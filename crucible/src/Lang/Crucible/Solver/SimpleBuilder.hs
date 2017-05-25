@@ -154,8 +154,9 @@ import           Lang.Crucible.ProgramLoc
 import           Lang.Crucible.Simulator.SimError
 import           Lang.Crucible.Solver.Interface
 import           Lang.Crucible.Solver.Symbol
-import           Lang.Crucible.Solver.WeightedSum (WeightedSum)
+--import           Lang.Crucible.Solver.WeightedSum (WeightedSum)
 import qualified Lang.Crucible.Solver.WeightedSum as WSum
+import           Lang.Crucible.Solver.SemiRing
 import           Lang.Crucible.Utils.AbstractDomains
 import           Lang.Crucible.Utils.Arithmetic
 import qualified Lang.Crucible.Utils.BVDomain as BVD
@@ -270,6 +271,11 @@ data App e (tp :: BaseType) where
           -> !(e BaseBoolType)
           -> App e BaseBoolType
 
+  -- This represents a weighted sum of other expressions plus an offset.
+  SemiRingSum
+     :: SemiRing tp
+     -> {-# UNPACK #-} !(WSum e tp)
+     -> App e tp
 
   ------------------------------------------------------------------------
   -- Basic arithmetic operations
@@ -279,16 +285,11 @@ data App e (tp :: BaseType) where
   RealIsInteger :: !(e BaseRealType) -> App e BaseBoolType
 
 
-  -- This represents a real number as a weighted sum of other expressions plus
-  -- an offset.
-  RealSum :: {-# UNPACK #-} !(WeightedSum Rational e BaseRealType)
-          -> App e BaseRealType
-
   -- Multiplication of two real numbers
   --
   -- The SimpleBuilder should maintain the invariant that neither value is
   -- a real constant, and hence this denotes a non-linear expression.
-  -- Multiplications by scalars should use the 'RealSum' constructor.
+  -- Multiplications by scalars should use the 'SemiRingSum' constructor.
   RealMul :: !(e BaseRealType) -> !(e BaseRealType) -> App e BaseRealType
 
   RealIte :: !(e BaseBoolType)
@@ -814,7 +815,8 @@ appType a =
     NatDiv{} -> knownRepr
     IntMod{} -> knownRepr
 
-    RealSum{} -> knownRepr
+    SemiRingSum{} -> knownRepr
+
     RealMul{} -> knownRepr
     RealIte{} -> knownRepr
     RealDiv{} -> knownRepr
@@ -1171,15 +1173,8 @@ ppApp' a0 = do
     IntMod x y -> prettyApp "intMod" [eltPrettyArg x, eltPrettyArg y]
 
     RealMul x y -> ppSExpr "realMul" [x, y]
-    RealSum s -> prettyApp "realSum" (WSum.eval (++) ppEntry ppConstant s)
-      where ppConstant 0 = []
-            ppConstant c = [ stringPrettyArg (ppRat c)]
-            ppEntry 1 e = [ eltPrettyArg e ]
-            ppEntry sm e = [ stringPrettyArg (ppRat sm ++ "*"), eltPrettyArg e ]
-            ppRat r | d == 1 = show n
-                    | otherwise = "(" ++ show n ++ "/" ++ show d ++ ")"
-              where n = numerator r
-                    d = denominator r
+
+    SemiRingSum sr s -> ppSemiRingSum sr s
     RealIte x y z -> ppITE "realIte" x y z
     RealDiv x y -> ppSExpr "divReal" [x, y]
     RealSqrt x  -> ppSExpr "sqrt" [x]
@@ -1376,7 +1371,7 @@ traverseApp =
     , ( ConType [t|Ctx.Assignment BaseTypeRepr|] `TypeApp` AnyType
       , [|(\_ -> pure) |]
       )
-    , ( ConType [t|WeightedSum|] `TypeApp` AnyType `TypeApp` AnyType `TypeApp` AnyType
+    , ( ConType [t|WSum|] `TypeApp` AnyType `TypeApp` AnyType
       , [| WSum.traverseVars
          |]
       )
@@ -2919,7 +2914,7 @@ sbTryUnaryTerm sym u a
 -- | This privides a view of a real elt as a weighted sum of values.
 data SumView t
    = ConstantSum !Rational
-   | LinearSum !(WeightedSum Rational (Elt t) BaseRealType)
+   | LinearSum !(WSum (Elt t) BaseRealType)
    | GeneralSum
 
 viewSum :: RealElt t -> SumView t
@@ -2930,15 +2925,15 @@ viewSum x
 
 asWeightedSum :: HashableF (Elt t)
               => RealElt t
-              -> WeightedSum Rational (Elt t) BaseRealType
+              -> WSum (Elt t) BaseRealType
 asWeightedSum x
-  | RatElt r _ <- x = WSum.constant r
+  | RatElt r _ <- x = constWSum SemiRingReal r
   | Just (RealSum s) <- asApp x = s
-  | otherwise = WSum.var x
+  | otherwise = termWSum SemiRingReal 1 x
 
 realSum' :: SimpleBuilder t st
-            -> WeightedSum Rational (Elt t) BaseRealType
-            -> IO (RealElt t)
+         -> WSum (Elt t) BaseRealType
+         -> IO (RealElt t)
 realSum' sym s = sbMakeElt sym $ RealSum $ s
 
 realScalarMul :: SimpleBuilder t st
@@ -2953,9 +2948,9 @@ realScalarMul sym c x
   | Just r <- asRational x =
     realLit sym (c*r)
   | Just (RealSum s) <- asApp x =
-    realSum' sym (WSum.scale c s)
+    realSum' sym (smulWSum SemiRingReal c s)
   | otherwise = do
-    realSum' sym (WSum.scaledVar c x)
+    realSum' sym (termWSum SemiRingReal c x)
 
 -- Add following rule to do a strength reduction on non-linear
 -- constraint non-negative constraint

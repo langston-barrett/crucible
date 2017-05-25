@@ -130,10 +130,10 @@ addVars x y
   where zm = Map.fromList [(x, 1), (y,1)]
 
 -- | Add two sums.
-add :: (HashableF t, Ord (t i))
-    => WeightedSum Rational t i
-    -> WeightedSum Rational t i
-    -> WeightedSum Rational t i
+add :: (Eq c, Num c, Hashable c, HashableF t, Ord (t i))
+    => WeightedSum c t i
+    -> WeightedSum c t i
+    -> WeightedSum c t i
 add x y = unfilteredSum zm zc
   where merge _ u v | r == 0 = Nothing
                     | otherwise = Just r
@@ -142,8 +142,8 @@ add x y = unfilteredSum zm zc
         zc = x^.sumOffset + y^.sumOffset
 
 -- | Add a variable to the sum.
-addVar :: (Ord (t i), HashableF t)
-       => WeightedSum Rational t i -> t i -> WeightedSum Rational t i
+addVar :: (Eq c, Num c, Hashable c, Ord (t i), HashableF t)
+       => WeightedSum c t i -> t i -> WeightedSum c t i
 addVar x y = x{ _sumMap  = if newval == 0 then Map.delete y m' else m'
               , _sumHash = _sumHash x `xor` oldHash `xor` newHash
               }

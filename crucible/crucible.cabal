@@ -107,6 +107,7 @@ library
     Lang.Crucible.Solver.Partial
     Lang.Crucible.Solver.ProcessUtils
     Lang.Crucible.Solver.SatResult
+    Lang.Crucible.Solver.SemiRing
     Lang.Crucible.Solver.SimpleBackend
     Lang.Crucible.Solver.SimpleBackend.AppTheory
     Lang.Crucible.Solver.SimpleBackend.Boolector
