@@ -232,6 +232,7 @@ packBase ctp ctx0 asgn k =
            in k (Some (asgn Ctx.! idx))
                 ctx'
                 asgn'
+    _ -> error "unknown pattern"
 
 typeToRegExpr :: MemType -> LLVMEnd h s wptr ret (Some (Reg s))
 typeToRegExpr tp = do
