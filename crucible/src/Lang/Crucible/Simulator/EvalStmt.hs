@@ -293,24 +293,31 @@ stepStmt verb stmt rest =
 
        Print e ->
          do msg <- evalReg e
-            let msg' = case asString msg of
-                         Just txt -> Text.unpack txt
-                         _ -> show (printSymExpr msg)
+            let msg' = asStringForUser msg
             liftIO $ do
               let h = printHandle ctx
               hPutStr h msg'
               hFlush h
             continueWith (stateCrucibleFrame  . frameStmts .~ rest)
 
-       Assert c_expr msg_expr ->
-         do c <- evalReg c_expr
-            msg <- evalReg msg_expr
-            let msg' = case asString msg of
-                         Just txt -> Text.unpack txt
-                         _ -> show (printSymExpr msg)
+       Assert c_reg msg_reg ->
+         do c <- evalReg c_reg
+            msg <- evalReg msg_reg
+            let msg' = asStringForUser msg
             liftIO $ assert sym c (AssertFailureSimError msg')
             continueWith (stateCrucibleFrame  . frameStmts .~ rest)
 
+       Assume c_reg msg_reg ->
+         do c <- evalReg c_reg
+            msg <- evalReg msg_reg
+            let msg' = asStringForUser msg
+            liftIO $ assume sym c msg'
+            continueWith (stateCrucibleFrame  . frameStmts .~ rest)
+  where
+    asStringForUser expr =
+      case asString expr of
+        Just txt -> Text.unpack txt
+        _ -> show (printSymExpr expr)
 
 ---------------------------------------------------------------
 -- TODO, this should probably be moved to parameterized-utils

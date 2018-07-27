@@ -249,6 +249,8 @@ transfer dom interp retRepr blk = transferSeq (_blockStmts blk)
         -- though... maybe with a unit type.
         Assert _ _ -> assignment
 
+        Assume _ _ -> assignment
+
         ReadGlobal gv ->
           let (assignment', absVal) = interpReadGlobal interp gv assignment
               assignment'' = maybe assignment (joinPointAbstractions dom assignment) assignment'

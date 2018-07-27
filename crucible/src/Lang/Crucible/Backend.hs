@@ -32,6 +32,7 @@ module Lang.Crucible.Backend
   , ProofObligations
   , AssumptionState
   , assert
+  , assume
 
     -- ** Reexports
   , AS.LabeledPred(..)
@@ -244,6 +245,17 @@ assert ::
 assert sym p msg =
   do loc <- getCurrentProgramLoc sym
      addAssertion sym (AS.LabeledPred p (SimError loc msg))
+
+-- | Assume the given fact using the current program location.
+assume ::
+  IsSymInterface sym =>
+  sym ->
+  Pred sym ->
+  String ->
+  IO ()
+assume sym p msg =
+  do loc <- getCurrentProgramLoc sym
+     addAssumption sym (AS.LabeledPred p (AssumptionReason loc msg))
 
 -- | Add a proof obligation for False. This always aborts execution
 -- of the current path, because after asserting false, we get to assume it,
