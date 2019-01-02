@@ -373,8 +373,7 @@ runErrorHandler msg st =
   let ctx = st^.stateContext
       sym = ctx^.ctxSymInterface
    in ctxSolverProof ctx $
-      do loc <- getCurrentProgramLoc sym
-         let err = SimError loc msg
+      do err <- makeSimError sym msg
          let obl = LabeledPred (falsePred sym) err
          let rsn = AssumedFalse (AssumingNoError err)
          addProofObligation sym obl

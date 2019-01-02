@@ -138,7 +138,7 @@ ppAssumptionReason e =
     ExploringAPath l Nothing -> "The branch in" PP.<+> ppFn l PP.<+> "at" PP.<+> ppLoc l
     ExploringAPath l (Just t) ->
         "The branch in" PP.<+> ppFn l PP.<+> "from" PP.<+> ppLoc l PP.<+> "to" PP.<+> ppLoc t
-    AssumingNoError simErr -> ppSimError simErr
+    AssumingNoError simErr -> ppSimError 1 simErr
 
 ppLocated :: ProgramLoc -> PP.Doc -> PP.Doc
 ppLocated l x = "in" PP.<+> ppFn l PP.<+> ppLoc l PP.<> ":" PP.<+> x
@@ -251,8 +251,8 @@ assert ::
   SimErrorReason ->
   IO ()
 assert sym p msg =
-  do loc <- getCurrentProgramLoc sym
-     addAssertion sym (AS.LabeledPred p (SimError loc msg))
+  do err <- makeSimError sym msg
+     addAssertion sym (AS.LabeledPred p err)
 
 -- | Add a proof obligation for False. This always aborts execution
 -- of the current path, because after asserting false, we get to assume it,
@@ -260,12 +260,11 @@ assert sym p msg =
 -- IO computation can have the fully polymorphic type.
 addFailedAssertion :: (IsExprBuilder sym, IsBoolSolver sym) => sym -> SimErrorReason -> IO a
 addFailedAssertion sym msg =
-  do loc <- getCurrentProgramLoc sym
-     let err = AS.LabeledPred (falsePred sym) (SimError loc msg)
+  do err0 <- makeSimError sym msg
+     let err = AS.LabeledPred (falsePred sym) err0
      addProofObligation sym err
      abortExecBecause $ AssumedFalse
-                      $ AssumingNoError
-                        SimError { simErrorLoc = loc, simErrorReason = msg }
+                      $ AssumingNoError err0
 
 
 -- | Run the given action to compute a predicate, and assert it.
@@ -300,8 +299,8 @@ readPartExpr ::
 readPartExpr sym Unassigned msg = do
   addFailedAssertion sym msg
 readPartExpr sym (PE p v) msg = do
-  loc <- getCurrentProgramLoc sym
-  addAssertion sym (AS.LabeledPred p (SimError loc msg))
+  err <- makeSimError sym msg
+  addAssertion sym (AS.LabeledPred p err)
   return v
 
 ppProofObligation :: IsSymInterface sym => sym -> ProofObligation sym -> PP.Doc
@@ -318,5 +317,5 @@ ppProofObligation _ (AS.ProofGoal (toList -> as) gl) =
     printSymExpr (asm^.AS.labeledPred))
 
  ppGl = PP.indent 2
-   (ppSimError (gl^.AS.labeledPredMsg) PP.<$>
+   (ppSimError 1 (gl^.AS.labeledPredMsg) PP.<$>
     printSymExpr (gl^.AS.labeledPred))

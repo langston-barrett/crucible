@@ -30,7 +30,7 @@ module Lang.Crucible.Simulator.BoundedExec
   ( boundedExecFeature
   ) where
 
-import           Control.Lens ( (^.), to )
+import           Control.Lens ( (^.) )
 import           Control.Monad ( when )
 import           Data.IORef
 import           Data.Map (Map)
@@ -189,27 +189,28 @@ boundedExecFeature getLoopBounds generateSideConditions =
    ControlTransferState res st -> stateSolverProof st $
      let sym = st^.stateSymInterface
          msg n = "reached maximum number of loop iterations (" ++ show n ++ ")"
-         err loc n = SimError loc (ResourceExhausted (msg n))
+         err :: Show n => n -> IO SimError
+         err n = makeSimError sym (ResourceExhausted (msg n))
      in
      case res of
        ContinueResumption (ResolvedJump tgt_id _) ->
-         do let loc = st^.stateCrucibleFrame.to frameProgramLoc
-            overLimit <- checkBackedge stackRef (st^.stateCrucibleFrame.frameBlockID) tgt_id
+         do overLimit <- checkBackedge stackRef (st^.stateCrucibleFrame.frameBlockID) tgt_id
             case overLimit of
               Just n ->
-                do when generateSideConditions
-                        (addProofObligation sym (LabeledPred (falsePred sym) (err loc n)))
-                   return (Just (AbortState (AssumedFalse (AssumingNoError (err loc n))) st))
+                do err_ <- err n
+                   when generateSideConditions
+                        (addProofObligation sym (LabeledPred (falsePred sym) err_))
+                   return (Just (AbortState (AssumedFalse (AssumingNoError err_)) st))
               Nothing -> return Nothing
 
        CheckMergeResumption (ResolvedJump tgt_id _) ->
-         do let loc = st^.stateCrucibleFrame.to frameProgramLoc
-            overLimit <- checkBackedge stackRef (st^.stateCrucibleFrame.frameBlockID) tgt_id
+         do overLimit <- checkBackedge stackRef (st^.stateCrucibleFrame.frameBlockID) tgt_id
             case overLimit of
               Just n ->
-                do when generateSideConditions
-                        (addProofObligation sym (LabeledPred (falsePred sym) (err loc n)))
-                   return (Just (AbortState (AssumedFalse (AssumingNoError (err loc n))) st))
+                do err_ <- err n
+                   when generateSideConditions
+                        (addProofObligation sym (LabeledPred (falsePred sym) err_))
+                   return (Just (AbortState (AssumedFalse (AssumingNoError err_)) st))
               Nothing ->
                 do return Nothing
 

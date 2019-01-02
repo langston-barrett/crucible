@@ -7,13 +7,14 @@
 -- Maintainer       : Joe Hendrix <jhendrix@galois.com>
 -- Stability        : provisional
 ------------------------------------------------------------------------
-{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE CPP #-}
+{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -23,6 +24,7 @@ module Lang.Crucible.Simulator.SimError (
     SimErrorReason(..)
   , SimError(..)
   , simErrorReasonMsg
+  , makeSimError
   , ppSimError
   ) where
 
@@ -30,8 +32,10 @@ import Control.Exception
 import Data.String
 import Data.Typeable
 import Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
+import GHC.Stack
 
 import What4.ProgramLoc
+import What4.Interface (IsExprBuilder, getCurrentProgramLoc)
 
 ------------------------------------------------------------------------
 -- SimError
@@ -45,14 +49,16 @@ data SimErrorReason
    | ResourceExhausted String
       -- ^ A loop iteration count, or similar resource limit,
       --   was exceeded.
- deriving (Typeable)
+ deriving (Eq, Ord, Typeable)
 
 data SimError
    = SimError
-   { simErrorLoc :: !ProgramLoc
-   , simErrorReason :: !SimErrorReason
+   { simErrorLoc        :: !ProgramLoc
+   , simErrorStackTrace :: ![String]
+     -- ^ A GHC profiling stack trace, for debugging internal errors.
+   , simErrorReason     :: !SimErrorReason
    }
- deriving (Typeable)
+ deriving (Eq, Ord, Typeable)
 
 simErrorReasonMsg :: SimErrorReason -> String
 simErrorReasonMsg (GenericSimError msg) = msg
@@ -68,13 +74,40 @@ instance Show SimErrorReason where
   show = simErrorReasonMsg
 
 instance Show SimError where
-  show = show . ppSimError
+  show = show . ppSimError 1
 
-ppSimError :: SimError -> Doc
-ppSimError er =
-  vcat [ vcat (text <$> lines (show (simErrorReason er)))
-       , text "in" <+> text (show (plFunction loc)) <+> text "at" <+> text (show (plSourceLoc loc))
-       ]
+-- | Create a 'SimError' with a profiling stack trace (if one is available)
+makeSimError :: IsExprBuilder sym => sym -> SimErrorReason -> IO SimError
+makeSimError sym reason =
+  (\loc st -> SimError { simErrorLoc        = loc
+                       , simErrorReason     = reason
+                       -- drop this frame so 'makeSimError' isn't in the stack
+                       , simErrorStackTrace = take (length st - 1) st
+                       })
+  <$> getCurrentProgramLoc sym
+  <*> currentCallStack
+
+ppSimError :: Int -> SimError -> Doc
+ppSimError verbosity er =
+  vcat $ [ vcat (text <$> lines (show (simErrorReason er)))
+         , text "in" <+> text (show (plFunction loc)) <+> text "at" <+> text (show (plSourceLoc loc))
+         ] ++ if | verbosity > 2 && not (null (simErrorStackTrace er)) ->
+                   [ text "Stack trace:"
+                   , vcat (map text (simErrorStackTrace er))
+                   ]
+                 | verbosity > 2 -> -- The stack trace is null
+                   [ text "Empty call stack!"
+                   , hcat . map text $
+                     [ "Hint: Crucible must be compiled with profiling for"
+                     , "stack traces."
+                     ]
+                   ]
+                 | otherwise ->
+                   [ hcat . map text $
+                     [ "(for a complete stack trace,"
+                     , "try increasing the verbosity)"
+                     ]
+                   ]
  where loc = simErrorLoc er
 
 instance Exception SimError
