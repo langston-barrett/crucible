@@ -77,6 +77,7 @@ library
     Lang.Crucible.CFG.Generator
     Lang.Crucible.CFG.Reg
     Lang.Crucible.CFG.SSAConversion
+    Lang.Crucible.CFG.Util
     Lang.Crucible.FunctionHandle
     Lang.Crucible.Simulator
     Lang.Crucible.Simulator.BoundedExec
