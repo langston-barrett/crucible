@@ -97,6 +97,7 @@ module Lang.Crucible.LLVM.Translation
 import Control.Monad.Except
 import Control.Lens hiding (op, (:>) )
 import Control.Monad.ST
+import qualified Data.Either.Validation as Validation
 import Data.Maybe
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -185,11 +186,18 @@ generateStmts
 generateStmts retType lab stmts = go (processDbgDeclare stmts)
  where go [] = fail "LLVM basic block ended without a terminating instruction"
        go (x:xs) =
+         let (instr, md, assign) =
+               case x of
+                 -- a result statement assigns the result of the instruction into a register
+                 L.Result ident instr md -> (instr, md, assignLLVMReg ident)
+                 -- an effect statement simply executes the instruction for its effects and discards the result
+                 L.Effect instr md -> (instr, md, (\_ -> return ()))
+         in do
+            setLocation md
+            generateInstr retType lab instr (assignLLVMReg ident) (go xs)
          case x of
            -- a result statement assigns the result of the instruction into a register
            L.Result ident instr md -> do
-                 setLocation md
-                 generateInstr retType lab instr (assignLLVMReg ident) (go xs)
 
            -- an effect statement simply executes the instruction for its effects and discards the result
            L.Effect instr md -> do

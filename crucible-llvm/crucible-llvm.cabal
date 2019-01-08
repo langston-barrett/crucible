@@ -21,6 +21,7 @@ library
     what4 >= 0.4.1,
     deepseq,
     directory,
+    either >= 5,
     ghc-prim,
     hashable,
     hashtables,

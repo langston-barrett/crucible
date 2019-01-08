@@ -35,20 +35,22 @@ module Lang.Crucible.LLVM.Translation.Instruction
   , assignLLVMReg
   ) where
 
-import Control.Monad.Except
-import Control.Monad.State.Strict
-import Control.Monad.Trans.Maybe
-import Control.Lens hiding (op, (:>) )
-import Data.Foldable (toList)
-import Data.Int
+import           Control.Monad.Except
+import           Control.Monad.State.Strict
+import           Control.Monad.Trans.Maybe
+import           Control.Lens hiding (op, (:>) )
+import qualified Data.Either.Validation as Validation
+import           Data.Either.Validation (Validation(..))
+import           Data.Foldable (toList)
+import           Data.Int
 import qualified Data.List as List
-import Data.Maybe
+import           Data.Maybe
 import qualified Data.Map.Strict as Map
-import Data.Sequence (Seq)
+import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
-import Data.String
+import           Data.String
 import qualified Data.Vector as V
-import qualified Data.Text   as Text
+import qualified Data.Text as Text
 import           Numeric.Natural
 
 import qualified Text.LLVM.AST as L
@@ -57,8 +59,8 @@ import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Context ( pattern (:>) )
 import           Data.Parameterized.NatRepr as NatRepr
 
-import Data.Parameterized.Some
-import Text.PrettyPrint.ANSI.Leijen (pretty)
+import           Data.Parameterized.Some
+import           Text.PrettyPrint.ANSI.Leijen (pretty)
 
 import           Lang.Crucible.CFG.Expr
 import           Lang.Crucible.CFG.Generator
@@ -1099,6 +1101,10 @@ pointerOp op x y =
 
 
 -- | Do the heavy lifting of translating LLVM instructions to crucible code.
+--
+-- This returns a @Failure@ when it encounters an unsupported instruction. It
+-- does so instead of calling @fail@ so that the messages can be aggregated, and
+-- the user gets a complete picture of what's left to support.
 generateInstr :: forall h s arch ret a
          . TypeRepr ret     -- ^ Type of the function return value
         -> L.BlockLabel     -- ^ The label of the current LLVM basic block
@@ -1108,28 +1114,28 @@ generateInstr :: forall h s arch ret a
         -> LLVMGenerator h s arch ret a  -- ^ A continuation for translating the remaining statements in this function.
                                    --   Straightline instructions should enter this continuation,
                                    --   but block-terminating instructions should not.
-        -> LLVMGenerator h s arch ret a
+        -> Validation [String] (LLVMGenerator h s arch ret a)
 generateInstr retType lab instr assign_f k =
   case instr of
     -- skip phi instructions, they are handled in definePhiBlock
-    L.Phi _ _ -> k
-    L.Comment _ -> k
-    L.Unreachable -> reportError "LLVM unreachable code"
+    L.Phi _ _     -> Success k
+    L.Comment _   -> Success k
+    L.Unreachable -> Success $ reportError "LLVM unreachable code"
 
-    L.ExtractValue x is -> do
+    L.ExtractValue x is -> Success $ do
         x' <- transTypedValue x
         v <- extractValue x' is
         assign_f v
         k
 
-    L.InsertValue x v is -> do
+    L.InsertValue x v is -> Success $ do
         x' <- transTypedValue x
         v' <- transTypedValue v
         y <- insertValue x' v' is
         assign_f y
         k
 
-    L.ExtractElt x i ->
+    L.ExtractElt x i -> Success $
         case x of
           L.Typed (L.Vector n ty) x' -> do
             ty' <- liftMemType' ty
@@ -1142,7 +1148,7 @@ generateInstr retType lab instr assign_f k =
 
           _ -> fail $ unwords ["expected vector type in extractelement instruction:", show x]
 
-    L.InsertElt x v i ->
+    L.InsertElt x v i -> Success $
         case x of
           L.Typed (L.Vector n ty) x' -> do
             ty' <- liftMemType' ty
@@ -1156,7 +1162,7 @@ generateInstr retType lab instr assign_f k =
 
           _ -> fail $ unwords ["expected vector type in insertelement instruction:", show x]
 
-    L.ShuffleVector sV1 sV2 sIxes ->
+    L.ShuffleVector sV1 sV2 sIxes -> Success $
       case (L.typedType sV1, L.typedType sIxes) of
         (L.Vector m ty, L.Vector n (L.PrimType (L.Integer 32))) ->
           do elTy <- liftMemType' ty
@@ -1186,11 +1192,7 @@ generateInstr retType lab instr assign_f k =
 
         (t1,t2) -> fail $ unlines ["[shuffle] Type error", show t1, show t2 ]
 
-
-    L.LandingPad _ _ _ _ ->
-      reportError "FIXME landingPad not implemented"
-
-    L.Alloca tp num align -> do
+    L.Alloca tp num align -> Success $ do
       tp' <- liftMemType' tp
       let dl = llvmDataLayout ?lc
       let tp_sz = memTypeSize dl tp'
@@ -1229,7 +1231,7 @@ generateInstr retType lab instr assign_f k =
 
     -- We don't care if it's atomic, since the symbolic simulator is
     -- effectively single-threaded.
-    L.Load ptr _atomic align -> do
+    L.Load ptr _atomic align -> Success $ do
       tp'  <- liftMemType' (L.typedType ptr)
       ptr' <- transValue tp' (L.typedValue ptr)
       case tp' of
@@ -1245,7 +1247,7 @@ generateInstr retType lab instr assign_f k =
 
     -- We don't care if it's atomic, since the symbolic simulator is
     -- effectively single-threaded.
-    L.Store v ptr _atomic align -> do
+    L.Store v ptr _atomic align -> Success $ do
       tp'  <- liftMemType' (L.typedType ptr)
       ptr' <- transValue tp' (L.typedValue ptr)
       case tp' of
@@ -1265,7 +1267,7 @@ generateInstr retType lab instr assign_f k =
     -- NB We treat every GEP as though it has the "inbounds" flag set;
     --    thus, the calculation of out-of-bounds pointers results in
     --    a runtime error.
-    L.GEP inbounds base elts -> do
+    L.GEP inbounds base elts -> Success $ do
       runExceptT (translateGEP inbounds base elts) >>= \case
         Left err -> reportError $ fromString $ unlines ["Error translating GEP", err]
         Right gep ->
@@ -1273,138 +1275,141 @@ generateInstr retType lab instr assign_f k =
              assign_f =<< evalGEP instr gep'
              k
 
-    L.Conv op x outty -> do
+    L.Conv op x outty -> Success $ do
       v <- translateConversion instr op x outty
       assign_f v
       k
 
-    L.Call _tailCall (L.PtrTo fnTy) fn args ->
-        callFunctionWithCont fnTy fn args assign_f k
+    L.Call _tailCall (L.PtrTo fnTy) fn args -> Success $
+      callFunctionWithCont fnTy fn args assign_f k
 
-    L.Invoke fnTy fn args normLabel _unwindLabel -> do
-        callFunctionWithCont fnTy fn args assign_f $ definePhiBlock lab normLabel
+    L.Invoke fnTy fn args normLabel _unwindLabel -> Success $
+      callFunctionWithCont fnTy fn args assign_f $ definePhiBlock lab normLabel
 
-    L.Bit op x y ->
-      do tp <- liftMemType' (L.typedType x)
-         x' <- transValue tp (L.typedValue x)
-         y' <- transValue tp y
-         assign_f =<< bitop op tp x' y'
-         k
+    L.Bit op x y -> Success $ do
+      tp <- liftMemType' (L.typedType x)
+      x' <- transValue tp (L.typedValue x)
+      y' <- transValue tp y
+      assign_f =<< bitop op tp x' y'
+      k
 
-    L.Arith op x y ->
-      do tp <- liftMemType' (L.typedType x)
-         x' <- transValue tp (L.typedValue x)
-         y' <- transValue tp y
-         assign_f =<< arithOp op tp x' y'
-         k
+    L.Arith op x y -> Success $ do
+      tp <- liftMemType' (L.typedType x)
+      x' <- transValue tp (L.typedValue x)
+      y' <- transValue tp y
+      assign_f =<< arithOp op tp x' y'
+      k
 
-    L.FCmp op x y -> do
-           let isNaNCond = App . FloatIsNaN
-           let cmpf :: Expr (LLVM arch) s (FloatType fi)
-                    -> Expr (LLVM arch) s (FloatType fi)
-                    -> Expr (LLVM arch) s BoolType
-               cmpf a b =
-                  -- True if a is NAN or b is NAN
-                  let unoCond = App $ Or (isNaNCond a) (isNaNCond b) in
-                  let mkUno c = App $ Or c unoCond in
-                  case op of
-                    L.Ftrue  -> App $ BoolLit True
-                    L.Ffalse -> App $ BoolLit False
-                    L.Foeq   -> App $ FloatFpEq a b
-                    L.Folt   -> App $ FloatLt a b
-                    L.Fole   -> App $ FloatLe a b
-                    L.Fogt   -> App $ FloatGt a b
-                    L.Foge   -> App $ FloatGe a b
-                    L.Fone   -> App $ FloatFpNe a b
-                    L.Fueq   -> mkUno $ App $ FloatFpEq a b
-                    L.Fult   -> mkUno $ App $ FloatLt a b
-                    L.Fule   -> mkUno $ App $ FloatLe a b
-                    L.Fugt   -> mkUno $ App $ FloatGt a b
-                    L.Fuge   -> mkUno $ App $ FloatGe a b
-                    L.Fune   -> mkUno $ App $ FloatFpNe a b
-                    L.Ford   -> App $ And (App $ Not $ isNaNCond a) (App $ Not $ isNaNCond b)
-                    L.Funo   -> unoCond
+    L.FCmp op x y -> Success $ do
+      let isNaNCond = App . FloatIsNaN
+      let cmpf :: Expr (LLVM arch) s (FloatType fi)
+              -> Expr (LLVM arch) s (FloatType fi)
+              -> Expr (LLVM arch) s BoolType
+          cmpf a b =
+            -- True if a is NAN or b is NAN
+            let unoCond = App $ Or (isNaNCond a) (isNaNCond b) in
+            let mkUno c = App $ Or c unoCond in
+            case op of
+              L.Ftrue  -> App $ BoolLit True
+              L.Ffalse -> App $ BoolLit False
+              L.Foeq   -> App $ FloatFpEq a b
+              L.Folt   -> App $ FloatLt a b
+              L.Fole   -> App $ FloatLe a b
+              L.Fogt   -> App $ FloatGt a b
+              L.Foge   -> App $ FloatGe a b
+              L.Fone   -> App $ FloatFpNe a b
+              L.Fueq   -> mkUno $ App $ FloatFpEq a b
+              L.Fult   -> mkUno $ App $ FloatLt a b
+              L.Fule   -> mkUno $ App $ FloatLe a b
+              L.Fugt   -> mkUno $ App $ FloatGt a b
+              L.Fuge   -> mkUno $ App $ FloatGe a b
+              L.Fune   -> mkUno $ App $ FloatFpNe a b
+              L.Ford   -> App $ And (App $ Not $ isNaNCond a) (App $ Not $ isNaNCond b)
+              L.Funo   -> unoCond
 
-           x' <- transTypedValue x
-           y' <- transTypedValue (L.Typed (L.typedType x) y)
-           case (asScalar x', asScalar y') of
-             (Scalar (FloatRepr fi) x'',
-              Scalar (FloatRepr fi') y'')
-              | Just Refl <- testEquality fi fi' ->
-                do assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
-                                   (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat (cmpf  x'' y'')))))
-                   k
+      x' <- transTypedValue x
+      y' <- transTypedValue (L.Typed (L.typedType x) y)
+      case (asScalar x', asScalar y') of
+        (Scalar (FloatRepr fi) x'',
+         Scalar (FloatRepr fi') y'')
+         | Just Refl <- testEquality fi fi' -> do
+             assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
+                                (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat (cmpf  x'' y'')))))
+             k
 
-             _ -> fail $ unwords ["Floating point comparison on incompatible values", show x, show y]
+        _ -> fail $ unwords ["Floating point comparison on incompatible values", show x, show y]
 
-    L.ICmp op x y -> do
-           x' <- transTypedValue x
-           y' <- transTypedValue (L.Typed (L.typedType x) y)
-           case (asScalar x', asScalar y') of
-             (Scalar (LLVMPointerRepr w) x'', Scalar (LLVMPointerRepr w') y'')
-                | Just Refl <- testEquality w w'
-                , Just Refl <- testEquality w PtrWidth
-                -> do b <- pointerCmp op x'' y''
-                      assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
-                                         (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
-                      k
-                | Just Refl <- testEquality w w'
-                -> do xbv <- pointerAsBitvectorExpr w x''
-                      ybv <- pointerAsBitvectorExpr w y''
-                      let b = intcmp w op xbv ybv
-                      assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
-                                         (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
-                      k
+    L.ICmp op x y -> Success $ do
+      x' <- transTypedValue x
+      y' <- transTypedValue (L.Typed (L.typedType x) y)
+      case (asScalar x', asScalar y') of
+        (Scalar (LLVMPointerRepr w) x'', Scalar (LLVMPointerRepr w') y'')
+          | Just Refl <- testEquality w w'
+          , Just Refl <- testEquality w PtrWidth
+          -> do b <- pointerCmp op x'' y''
+                assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
+                                    (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
+                k
+          | Just Refl <- testEquality w w'
+          -> do xbv <- pointerAsBitvectorExpr w x''
+                ybv <- pointerAsBitvectorExpr w y''
+                let b = intcmp w op xbv ybv
+                assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
+                                    (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
+                k
 
-             _ -> fail $ unwords ["arithmetic comparison on incompatible values", show x, show y]
+        _ -> fail $ unwords ["arithmetic comparison on incompatible values", show x, show y]
 
-    L.Select c x y -> do
-         c' <- transTypedValue c
-         x' <- transTypedValue x
-         y' <- transTypedValue (L.Typed (L.typedType x) y)
-         e' <- case asScalar c' of
-                 Scalar (LLVMPointerRepr w) e -> callIntToBool w e
-                 _ -> fail "expected boolean condition on select"
+    L.Select c x y -> Success $ do
+      c' <- transTypedValue c
+      x' <- transTypedValue x
+      y' <- transTypedValue (L.Typed (L.typedType x) y)
+      e' <- case asScalar c' of
+              Scalar (LLVMPointerRepr w) e -> callIntToBool w e
+              _ -> fail "expected boolean condition on select"
 
-         ifte_ e' (assign_f x') (assign_f y')
-         k
+      ifte_ e' (assign_f x') (assign_f y')
+      k
 
-    L.Jump l' -> definePhiBlock lab l'
+    L.Jump l' -> Success $ definePhiBlock lab l'
 
-    L.Br v l1 l2 -> do
-        v' <- transTypedValue v
-        e' <- case asScalar v' of
-                 Scalar (LLVMPointerRepr w) e -> callIntToBool w e
-                 _ -> fail "expected boolean condition on branch"
+    L.Br v l1 l2 -> Success $ do
+      v' <- transTypedValue v
+      e' <- case asScalar v' of
+                Scalar (LLVMPointerRepr w) e -> callIntToBool w e
+                _ -> fail "expected boolean condition on branch"
 
-        phi1 <- defineBlockLabel (definePhiBlock lab l1)
-        phi2 <- defineBlockLabel (definePhiBlock lab l2)
-        branch e' phi1 phi2
+      phi1 <- defineBlockLabel (definePhiBlock lab l1)
+      phi2 <- defineBlockLabel (definePhiBlock lab l2)
+      branch e' phi1 phi2
 
-    L.Switch x def branches -> do
-        x' <- transTypedValue x
-        case asScalar x' of
-          Scalar (LLVMPointerRepr w) x'' ->
-            do bv <- pointerAsBitvectorExpr w x''
-               buildSwitch w bv lab def branches
-          _ -> fail $ unwords ["expected integer value in switch", showInstr instr]
+    L.Switch x def branches -> Success $ do
+      x' <- transTypedValue x
+      case asScalar x' of
+        Scalar (LLVMPointerRepr w) x'' -> do
+          bv <- pointerAsBitvectorExpr w x''
+          buildSwitch w bv lab def branches
+        _ -> fail $ unwords ["expected integer value in switch", showInstr instr]
 
-    L.Ret v -> do v' <- transTypedValue v
-                  let ?err = fail
-                  unpackOne v' $ \retType' ex ->
-                     case testEquality retType retType' of
-                        Just Refl -> do
-                           callPopFrame
-                           returnFromFunction ex
-                        Nothing -> fail $ unwords ["unexpected return type", show retType, show retType']
+    L.Ret v -> Success $ do
+      v' <- transTypedValue v
+      let ?err = fail
+      unpackOne v' $ \retType' ex ->
+          case testEquality retType retType' of
+            Just Refl -> do
+                callPopFrame
+                returnFromFunction ex
+            Nothing -> fail $ unwords ["unexpected return type", show retType, show retType']
 
-    L.RetVoid -> case testEquality retType UnitRepr of
-                    Just Refl -> do
-                       callPopFrame
-                       returnFromFunction (App EmptyApp)
-                    Nothing -> fail $ unwords ["tried to void return from non-void function", show retType]
+    L.RetVoid -> Success $
+      case testEquality retType UnitRepr of
+        Just Refl -> do
+            callPopFrame
+            returnFromFunction (App EmptyApp)
+        Nothing -> fail $ unwords ["tried to void return from non-void function", show retType]
 
-    _ -> reportError $ App $ TextLit $ Text.pack $ unwords ["unsupported instruction", showInstr instr]
+    -- FIXME: implement LandingPad
+    _ -> Failure $ [showInstr instr]
 
 
 arithOp ::
