@@ -261,13 +261,12 @@ doDumpMem h mem = do
 assertUndefined :: (IsSymInterface sym, HasPtrWidth wptr)
                 => sym
                 -> Pred sym
-                -> Maybe (UB.Config sym)      -- ^ defaults to 'strictConfig'
-                -> (UB.UndefinedBehavior sym) -- ^ The undesirable behavior
-                -- -> [Text]                     -- ^ Additional error message lines
+                -> Maybe (UB.Config (SymExpr sym))      -- ^ defaults to 'strictConfig'
+                -> (UB.UndefinedBehavior (SymExpr sym)) -- ^ The undesirable behavior
                 -> IO ()
 assertUndefined sym p (UB.defaultStrict -> ubConfig) ub =
   when (UB.getConfig ubConfig ub) $ assert sym p $
-    (AssertFailureSimError $ Text.unpack $ UB.pp ub)
+    (AssertFailureSimError $ Text.unpack $ UB.ppSym (Just sym) ub)
 
 instance IntrinsicClass sym "LLVM_memory" where
   type Intrinsic sym "LLVM_memory" ctx = MemImpl sym
@@ -601,7 +600,7 @@ doLookupHandle _sym mem ptr = do
 doFree
   :: (IsSymInterface sym, HasPtrWidth wptr)
   => sym
-  -> Maybe (UB.Config sym)  {- ^ defaults to 'strictConfig' -}
+  -> Maybe (UB.Config (SymExpr sym))  {- ^ defaults to 'strictConfig' -}
   -> MemImpl sym
   -> LLVMPtr sym wptr
   -> IO (MemImpl sym)
@@ -629,7 +628,7 @@ doFree sym ubConfig mem ptr = do
 doMemset ::
   (1 <= w, IsSymInterface sym, HasPtrWidth wptr) =>
   sym ->
-  Maybe (UB.Config sym)  {- ^ defaults to 'strictConfig' -} ->
+  Maybe (UB.Config (SymExpr sym))  {- ^ defaults to 'strictConfig' -} ->
   NatRepr w ->
   MemImpl sym ->
   LLVMPtr sym wptr {- ^ destination -} ->
@@ -730,7 +729,7 @@ uncheckedMemcpy sym mem dest src len = do
 doPtrSubtract ::
   (IsSymInterface sym, HasPtrWidth wptr) =>
   sym ->
-  Maybe (UB.Config sym)  {- ^ defaults to 'strictConfig' -} ->
+  Maybe (UB.Config (SymExpr sym))  {- ^ defaults to 'strictConfig' -} ->
   MemImpl sym ->
   LLVMPtr sym wptr ->
   LLVMPtr sym wptr ->
@@ -745,7 +744,7 @@ doPtrSubtract sym ubConfig _m x y = do
 doPtrAddOffset ::
   (IsSymInterface sym, HasPtrWidth wptr) =>
   sym ->
-  Maybe (UB.Config sym)  {- ^ defaults to 'strictConfig' -} ->
+  Maybe (UB.Config (SymExpr sym))  {- ^ defaults to 'strictConfig' -} ->
   MemImpl sym ->
   LLVMPtr sym wptr {- ^ base pointer -} ->
   SymBV sym wptr   {- ^ offset       -} ->

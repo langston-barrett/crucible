@@ -514,7 +514,7 @@ readMem sym w l tp alignment m = do
   p1         <- isAllocated sym w alignment l undefined m
   p2         <- isAligned sym w l alignment
   W4P.PE p v <- readMem' sym w (memEndianForm m) l tp alignment (memWrites m)
-  let ub1, ub2 :: UB.UndefinedBehavior sym
+  let ub1, ub2 :: UB.UndefinedBehavior (SymExpr sym)
       ub1 = UB.ReadUnallocated  l
       ub2 = UB.ReadBadAlignment l alignment
   let p'  = W4P.And (p :| [ W4P.Leaf (Safety.undefinedBehavior ub1 p1)
