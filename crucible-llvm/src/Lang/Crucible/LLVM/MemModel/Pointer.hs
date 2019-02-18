@@ -178,11 +178,9 @@ ptrEq :: (1 <= w, IsSymInterface sym)
       -> NatRepr w
       -> LLVMPtr sym w
       -> LLVMPtr sym w
-      -> IO (Pred sym)
+      -> IO (Pred sym, Pred sym)
 ptrEq sym _w (LLVMPointer base1 off1) (LLVMPointer base2 off2) =
-  do p1 <- natEq sym base1 base2
-     p2 <- bvEq sym off1 off2
-     andPred sym p1 p2
+  (,) <$> bvEq sym off1 off2 <*> natEq sym base1 base2
 
 -- | Test whether one pointer is less than or equal to the other.
 --
