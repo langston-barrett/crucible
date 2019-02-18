@@ -72,7 +72,6 @@ import qualified Data.Sequence as Seq
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Vector as V
-import Numeric.Natural
 
 import Lang.Crucible.Syntax.ExprParse hiding (SyntaxError)
 import qualified Lang.Crucible.Syntax.ExprParse as SP
@@ -156,10 +155,6 @@ int = sideCondition "integer literal" numeric atomic
   where numeric (Int i) = Just i
         numeric _ = Nothing
 
-nat :: MonadSyntax Atomic m => m Natural
-nat = sideCondition "natural literal" isNat atomic
-  where isNat (Int i) | i >= 0 = Just (fromInteger i)
-        isNat _ = Nothing
 
 labelName :: MonadSyntax Atomic m => m LabelName
 labelName = sideCondition "label name" lbl atomic
@@ -240,15 +235,22 @@ data PosNat =
 
 posNat :: MonadSyntax Atomic m => m PosNat
 posNat =
-   do i <- sideCondition "positive nat literal" checkPosNat nat
-      maybe empty return $ do Some x <- return $ mkNatRepr i
+   do i <- sideCondition "positive nat literal" checkPosNat int
+      maybe empty return $ do Some x <- someNat i
                               LeqProof <- isPosNat x
                               return $ PosNat x
   where checkPosNat i | i > 0 = Just i
         checkPosNat _ = Nothing
 
 natRepr :: MonadSyntax Atomic m => m (Some NatRepr)
-natRepr = mkNatRepr <$> nat
+natRepr =
+   do i <- sideCondition "nat literal" checkNonneg int
+      case someNat i of
+        Just sx -> return sx
+        Nothing -> empty
+
+  where checkNonneg i | i >= 0 = Just i
+        checkNonneg _ = Nothing
 
 isType :: MonadSyntax Atomic m => m (Some TypeRepr)
 isType =
@@ -271,7 +273,7 @@ isType =
     vector = unary VectorT isType <&> \(Some t) -> Some (VectorRepr t)
     ref    = unary RefT isType <&> \(Some t) -> Some (ReferenceRepr t)
     bv :: MonadSyntax Atomic m => m  (Some TypeRepr)
-    bv     = do Some len <- unary BitvectorT (mkNatRepr <$> nat)
+    bv     = do (Some len) <- unary BitvectorT (sideCondition "natural number" someNat int)
                 describe "positive number" $
                   case testLeq (knownNat :: NatRepr 1) len of
                     Nothing -> empty

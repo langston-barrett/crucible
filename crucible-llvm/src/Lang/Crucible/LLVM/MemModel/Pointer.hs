@@ -70,8 +70,7 @@ module Lang.Crucible.LLVM.MemModel.Pointer
 
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
 
-import           GHC.TypeLits (TypeError, ErrorMessage(..))
-import           GHC.TypeNats
+import           GHC.TypeLits
 
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx

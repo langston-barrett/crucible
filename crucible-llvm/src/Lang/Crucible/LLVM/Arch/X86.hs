@@ -13,7 +13,7 @@ module Lang.Crucible.LLVM.Arch.X86 where
 import Data.Word(Word8)
 import Data.Bits
 import Data.Kind
-import GHC.TypeNats (type (<=))
+import GHC.TypeLits (type (<=))
 
 import Data.Parameterized.NatRepr(knownNat)
 import Data.Parameterized.Classes(testEquality,compareF)
