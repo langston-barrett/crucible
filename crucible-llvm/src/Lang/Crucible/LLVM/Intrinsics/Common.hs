@@ -146,8 +146,8 @@ mkLLVMContext halloc m = do
          $ [ "Failed to construct LLVM type context:" ] ++ map show errs
   let dl = llvmDataLayout typeCtx
 
-  case mkNatRepr (ptrBitwidth dl) of
-    Some (wptr :: NatRepr wptr) | Just LeqProof <- testLeq (knownNat @16) wptr ->
+  case someNat (toInteger (ptrBitwidth dl)) of
+    Just (Some (wptr :: NatRepr wptr)) | Just LeqProof <- testLeq (knownNat @16) wptr ->
       withPtrWidth wptr $
         do mvar <- mkMemVar halloc
            let archRepr = X86Repr wptr -- FIXME! we should select the architecture based on
@@ -250,7 +250,6 @@ build_llvm_override sym fnm args ret args' ret' llvmOverride =
             do RegMap xs <- getOverrideArgs
                applyValTransformer fret =<< llvmOverride =<< applyArgTransformer fargs xs
 
-
 register_1arg_polymorphic_override :: forall p sym arch wptr l a rtp.
   (IsSymInterface sym, HasPtrWidth wptr, wptr ~ ArchWidth arch) =>
   String ->
@@ -260,7 +259,7 @@ register_1arg_polymorphic_override prefix overrideFn =
   do L.Symbol nm <- L.decName <$> ask
      case List.stripPrefix prefix nm of
        Just ('.':'i': (readDec -> (sz,[]):_))
-         | Some w <- mkNatRepr sz
+         | Just (Some w) <- someNat sz
          , Just LeqProof <- isPosNat w
          -> case overrideFn w of SomeLLVMOverride ovr -> register_llvm_override ovr
        _ -> empty
