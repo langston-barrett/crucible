@@ -92,7 +92,6 @@ import           Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Builder.Int as Builder
 import           Numeric (readDec, readHex, readInt)
-import           Numeric.Natural
 import qualified System.Exit as Exit
 import qualified System.IO as IO
 import qualified System.IO.Streams as Streams
@@ -128,9 +127,9 @@ all_supported = SMT2.allSupported
 -- Floating point
 
 data SMTFloatPrecision =
-  SMTFloatPrecision { smtFloatExponentBits :: !Natural
+  SMTFloatPrecision { smtFloatExponentBits :: !Integer
                       -- ^ Number of bits in exponent
-                    , smtFloatSignificandBits :: !Natural
+                    , smtFloatSignificandBits :: !Integer
                       -- ^ Number of bits in the significand.
                     }
   deriving (Eq, Ord)
