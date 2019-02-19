@@ -203,6 +203,7 @@ import           Lang.Crucible.LLVM.TypeContext (TypeContext)
 import           Lang.Crucible.Panic (panic)
 
 import           GHC.Stack
+import           Debug.Trace
 
 ----------------------------------------------------------------------
 -- The MemImpl type
@@ -413,7 +414,8 @@ evalStmt sym = eval
         assert sym v3
            (AssertFailureSimError $ unlines ["Const pointers compared for equality:", show x_doc, show y_doc, show allocs_doc])
 
-        ptrEq sym PtrWidth x y
+        (p1, p2) <- ptrEq sym PtrWidth x y
+        andPred sym p1 p2
 
   eval (LLVM_PtrLe mvar (regValue -> x) (regValue -> y)) = do
     mem <- getMem mvar
@@ -1356,20 +1358,21 @@ reverseAliases lab aliasOf_ seq =
           case aliasOf_ a of
             Nothing ->
               do -- Don't overwrite it if it's already in the map
-                 modify (Map.insert (lab a) a)
+                 modify (Map.insert (lab a) a) -- Not an alias
                  go (Map.insertWith (\_ old -> old) a Set.empty map_) as
             Just l ->
               do st <- get
                  case Map.lookup l st of
                    Just aliasee ->
-                     modify (Map.insert l aliasee) >>                              -- 1a
-                     go (mapSetInsert aliasee a map_)                              -- 1b
-                        (Seq.filter (\b -> lab b /= lab aliasee && lab b /= l) as) -- 1c
+                     modify (Map.insert l aliasee) >>         -- 1a
+                     go (mapSetInsert aliasee a map_)         -- 1b
+                        as    -- 1c
                    Nothing      ->
                      if isJust (List.find ((l ==) . lab) as)
-                     then go map_ (as <> Seq.singleton a)                          -- 2
-                     else modify (Map.insert (lab a) a) >>                         -- 3a
-                          pure map_                                                -- 3b
+                     then go map_ (as <> Seq.singleton a)     -- 2
+                     else -- Couldn't find the thing that a is an alias of
+                          modify (Map.insert (lab a) a) >>    -- 3a
+                          pure map_                           -- 3b
                  where mapSetInsert k v m  = Map.update (pure . Set.insert v) k m
 
 -- | This is one step closer to the application of 'reverseAliases':
@@ -1389,13 +1392,12 @@ reverseAliasesTwoSorted laba labb aliasOf_ seqa seqb =
     reverseAliases (either laba labb)
                    (either (const Nothing) aliasOf_)
                    (fmap Left seqa <> fmap Right seqb)
-  where -- Drop the b's which have been added as keys and
-        go (Right _, _) = Nothing
-        -- Call "error" if an a has been tagged as an alias
-        go (Left k, s) = Just (k, Set.map errLeft s)
-        -- TODO: Should this throw an exception?
-        errLeft (Left _)  = error "Internal error: unexpected Left value"
+  where -- Drop the b's which have been added as keys and call "error" if an 'a'
+        -- has been tagged as an alias
+        go (Right _, _)   = panic "reverseAliasesTwo" ["Alias added as a key"]
+        go (Left k, s)    = Just (k, Set.map errLeft s)
         errLeft (Right v) = v
+        errLeft (Left _)  = panic "reverseAliasesTwo" ["Unexpected Left value"]
 
 -- | What does this alias point to?
 aliasOf :: (?lc :: TypeContext, HasPtrWidth wptr)
@@ -1406,11 +1408,20 @@ aliasOf alias =
     L.ValSymbol    symb      -> Just symb
     L.ValConstExpr constExpr ->
       case transConstantExpr constExpr of
-        Right (SymbolConst symb 0) -> Just symb
-        _ -> Nothing
+        Right (SymbolConst symb 0) ->
+          Just symb
+        _ -> trace (unlines $ [ "[WARN] Couldn't translate constant expr for alias "
+                              , show (L.aliasName alias)
+                              , "target:"
+                              , show (L.aliasTarget alias)
+                              ]) Nothing
     -- All other things silently get dropped; it's invalid LLVM code to not have
     -- a symbol or constexpr.
-    _ -> Nothing
+    _ -> trace (unlines $ [ "[WARN] Illegal alias "
+                          , show (L.aliasName alias)
+                          , "target:"
+                          , show (L.aliasTarget alias)
+                          ]) Nothing
 
 -- | Get all the aliases that alias (transitively) to a certain global.
 globalAliases :: (?lc :: TypeContext, HasPtrWidth wptr)

@@ -71,6 +71,8 @@ import           Lang.Crucible.LLVM.TypeContext
 
 import           Lang.Crucible.Backend (IsSymInterface)
 
+import Debug.Trace
+
 ------------------------------------------------------------------------
 -- GlobalInitializerMap
 
@@ -160,10 +162,12 @@ initializeMemory sym llvm_ctx m = do
    -- Allocate function handles
    let funAliases = Map.mapKeys L.defName (functionAliases m)
    let lookupFunAliases symb =
+         (\x -> trace ("Aliases for " ++ show symb ++ ": " ++ show x) x) $
          Set.map L.aliasName $ fromMaybe Set.empty (Map.lookup symb funAliases)
    let handles =
          map (\(symb, hinfo) -> (symb, lookupFunAliases symb, hinfo)) $
-           Map.assocs (_symbolMap llvm_ctx)
+           Map.assocs ( (\x -> trace ("Symbol map: " ++ show (Map.keysSet x)) x) $
+                       _symbolMap llvm_ctx)
    mem <- foldM (allocLLVMHandleInfo sym) mem0 handles
    -- Allocate global values
    let globAliases = globalAliases m
