@@ -69,7 +69,7 @@ noAlignment = Alignment 0
 -- | @padToAlignment x a@ returns the smallest value greater than or
 -- equal to @x@ that is aligned to @a@.
 padToAlignment :: Bytes -> Alignment -> Bytes
-padToAlignment x (Alignment n) = toBytes (nextPow2Multiple (bytesToNatural x) (fromIntegral n))
+padToAlignment x (Alignment n) = fromInteger (nextPow2Multiple (bytesToInteger x) (fromIntegral n))
 
 -- | Convert a number of bytes into an alignment, if it is a power of 2.
 toAlignment :: Bytes -> Maybe Alignment
@@ -82,11 +82,11 @@ fromAlignment :: Alignment -> Bytes
 fromAlignment (Alignment n) = Bytes (2 ^ n)
 
 -- | Convert an exponent @n@ to an alignment of @2^n@ bytes.
-exponentToAlignment :: Natural -> Alignment
+exponentToAlignment :: Integer -> Alignment
 exponentToAlignment n = Alignment (fromIntegral n)
 
-alignmentToExponent :: Alignment -> Natural
-alignmentToExponent (Alignment n) = fromIntegral n
+alignmentToExponent :: Alignment -> Integer
+alignmentToExponent (Alignment n) = toInteger n
 
 newtype AlignInfo = AT (Map Natural Alignment)
   deriving (Eq)
@@ -215,7 +215,7 @@ layoutWarnings :: Simple Lens DataLayout [L.LayoutSpec]
 layoutWarnings = lens _layoutWarnings (\s v -> s { _layoutWarnings = v})
 
 ptrBitwidth :: DataLayout -> Natural
-ptrBitwidth dl = bytesToBits (dl^.ptrSize)
+ptrBitwidth dl = bytesToNatural (dl^.ptrSize)
 
 -- | Reduce the bit level alignment to a byte value, and error if it is not
 -- a multiple of 8.

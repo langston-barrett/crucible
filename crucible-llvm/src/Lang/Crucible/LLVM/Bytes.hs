@@ -16,8 +16,8 @@ module Lang.Crucible.LLVM.Bytes
   , Addr
   , Offset
   , bytesToBits
-  , bytesToNatural
   , bytesToInteger
+  , bytesToNatural
   , toBytes
   , bitsToBytes
   )  where
@@ -40,7 +40,7 @@ bytesToNatural :: Bytes -> Natural
 bytesToNatural (Bytes n) = n
 
 bytesToInteger :: Bytes -> Integer
-bytesToInteger (Bytes n) = fromIntegral n
+bytesToInteger (Bytes n) = toInteger n
 
 toBytes :: Integral a => a -> Bytes
 toBytes = Bytes . fromIntegral

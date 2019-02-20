@@ -108,8 +108,7 @@ module Lang.Crucible.Types
 
 import           Data.Hashable
 import           Data.Type.Equality
-import           GHC.TypeLits (Symbol)
-import           GHC.TypeNats (Nat, KnownNat)
+import           GHC.TypeLits
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Ctx

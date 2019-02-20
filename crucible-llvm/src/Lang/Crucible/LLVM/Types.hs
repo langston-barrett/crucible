@@ -37,7 +37,7 @@ module Lang.Crucible.LLVM.Types
   , globalSymbolName
   ) where
 
-import           GHC.TypeNats
+import           GHC.TypeLits
 import           Data.Typeable
 
 import           Data.Parameterized.Context

@@ -137,7 +137,7 @@ instrResultType instr =
           case gepRes of
             Left err -> fail err
             Right (GEPResult lanes tp _gep) ->
-              let n = natValue lanes in
+              let n = fromInteger (natValue lanes) in
               if n == 1 then
                 return (PtrType (MemType tp))
               else
@@ -400,13 +400,13 @@ evalGEP instr (GEPResult _lanes finalMemType gep0) = finish =<< go gep0
 
  go (GEP_vector_base n x) =
       do xs <- maybe badGEP (traverse asPtr) (asVector x)
-         unless (fromIntegral (Seq.length xs) == natValue n) badGEP
+         unless (toInteger (Seq.length xs) == natValue n) badGEP
          return xs
 
  go (GEP_scatter n gep) =
       do xs <- go gep
          unless (Seq.length xs == 1) badGEP
-         return (Seq.cycleTaking (widthVal n) xs)
+         return (Seq.cycleTaking (fromInteger (natValue n)) xs)
 
  go (GEP_field fi gep) =
       do xs <- go gep
@@ -657,7 +657,7 @@ castToInt :: (?lc::TypeContext,HasPtrWidth w, w ~ ArchWidth arch) =>
   LLVMExpr s arch ->
   MaybeT (LLVMGenerator' h s arch ret) (LLVMExpr s arch)
 castToInt (IntType w) (BaseExpr (LLVMPointerRepr wrepr) x)
-  | w == natValue wrepr
+  | toInteger w == natValue wrepr
   = lift (BaseExpr (BVRepr wrepr) <$> pointerAsBitvectorExpr wrepr x)
 
 castToInt FloatType (BaseExpr (FloatRepr SingleFloatRepr) x)
@@ -678,7 +678,7 @@ castFromInt :: (?lc::TypeContext,HasPtrWidth w, w ~ ArchWidth arch) =>
   LLVMExpr s arch -> MaybeT (LLVMGenerator' h s arch ret) (LLVMExpr s arch)
 
 castFromInt (IntType w1) w2 (BaseExpr (BVRepr w) x)
-  | w1 == w2, w1 == natValue w
+  | w1 == w2, toInteger w1 == natValue w
   = return (BaseExpr (LLVMPointerRepr w) (BitvectorAsPointerExpr w x))
 
 castFromInt FloatType 32 (BaseExpr (BVRepr w) x)
@@ -694,9 +694,8 @@ castFromInt X86_FP80Type 80 (BaseExpr (BVRepr w) x)
   = return (BaseExpr (FloatRepr X86_80FloatRepr) (app (FloatFromBinary X86_80FloatRepr x)))
 
 castFromInt (VecType n tp) w expr
-  | n > 0
-  , (w',0) <- w `divMod` n
-  , Some wrepr' <- mkNatRepr w'
+  | (w',0) <- w `divMod` n
+  , Just (Some wrepr') <- someNat (toInteger w')
   , Just LeqProof <- isPosNat wrepr'
   = do xs <- MaybeT (return (vecSplit wrepr' expr))
        VecExpr tp . Seq.fromList <$> traverse (castFromInt tp w') xs
@@ -799,7 +798,7 @@ raw_bitop ubConfig op w a b =
       L.Xor -> return $ App (BVXor w a b)
 
       L.Shl nuw nsw -> do
-        let wlit = App (BVLit w (intValue w))
+        let wlit = App (BVLit w (natValue w))
         assertUndefined_ UB.ShlOp2Big (App (BVUlt w b wlit))
 
         res <- AtomExpr <$> mkAtom (App (BVShl w a b))
@@ -825,7 +824,7 @@ raw_bitop ubConfig op w a b =
         nuwCond =<< nswCond =<< return res
 
       L.Lshr exact -> do
-        let wlit = App (BVLit w (intValue w))
+        let wlit = App (BVLit w (natValue w))
         assertUndefined_ UB.LshrOp2Big (App (BVUlt w b wlit))
 
         res <- AtomExpr <$> mkAtom (App (BVLshr w a b))
@@ -843,7 +842,7 @@ raw_bitop ubConfig op w a b =
 
       L.Ashr exact
         | Just LeqProof <- isPosNat w -> do
-           let wlit = App (BVLit w (intValue w))
+           let wlit = App (BVLit w (natValue w))
            assertUndefined_ UB.AshrOp2Big (App (BVUlt w b wlit))
 
            res <- AtomExpr <$> mkAtom (App (BVAshr w a b))

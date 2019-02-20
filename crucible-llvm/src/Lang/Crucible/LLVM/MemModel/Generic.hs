@@ -941,7 +941,7 @@ isAligned ::
 isAligned sym _w _p a
   | a == noAlignment = return (truePred sym)
 isAligned sym w (LLVMPointer _blk offset) a
-  | Some bits <- mkNatRepr (alignmentToExponent a)
+  | Just (Some bits) <- someNat (alignmentToExponent a)
   , Just LeqProof <- isPosNat bits
   , Just LeqProof <- testLeq bits w =
     do lowbits <- bvSelect sym (knownNat :: NatRepr 0) bits offset

@@ -58,7 +58,7 @@ import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Vector as V
 import           Data.Word
-import           GHC.TypeNats (KnownNat)
+import           GHC.TypeLits
 
 import qualified Data.Parameterized.Context as Ctx
 
