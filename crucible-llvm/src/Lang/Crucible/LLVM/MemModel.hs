@@ -90,7 +90,6 @@ module Lang.Crucible.LLVM.MemModel
   , mallocRaw
   , mallocConstRaw
   , constToLLVMVal
-  , constToLLVMValP
   , ptrMessage
 
     -- * Storage types
@@ -1330,8 +1329,6 @@ constToLLVMVal :: forall wptr sym io.
     -> MemImpl sym       -- ^ The current memory state, for looking up globals
     -> LLVMConst         -- ^ Constant expression to translate
     -> io (LLVMVal sym)  -- ^ Runtime representation of the constant expression
-
--- See comment on @LLVMVal@ on why we use a literal 0.
 constToLLVMVal sym mem =
   constToLLVMValP sym (\symb -> liftIO $ doResolveGlobal sym mem symb)
 

@@ -51,7 +51,6 @@ import qualified Data.Set as Set
 import           Data.Set (Set)
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import           Control.Monad.State (StateT, runStateT, get, put)
 import           Data.Maybe (fromMaybe)
 
 import qualified Text.LLVM.AST as L
@@ -71,7 +70,6 @@ import           Lang.Crucible.LLVM.Translation.Types
 import           Lang.Crucible.LLVM.TypeContext
 
 import           Lang.Crucible.Backend (IsSymInterface)
-import           Lang.Crucible.Panic (panic)
 
 import           GHC.Stack
 
@@ -232,7 +230,7 @@ populateGlobals select sym gimap mem0 = foldM f mem0 (Map.elems gimap)
   where
   f mem (gl, _) | not (select gl)    = return mem
   f _   (_,  Left msg)               = fail msg
-  f mem (gl, Right (mty, Just cval)) = populateGlobal sym gl mty cval gimap mem
+  f mem (gl, Right (mty, Just cval)) = populateGlobal sym gl mty cval mem
   f mem (_ , Right (_, Nothing))     = return mem
 
 
@@ -278,46 +276,11 @@ populateGlobal :: forall sym wptr.
   L.Global {- ^ The global to populate -} ->
   MemType {- ^ Type of the global -} ->
   LLVMConst {- ^ Constant value to initialize with -} ->
-  GlobalInitializerMap ->
   MemImpl sym ->
   IO (MemImpl sym)
-populateGlobal sym gl memty cval giMap mem =
+populateGlobal sym gl memty cval mem =
   do let alignment = memTypeAlign (llvmDataLayout ?lc) memty
-
-     -- So that globals can populate and look up the globals they reference
-     -- during initialization
-     let populateRec :: HasCallStack
-                     => L.Symbol -> StateT (MemImpl sym) IO (LLVMPtr sym wptr)
-         populateRec symbol = do
-           memimpl0 <- get
-           memimpl <-
-            case Map.lookup symbol (memImplGlobalMap mem) of
-              Just _  -> pure memimpl0 -- We already populated this one
-              Nothing ->
-                -- For explanations of the various modes of failure, see the
-                -- comment on 'GlobalInitializerMap'.
-                case Map.lookup symbol giMap of
-                  Nothing -> panic "populateGlobal" $
-                    [ "Couldn't find global variable: " ++ show symbol ]
-                  Just (glob, Left str) -> panic "populateGlobal" $
-                    [ "Couldn't find global variable's initializer: " ++
-                        show symbol
-                    , "Reason:"
-                    , str
-                    , "Full definition:"
-                    , show glob
-                    ]
-                  Just (glob, Right (_, Nothing)) -> panic "populateGlobal" $
-                    [ "Global was not a compile-time constant:" ++ show symbol
-                    , "Full definition:"
-                    , show glob
-                    ]
-                  Just (glob, Right (memty_, Just cval_)) ->
-                    liftIO $ populateGlobal sym glob memty_ cval_ giMap mem
-           put memimpl
-           liftIO $ doResolveGlobal sym memimpl symbol
-
      ty <- toStorableType memty
      ptr <- doResolveGlobal sym mem (L.globalSym gl)
-     (val, mem') <- runStateT (constToLLVMValP sym populateRec cval) mem
-     storeConstRaw sym mem' ptr ty alignment val
+     val <- constToLLVMVal sym mem cval
+     storeConstRaw sym mem ptr ty alignment val
