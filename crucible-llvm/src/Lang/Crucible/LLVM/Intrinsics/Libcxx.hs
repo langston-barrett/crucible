@@ -31,6 +31,7 @@ module Lang.Crucible.LLVM.Intrinsics.Libcxx
   , endlOverride
   , sentryOverride
   , sentryBoolOverride
+  , moneypunctDestructorOverride
   ) where
 
 import qualified ABI.Itanium as ABI
@@ -291,3 +292,16 @@ sentryBoolOverride =
               [ABI.VoidType]) -> True
       _ -> False
 
+------------------------------------------------------------------------
+-- *** locale
+
+-- | An override of the @bool@ operator (cast) on the @sentry@ class,
+--
+-- @sentry::operator bool()@
+moneypunctDestructorOverride :: (IsSymInterface sym, HasPtrWidth wptr, wptr ~ ArchWidth arch)
+                             => SomeCPPOverride p sym arch
+moneypunctDestructorOverride =
+  voidOverride $ \(L.Symbol nm) ->
+    and [ "moneypunct"    `isInfixOf` nm
+        , "D0"            `isInfixOf` nm
+        ]

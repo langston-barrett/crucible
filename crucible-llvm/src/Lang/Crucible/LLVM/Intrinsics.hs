@@ -221,4 +221,5 @@ define_overrides =
   , Libcxx.register_cpp_override Libcxx.endlOverride
   , Libcxx.register_cpp_override Libcxx.sentryOverride
   , Libcxx.register_cpp_override Libcxx.sentryBoolOverride
+  , Libcxx.register_cpp_override Libcxx.moneypunctDestructorOverride
   ]
