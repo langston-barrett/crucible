@@ -20,7 +20,9 @@ module What4.Solver.Boolector
   ) where
 
 import           Control.Concurrent
+import           Control.Lens(folded)
 import           Control.Monad
+import           Control.Monad.Identity
 import qualified Data.ByteString.UTF8 as UTF8
 import           Data.Map (Map)
 import qualified Data.Map as Map
@@ -28,7 +30,6 @@ import           Data.Text.Lazy (Text)
 import qualified Data.Text.Lazy as Text
 import qualified Data.Text.Lazy.Builder as Builder
 import           System.Exit
-import           System.IO
 import qualified System.IO.Streams as Streams
 import           System.Process
 import qualified Text.PrettyPrint.ANSI.Leijen as PP
@@ -44,9 +45,10 @@ import           What4.Expr.GroundEval
 import           What4.Solver.Adapter
 import qualified What4.Protocol.SMTLib2 as SMT2
 import           What4.Protocol.SMTWriter
-  (smtExprGroundEvalFn, renderTerm, SMTEvalFunctions(..))
+  (smtExprGroundEvalFn, SMTEvalFunctions(..), nullAcknowledgementAction)
 import           What4.Utils.Process
 import           What4.Utils.Streams
+import           What4.Utils.HandleReader
 
 data Boolector = Boolector
 
@@ -68,37 +70,54 @@ boolectorAdapter =
   SolverAdapter
   { solver_adapter_name = "boolector"
   , solver_adapter_config_options = boolectorOptions
-  , solver_adapter_check_sat = \sym logLn p cont -> do
-      res <- runBoolectorInOverride sym logLn p
-      cont (fmap (\x -> (x,Nothing)) res)
+  , solver_adapter_check_sat = \sym logData p cont -> do
+      res <- runBoolectorInOverride sym logData p
+      cont . runIdentity . traverseSatResult (\x -> pure (x,Nothing)) pure $ res
   , solver_adapter_write_smt2 =
-      SMT2.writeDefaultSMT2 () "Boolector" defaultWriteSMTLIB2Features
+      SMT2.writeDefaultSMT2 () nullAcknowledgementAction "Boolector" defaultWriteSMTLIB2Features
   }
 
 instance SMT2.SMTLib2Tweaks Boolector where
   smtlib2tweaks = Boolector
 
 runBoolectorInOverride :: ExprBuilder t st fs
-                       -> (Int -> String -> IO ())
-                       -> BoolExpr t
-                       -> IO (SatResult (GroundEvalFn t))
-runBoolectorInOverride sym logLn p  = do
+                       -> LogData
+                       -> [BoolExpr t]
+                       -> IO (SatResult (GroundEvalFn t) ())
+runBoolectorInOverride sym logData ps = do
   -- Get boolector path.
   path <- findSolverPath boolectorPath (getConfiguration sym)
+  p <- andAllOf sym folded ps
+
+  logSolverEvent sym
+    SolverStartSATQuery
+    { satQuerySolverName = "Boolector"
+    , satQueryReason = logReason logData
+    }
   withProcessHandles path ["-m"] Nothing $ \(in_h, out_h, err_h, ph) -> do
       -- Log stderr to output.
       err_stream <- Streams.handleToInputStream err_h
-      void $ forkIO $ logErrorStream err_stream (logLn 2)
+      void $ forkIO $ logErrorStream err_stream (logCallbackVerbose logData 2)
       -- Write SMT2 input to Boolector.
       bindings <- getSymbolVarBimap sym
-      wtr <- SMT2.newWriter Boolector in_h "Boolector" False noFeatures False bindings
+
+      in_str  <-
+        case logHandle logData of
+          Nothing -> Streams.encodeUtf8 =<< Streams.handleToOutputStream in_h
+          Just aux_h ->
+            do aux_str <- Streams.handleToOutputStream aux_h
+               Streams.encodeUtf8 =<< teeOutputStream aux_str =<< Streams.handleToOutputStream in_h
+
+      wtr <- SMT2.newWriter Boolector in_str nullAcknowledgementAction "Boolector"
+               False noFeatures False bindings
       SMT2.setLogic wtr SMT2.qf_bv
       SMT2.assume wtr p
 
       SMT2.writeCheckSat wtr
       SMT2.writeExit wtr
       -- Close input handle to tell boolector input is done.
-      hClose in_h
+      Streams.write Nothing in_str
+
       -- Read stdout to get output.
       out_stream <- Streams.handleToInputStream out_h
       line_stream <- Streams.map UTF8.toString =<< Streams.lines out_stream
@@ -112,7 +131,13 @@ runBoolectorInOverride sym logLn p  = do
         ExitFailure exit_code  ->
           fail $ "boolector exited with unexpected code: " ++ show exit_code
       -- Parse output.
-      parseBoolectorOutput wtr out_lines
+      res <- parseBoolectorOutput wtr out_lines
+      logSolverEvent sym
+         SolverEndSATQuery
+         { satQueryResult = forgetModelAndCore res
+         , satQueryError  = Nothing
+         }
+      return res
 
 parseBoolectorOutputLine :: Monad m => String -> m (Text, String)
 parseBoolectorOutputLine s =
@@ -150,15 +175,15 @@ lookupBoolectorVar m evalFn nm =
 
 parseBoolectorOutput :: SMT2.WriterConn t (SMT2.Writer Boolector)
                      -> [String]
-                     -> IO (SatResult (GroundEvalFn t))
+                     -> IO (SatResult (GroundEvalFn t) ())
 parseBoolectorOutput c out_lines =
   case out_lines of
-    "unsat":_ -> return Unsat
+    "unsat":_ -> return (Unsat ())
     "sat":mdl_lines0 -> do
       let mdl_lines = filter (/= "") mdl_lines0
       m <- Map.fromList <$> mapM parseBoolectorOutputLine mdl_lines
-      let evalBool tm = lookupBoolectorVar m boolectorBoolValue (Builder.toLazyText (renderTerm tm))
-      let evalBV w tm = lookupBoolectorVar m (boolectorBVValue w) (Builder.toLazyText (renderTerm tm))
+      let evalBool tm = lookupBoolectorVar m boolectorBoolValue   $ Builder.toLazyText $ SMT2.renderTerm tm
+      let evalBV w tm = lookupBoolectorVar m (boolectorBVValue w) $ Builder.toLazyText $ SMT2.renderTerm tm
       let evalReal _ = fail "Boolector does not support real variables."
       let evalFloat _ = fail "Boolector does not support floats."
       let evalFns = SMTEvalFunctions { smtEvalBool = evalBool

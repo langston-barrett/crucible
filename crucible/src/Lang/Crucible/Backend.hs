@@ -19,8 +19,7 @@ for interacting with the symbolic simulator.
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ViewPatterns #-}
 module Lang.Crucible.Backend
-  ( BranchResult(..)
-  , IsBoolSolver(..)
+  ( IsBoolSolver(..)
   , IsSymInterface
 
     -- * Assumption management
@@ -114,7 +113,7 @@ data AbortExecReason =
   | AssumedFalse AssumptionReason
     -- ^ We assumed false on some branch
 
-  | VariantOptionsExhaused ProgramLoc
+  | VariantOptionsExhausted ProgramLoc
     -- ^ We tried all possible cases for a variant, and now we should
     -- do something else.
 
@@ -130,34 +129,25 @@ ppAbortExecReason e =
     AssumedFalse reason ->
       "Abort due to false assumption:" PP.<$$>
       PP.indent 2 (ppAssumptionReason reason)
-    VariantOptionsExhaused l -> ppLocated l "Variant options exhaused."
+    VariantOptionsExhausted l -> ppLocated l "Variant options exhausted."
 
 ppAssumptionReason :: AssumptionReason -> PP.Doc
 ppAssumptionReason e =
   case e of
     AssumptionReason l msg -> ppLocated l (PP.text msg)
-    ExploringAPath l Nothing -> "The branch at " PP.<+> ppLoc l
+    ExploringAPath l Nothing -> "The branch in" PP.<+> ppFn l PP.<+> "at" PP.<+> ppLoc l
     ExploringAPath l (Just t) ->
-        "The branch from" PP.<+> ppLoc l PP.<+> "to" PP.<+> ppLoc t
+        "The branch in" PP.<+> ppFn l PP.<+> "from" PP.<+> ppLoc l PP.<+> "to" PP.<+> ppLoc t
     AssumingNoError simErr -> ppSimError simErr
 
 ppLocated :: ProgramLoc -> PP.Doc -> PP.Doc
-ppLocated l x = ppLoc l PP.<> ":" PP.<+> x
+ppLocated l x = "in" PP.<+> ppFn l PP.<+> ppLoc l PP.<> ":" PP.<+> x
+
+ppFn :: ProgramLoc -> PP.Doc
+ppFn l = PP.pretty (plFunction l)
 
 ppLoc :: ProgramLoc -> PP.Doc
 ppLoc l = PP.pretty (plSourceLoc l)
-
--- | Result of attempting to branch on a predicate.
-data BranchResult
-     -- | Branch is symbolic.
-     --
-     -- The Boolean value indicates whether the backend suggests that the active
-     -- path should be the case where the condition is true or false.
-   = SymbolicBranch !Bool
-
-     -- | No branch is needed, and the predicate is evaluated to the
-     -- given value.
-   | NoBranch !Bool
 
 type IsSymInterface sym =
   ( IsBoolSolver sym
@@ -173,12 +163,6 @@ class IsBoolSolver sym where
   ----------------------------------------------------------------------
   -- Branch manipulations
 
-  -- | Given a Boolean predicate that the simulator wishes to branch on,
-  --   this decides what the next course of action should be for the branch.
-  evalBranch :: sym
-             -> Pred sym -- Predicate to branch on.
-             -> IO BranchResult
-
   -- | Push a new assumption frame onto the stack.  Assumptions and assertions
   --   made will now be associated with this frame on the stack until a new
   --   frame is pushed onto the stack, or until this one is popped.
@@ -189,6 +173,19 @@ class IsBoolSolver sym where
   --   with pushes.  In particular, if the given frame identifier is not
   --   the identifier of the top frame on the stack, an error will be raised.
   popAssumptionFrame :: sym -> AS.FrameIdentifier -> IO (Seq (Assumption sym))
+
+  -- | Pop all assumption frames up to and including the frame with the given
+  --   frame identifier.  This operation will panic if the named frame does
+  --   not exist on the stack.
+  popUntilAssumptionFrame :: sym -> AS.FrameIdentifier -> IO ()
+
+  -- | Pop an assumption frame from the stack.  The collected assummptions
+  --   in this frame are returned, along with any proof obligations that were
+  --   incurred while the frame was active. Pops are required to be well-bracketed
+  --   with pushes.  In particular, if the given frame identifier is not
+  --   the identifier of the top frame on the stack, an error will be raised.
+  popAssumptionFrameAndObligations ::
+    sym -> AS.FrameIdentifier -> IO (Seq (Assumption sym), ProofObligations sym)
 
   ----------------------------------------------------------------------
   -- Assertions
@@ -271,8 +268,6 @@ addFailedAssertion sym msg =
                         SimError { simErrorLoc = loc, simErrorReason = msg }
 
 
-
-
 -- | Run the given action to compute a predicate, and assert it.
 addAssertionM ::
   (IsExprBuilder sym, IsBoolSolver sym) =>
@@ -313,16 +308,18 @@ ppProofObligation :: IsSymInterface sym => sym -> ProofObligation sym -> PP.Doc
 ppProofObligation _ (AS.ProofGoal (toList -> as) gl) =
   (if null as then PP.empty else
     PP.text "Assuming:" PP.<$$>
-    PP.vcat (map ppAsm (toList as)))
+    PP.vcat (concatMap ppAsm (toList as)))
   PP.<$>
   PP.text "Prove:" PP.<$>
   ppGl
  where
- ppAsm asm = PP.text "* " PP.<> PP.hang 2
-   (ppAssumptionReason (asm^.AS.labeledPredMsg) PP.<$>
-    printSymExpr (asm^.AS.labeledPred))
+ ppAsm asm
+   | asConstantPred (asm^.AS.labeledPred) /= Just True =
+      [PP.text "* " PP.<> PP.hang 2
+        (ppAssumptionReason (asm^.AS.labeledPredMsg) PP.<$>
+        printSymExpr (asm^.AS.labeledPred))]
+   | otherwise = []
 
  ppGl = PP.indent 2
    (ppSimError (gl^.AS.labeledPredMsg) PP.<$>
     printSymExpr (gl^.AS.labeledPred))
-

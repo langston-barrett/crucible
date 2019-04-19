@@ -12,15 +12,20 @@ and for the core SSA-form CFGs ("Lang.Crucible.CFG.Core").
 
 Evaluation of expressions is defined in module "Lang.Crucible.Simulator.Evaluation".
 -}
+
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE InstanceSigs #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -56,22 +61,26 @@ module Lang.Crucible.CFG.Expr
 
 import           Control.Monad.Identity
 import           Control.Monad.State.Strict
+import           Data.Kind (Type)
 import           Data.Text (Text)
 import           Data.Vector (Vector)
-import qualified Data.Vector as V
 import           Numeric.Natural
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
+import qualified Data.Vector as V
 
 import           Data.Parameterized.Classes
+import           Data.Parameterized.ClassesC (TestEqualityC(..), OrdC(..))
 import qualified Data.Parameterized.Context as Ctx
 import qualified Data.Parameterized.TH.GADT as U
+import           Data.Parameterized.TraversableF
 import           Data.Parameterized.TraversableFC
 
 import           What4.Interface (RoundingMode(..))
 
 import           Lang.Crucible.CFG.Extension
-import           Lang.Crucible.Types
+import           Lang.Crucible.CFG.Extension.Safety
 import           Lang.Crucible.FunctionHandle
+import           Lang.Crucible.Types
 import           Lang.Crucible.Utils.PrettyPrint
 import qualified Lang.Crucible.Utils.Structural as U
 
@@ -81,7 +90,7 @@ import qualified Lang.Crucible.Utils.Structural as U
 -- | Base terms represent the subset of expressions
 --   of base types, packaged together with a run-time
 --   representation of their type.
-data BaseTerm (f :: CrucibleType -> *) tp
+data BaseTerm (f :: CrucibleType -> Type) tp
    = BaseTerm { baseTermType :: !(BaseTypeRepr tp)
               , baseTermVal  :: !(f (BaseToType tp))
               }
@@ -164,7 +173,7 @@ pattern BVIte c w x y = BaseIte (BaseBVRepr w) c x y
 -- by the given expression form. Parameter @f@ is used everywhere a
 -- recursive sub-expression would go.  Uses of the 'App' type will
 -- tie the knot through this parameter.
-data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
+data App (ext :: Type) (f :: CrucibleType -> Type) (tp :: CrucibleType) where
 
   ----------------------------------------------------------------------
   -- Syntax Extension
@@ -381,12 +390,28 @@ data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
   FloatNe :: !(f (FloatType fi)) -> !(f (FloatType fi)) -> App ext f BoolType
   FloatFpNe :: !(f (FloatType fi)) -> !(f (FloatType fi)) -> App ext f BoolType
 
+  FloatIte
+    :: !(FloatInfoRepr fi)
+    -> !(f BoolType)
+    -> !(f (FloatType fi))
+    -> !(f (FloatType fi))
+    -> App ext f (FloatType fi)
+
   -- Conversion operations
   FloatCast
     :: !(FloatInfoRepr fi)
     -> !RoundingMode
     -> !(f (FloatType fi'))
     -> App ext f (FloatType fi)
+  FloatFromBinary
+    :: !(FloatInfoRepr fi)
+    -> !(f (BVType (FloatInfoToBitWidth fi)))
+    -> App ext f (FloatType fi)
+  FloatToBinary
+    :: (1 <= FloatInfoToBitWidth fi)
+    => !(FloatInfoRepr fi)
+    -> !(f (FloatType fi))
+    -> App ext f (BVType (FloatInfoToBitWidth fi))
   FloatFromBV
     :: (1 <= w)
     => !(FloatInfoRepr fi)
@@ -450,11 +475,10 @@ data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
 
   ----------------------------------------------------------------------
   -- Side conditions
-  AddSideCondition :: BaseTypeRepr bt
-                   -> !(f (BoolType))
-                   -> String
-                   -> !(f (BaseToType bt))
-                   -> App ext f (BaseToType bt)
+
+  WithAssertion :: !(TypeRepr tp)
+                -> !(PartialExpr ext f tp)
+                -> App ext f tp
 
   ----------------------------------------------------------------------
   -- Recursive Types
@@ -627,6 +651,11 @@ data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
         -> !(f (BVType w))
         -> App ext f (BVType w)
 
+  BVNeg :: (1 <= w)
+        => !(NatRepr w)
+        -> !(f (BVType w))
+        -> App ext f (BVType w)
+
   BVAdd :: (1 <= w)
         => !(NatRepr w)
         -> !(f (BVType w))
@@ -741,6 +770,38 @@ data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
          -> !(f (BVType w)) -- Value to shift
          -> !(f (BVType w)) -- The shift amount as an unsigned integer.
          -> App ext f (BVType w)
+
+  -- Return the minimum of the two arguments using unsigned comparisons
+  BVUMin ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(f (BVType w)) ->
+    !(f (BVType w)) ->
+    App ext f (BVType w)
+
+  -- Return the maximum of the two arguments using unsigned comparisons
+  BVUMax ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(f (BVType w)) ->
+    !(f (BVType w)) ->
+    App ext f (BVType w)
+
+  -- Return the minimum of the two arguments using signed comparisons
+  BVSMin ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(f (BVType w)) ->
+    !(f (BVType w)) ->
+    App ext f (BVType w)
+
+  -- Return the maximum of the two arguments using signed comparisons
+  BVSMax ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(f (BVType w)) ->
+    !(f (BVType w)) ->
+    App ext f (BVType w)
 
   -- Given a Boolean, returns one if Boolean is True and zero otherwise.
   BoolToBV :: (1 <= w)
@@ -860,6 +921,10 @@ data App (ext :: *) (f :: CrucibleType -> *) (tp :: CrucibleType) where
 
   ShowValue :: !(BaseTypeRepr bt)
             -> !(f (BaseToType bt))
+            -> App ext f StringType
+
+  ShowFloat :: !(FloatInfoRepr fi)
+            -> !(f (FloatType fi))
             -> App ext f StringType
 
   AppendString :: !(f StringType)
@@ -992,7 +1057,11 @@ instance TypeApp (ExprExtension ext) => TypeApp (App ext) where
     FloatGe{} -> knownRepr
     FloatNe{} -> knownRepr
     FloatFpNe{} -> knownRepr
+    FloatIte fi _ _ _ -> FloatRepr fi
     FloatCast fi _ _ -> FloatRepr fi
+    FloatFromBinary fi _ -> FloatRepr fi
+    FloatToBinary fi _ -> case floatInfoToBVTypeRepr fi of
+      BaseBVRepr w -> BVRepr w
     FloatFromBV fi _ _ -> FloatRepr fi
     FloatFromSBV fi _ _ -> FloatRepr fi
     FloatFromReal fi _ _ -> FloatRepr fi
@@ -1016,7 +1085,7 @@ instance TypeApp (ExprExtension ext) => TypeApp (App ext) where
 
     ----------------------------------------------------------------------
     -- Side conditions
-    AddSideCondition tp _ _ _ -> baseToType tp
+    WithAssertion tp _ -> tp
 
     ----------------------------------------------------------------------
     -- Recursive Types
@@ -1083,6 +1152,7 @@ instance TypeApp (ExprExtension ext) => TypeApp (App ext) where
     BVAnd w _ _ -> BVRepr w
     BVOr  w _ _ -> BVRepr w
     BVXor  w _ _ -> BVRepr w
+    BVNeg w _ -> BVRepr w
     BVAdd w _ _ -> BVRepr w
     BVSub w _ _ -> BVRepr w
     BVMul w _ _ -> BVRepr w
@@ -1100,6 +1170,10 @@ instance TypeApp (ExprExtension ext) => TypeApp (App ext) where
     BVShl w _ _ -> BVRepr w
     BVLshr w _ _ -> BVRepr w
     BVAshr w _ _ -> BVRepr w
+    BVUMax w _ _ -> BVRepr w
+    BVUMin w _ _ -> BVRepr w
+    BVSMax w _ _ -> BVRepr w
+    BVSMin w _ _ -> BVRepr w
 
     BoolToBV w _ -> BVRepr w
     BvToNat{} -> knownRepr
@@ -1133,6 +1207,7 @@ instance TypeApp (ExprExtension ext) => TypeApp (App ext) where
 
     TextLit{} -> knownRepr
     ShowValue{} -> knownRepr
+    ShowFloat{} -> knownRepr
     AppendString{} -> knownRepr
 
     ------------------------------------------------------------------------
@@ -1171,6 +1246,7 @@ testVector testF x y = do
     Nothing -> Nothing
 
 compareVector :: forall f tp. (forall x y. f x -> f y -> OrderingF x y)
+
               -> Vector (f tp) -> Vector (f tp) -> OrderingF Int Int
 compareVector cmpF x y
     | V.length x < V.length y = LTF
@@ -1209,6 +1285,11 @@ instance PrettyApp (ExprExtension ext) => PrettyApp (App ext) where
           , ( U.ConType [t|Vector|] `U.TypeApp` U.AnyType
             , [| \pp v -> brackets (commas (fmap pp v)) |]
             )
+          , ( U.ConType [t|PartialExpr|] `U.TypeApp` U.AnyType
+                                         `U.TypeApp` U.AnyType
+                                         `U.TypeApp` U.AnyType
+            , [| \_ _ -> text "<some assertion>" |]
+            )
           ])
 
 ------------------------------------------------------------------------
@@ -1222,7 +1303,11 @@ traverseBaseTerm f = traverseFC (traverseFC f)
 
 -- | Traversal that performs the given action on each immediate
 -- subterm of an application. Used for the 'TraversableFC' instance.
-traverseApp :: (TraversableFC (ExprExtension ext), Applicative m)
+traverseApp :: forall ext m f g tp.
+               ( TraversableFC (ExprExtension ext)
+               , TraversableF (AssertionClassifier ext)
+               , Applicative m
+               )
             => (forall u . f u -> m (g u))
             -> App ext f tp -> m (App ext g tp)
 traverseApp =
@@ -1240,44 +1325,61 @@ traverseApp =
          `U.TypeApp` U.AnyType
        , [| traverseBaseTerm |]
        )
+     , ( U.ConType [t|PartialExpr|] `U.TypeApp` U.AnyType
+                                    `U.TypeApp` U.AnyType
+                                    `U.TypeApp` U.AnyType
+       , [| traverseFC |]
+       )
      ])
 
 ------------------------------------------------------------------------------
 -- Parameterized Eq and Ord instances
 
-instance TestEqualityFC (ExprExtension ext) => TestEqualityFC (App ext) where
-  testEqualityFC testSubterm
-      = $(U.structuralTypeEquality [t|App|]
-                   [ (U.DataArg 1                   `U.TypeApp` U.AnyType, [|testSubterm|])
-                   , (U.ConType [t|ExprExtension|] `U.TypeApp`
-                           U.DataArg 0 `U.TypeApp` U.DataArg 1 `U.TypeApp` U.AnyType,
-                       [|testEqualityFC testSubterm|]
-                     )
-                   , (U.ConType [t|NatRepr |]       `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|SymbolRepr |]    `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|TypeRepr|]       `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|BaseTypeRepr|]  `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|FloatInfoRepr|]  `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|Ctx.Assignment|] `U.TypeApp`
-                         (U.ConType [t|BaseTerm|] `U.TypeApp` U.AnyType) `U.TypeApp` U.AnyType
-                     , [| testEqualityFC (testEqualityFC testSubterm) |]
-                     )
-                   , (U.ConType [t|Ctx.Assignment|] `U.TypeApp` U.DataArg 1 `U.TypeApp` U.AnyType
-                     , [| testEqualityFC testSubterm |]
-                     )
-                   , (U.ConType [t|CtxRepr|] `U.TypeApp` U.AnyType
-                     , [| testEquality |]
-                     )
-                   , (U.ConType [t|Ctx.Index|] `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|testEquality|])
-                   , (U.ConType [t|FnHandle|]  `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|testFnHandle|])
-                   , (U.ConType [t|Vector|]    `U.TypeApp` U.AnyType, [|testVector testSubterm|])
-                   ]
-                  )
+instance ( TestEqualityFC (ExprExtension ext)
+         , TestEqualityC (AssertionClassifier ext)
+         ) => TestEqualityFC (App ext) where
+  testEqualityFC testSubterm =
+    $(U.structuralTypeEquality [t|App|]
+        [ (U.DataArg 1                   `U.TypeApp` U.AnyType, [|testSubterm|])
+        , (U.ConType [t|ExprExtension|] `U.TypeApp`
+                U.DataArg 0 `U.TypeApp` U.DataArg 1 `U.TypeApp` U.AnyType,
+            [|testEqualityFC testSubterm|]
+          )
+        , (U.ConType [t|NatRepr |]       `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|SymbolRepr |]    `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|TypeRepr|]       `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|BaseTypeRepr|]  `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|FloatInfoRepr|]  `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|Ctx.Assignment|] `U.TypeApp`
+              (U.ConType [t|BaseTerm|] `U.TypeApp` U.AnyType) `U.TypeApp` U.AnyType
+          , [| testEqualityFC (testEqualityFC testSubterm) |]
+          )
+        , (U.ConType [t|Ctx.Assignment|] `U.TypeApp` U.DataArg 1 `U.TypeApp` U.AnyType
+          , [| testEqualityFC testSubterm |]
+          )
+        , (U.ConType [t|CtxRepr|] `U.TypeApp` U.AnyType
+          , [| testEquality |]
+          )
+        , (U.ConType [t|Ctx.Index|] `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|testEquality|])
+        , (U.ConType [t|FnHandle|]  `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|testFnHandle|])
+        , (U.ConType [t|Vector|]    `U.TypeApp` U.AnyType, [|testVector testSubterm|])
+        , ( U.ConType [t|PartialExpr|] `U.TypeApp` U.AnyType
+                                       `U.TypeApp` U.AnyType
+                                       `U.TypeApp` U.AnyType
+          , [| testEqualityFC testSubterm |]
+          )
+        ])
 
-instance (TestEqualityFC (ExprExtension ext), TestEquality f) => TestEquality (App ext f) where
+instance ( TestEqualityFC (ExprExtension ext)
+         , TestEqualityC (AssertionClassifier ext)
+         , TestEquality f
+         ) => TestEquality (App ext f) where
   testEquality = testEqualityFC testEquality
 
-instance OrdFC (ExprExtension ext) => OrdFC (App ext) where
+instance ( OrdFC (ExprExtension ext)
+         , OrdC  (AssertionClassifier ext)
+         , TestEqualityC (AssertionClassifier ext)
+         ) => OrdFC (App ext) where
   compareFC compareSubterm
         = $(U.structuralTypeOrd [t|App|]
                    [ (U.DataArg 1            `U.TypeApp` U.AnyType, [|compareSubterm|])
@@ -1303,25 +1405,43 @@ instance OrdFC (ExprExtension ext) => OrdFC (App ext) where
                    , (U.ConType [t|Ctx.Index|] `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|compareF|])
                    , (U.ConType [t|FnHandle|]  `U.TypeApp` U.AnyType `U.TypeApp` U.AnyType, [|compareFnHandle|])
                    , (U.ConType [t|Vector|]    `U.TypeApp` U.AnyType, [|compareVector compareSubterm|])
+                   , ( U.ConType [t|PartialExpr|] `U.TypeApp` U.AnyType
+                                                  `U.TypeApp` U.AnyType
+                                                  `U.TypeApp` U.AnyType
+                     , [| compareFC compareSubterm |]
+                     )
                    ]
                   )
-instance (OrdFC (ExprExtension ext), OrdF f) => OrdF (App ext f) where
+
+instance ( OrdFC (ExprExtension ext)
+         , OrdC (AssertionClassifier ext)
+         , TestEqualityC (AssertionClassifier ext)
+         , OrdF f
+         ) => OrdF (App ext f) where
   compareF = compareFC compareF
 
 -------------------------------------------------------------------------------------
 -- Traversals and such
 
-instance TraversableFC (ExprExtension ext) => FunctorFC (App ext) where
+instance ( TraversableFC (ExprExtension ext)
+         , TraversableF (AssertionClassifier ext)
+         ) => FunctorFC (App ext) where
   fmapFC = fmapFCDefault
 
-instance TraversableFC (ExprExtension ext) => FoldableFC (App ext) where
+instance ( TraversableFC (ExprExtension ext)
+         , TraversableF (AssertionClassifier ext)
+         ) => FoldableFC (App ext) where
   foldMapFC = foldMapFCDefault
 
-instance TraversableFC (ExprExtension ext) => TraversableFC (App ext) where
+instance ( TraversableFC (ExprExtension ext)
+         , TraversableF (AssertionClassifier ext)
+         ) => TraversableFC (App ext) where
   traverseFC = traverseApp
 
 -- | Fold over an application.
-foldApp :: TraversableFC (ExprExtension ext)
+foldApp :: ( TraversableFC (ExprExtension ext)
+           , TraversableF (AssertionClassifier ext)
+           )
         => (forall x . f x -> r -> r)
         -> r
         -> App ext f tp
@@ -1331,6 +1451,8 @@ foldApp f0 r0 a = execState (traverseApp (go f0) a) r0
 
 -- | Map a Crucible-type-preserving function over the immediate
 -- subterms of an application.
-mapApp :: TraversableFC (ExprExtension ext)
+mapApp :: ( TraversableFC (ExprExtension ext)
+          , TraversableF (AssertionClassifier ext)
+          )
        => (forall u . f u -> g u) -> App ext f tp -> App ext g tp
 mapApp f a = runIdentity (traverseApp (pure . f) a)

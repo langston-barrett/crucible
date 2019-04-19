@@ -29,7 +29,7 @@ import           Data.Foldable (toList)
 import           Data.IORef
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some
-import           Data.Sequence (Seq)
+--import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import qualified Data.Text as Text
 import qualified Data.Vector as V
@@ -53,7 +53,7 @@ import           Lang.Crucible.Server.Verification.Harness
 import           Lang.Crucible.Server.Verification.Override
 import           Lang.Crucible.Simulator.CallFrame (SomeHandle(..))
 import           Lang.Crucible.Simulator.ExecutionTree
-import           Lang.Crucible.Simulator.EvalStmt (executeCrucible)
+import           Lang.Crucible.Simulator.EvalStmt (executeCrucible,genericToExecutionFeature)
 import           Lang.Crucible.Simulator.GlobalState
 import           Lang.Crucible.Simulator.OverrideSim
 import           Lang.Crucible.Simulator.RegMap
@@ -64,7 +64,7 @@ import qualified Verifier.SAW.SharedTerm as SAW
 import qualified Verifier.SAW.Recognizer as SAW
 
 sawServerOptions :: [ConfigDesc]
-sawServerOptions = SAW.sawOptions
+sawServerOptions = []
 
 sawServerOverrides :: [Simulator p (SAWBack n) -> IO SomeHandle]
 sawServerOverrides = []
@@ -162,11 +162,11 @@ sawFulfillSimulateVerificationHarnessRequest sim harness opts =
                   ret <- regValue <$> (checkedRegEntry (BVRepr w) =<< fromProtoValue sim (opts^.P.verificationSimulateOptions_return_address))
                   fn  <- regValue <$> (checkedRegEntry (verifFnRepr rw w) =<< fromProtoValue sim (opts^.P.verificationSimulateOptions_program))
 
-                  let simSt = initSimState ctx emptyGlobals (serverErrorHandler sim)
+                  let simSt = InitialState ctx emptyGlobals (serverErrorHandler sim)
+                                $ runOverrideSim UnitRepr
+                                    (simulateHarness sim rw w sc cryEnv' harness' pc sp ret fn)
 
-                  exec_res <- executeCrucible simSt $ runOverrideSim UnitRepr
-                                (simulateHarness sim rw w sc cryEnv' harness' pc sp ret fn)
-
+                  exec_res <- executeCrucible (map genericToExecutionFeature (simExecFeatures sim)) simSt
                   case exec_res of
                     FinishedResult ctx' (TotalRes (GlobalPair _r _globals)) -> do
                       sendTextResponse sim "Finished!"

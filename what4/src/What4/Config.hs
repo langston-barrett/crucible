@@ -39,7 +39,7 @@
 -- etc.) as well as the allowed settings of that value.  In addition,
 -- options can take arbitrary actions when their values are changed in
 -- the @opt_onset@ callback.
--- 
+--
 -- Every configuration comes with the built-in `verbosity`
 -- configuration option pre-defined.  A `Config` value is constructed
 -- using the `initialConfig` operation, which should be given the
@@ -156,6 +156,7 @@ import           Control.Lens ((&))
 import           Control.Monad.Identity
 import           Control.Monad.IO.Class
 import           Control.Monad.Writer.Strict hiding ((<>))
+import           Data.Kind
 import           Data.Maybe
 import           Data.Typeable
 import           Data.Foldable (toList)
@@ -217,7 +218,7 @@ configOption tp nm =
 
 -- | Split a text value on \' characters.  Return @Nothing@ if
 --   the whole string, or any of its segments, is the empty string.
-splitPath :: Text -> Maybe (NonEmpty Text) 
+splitPath :: Text -> Maybe (NonEmpty Text)
 splitPath nm =
    let nms = Text.splitOn "." nm in
    case nms of
@@ -599,7 +600,7 @@ adjustConfigTrie     [] f (Just (ConfigTrie x m)) = g <$> f x
 adjustConfigMap :: Functor t => Text -> [Text] -> (Maybe ConfigLeaf -> t (Maybe ConfigLeaf)) -> ConfigMap -> t ConfigMap
 adjustConfigMap a as f = Map.alterF (adjustConfigTrie as f) a
 
--- | Traverse an entire @ConfigMap@.  The first argument is 
+-- | Traverse an entire @ConfigMap@.  The first argument is
 traverseConfigMap ::
   Applicative t =>
   [Text] {- ^ A REVERSED LIST of the name segments that represent the context from the root to the current @ConfigMap@. -} ->
@@ -608,7 +609,7 @@ traverseConfigMap ::
   t ConfigMap
 traverseConfigMap revPath f = Map.traverseWithKey (\k -> traverseConfigTrie (k:revPath) f)
 
--- | Traverse an entire @ConfigTrie@.  
+-- | Traverse an entire @ConfigTrie@.
 traverseConfigTrie ::
   Applicative t =>
   [Text] {- ^ A REVERSED LIST of the name segments that represent the context from the root to the current @ConfigTrie@. -} ->
@@ -697,7 +698,7 @@ verbosityLogger cfg h =
 -- | A utility class for making working with option settings
 --   easier.  The @tp@ argument is a @BaseType@, and the @a@
 --   argument is an associcated Haskell type.
-class Opt (tp :: BaseType) (a :: *) | tp -> a where
+class Opt (tp :: BaseType) (a :: Type) | tp -> a where
   -- | Return the current value of the option, as a @Maybe@ value.
   getMaybeOpt :: OptionSetting tp -> IO (Maybe a)
 

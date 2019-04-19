@@ -14,6 +14,9 @@ module What4.Solver
   , ExprRangeBindings
   , defaultSolverAdapter
   , solverAdapterOptions
+  , LogData(..)
+  , logCallback
+  , defaultLogData
 
     -- * Boolector
   , boolectorAdapter
@@ -33,7 +36,7 @@ module What4.Solver
   , drealPath
   , runDRealInOverride
   , writeDRealSMT2File
-  
+
     -- * STP
   , stpAdapter
   , stpPath

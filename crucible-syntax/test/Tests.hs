@@ -1,5 +1,6 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 module Main where
 
 import Control.Applicative
@@ -18,6 +19,7 @@ import Lang.Crucible.Syntax.Concrete hiding (SyntaxError)
 import Lang.Crucible.Syntax.Prog
 import Lang.Crucible.Syntax.SExpr
 import Lang.Crucible.Syntax.ExprParse
+import Lang.Crucible.Syntax.Overrides as SyntaxOvrs
 import Lang.Crucible.CFG.SSAConversion
 
 import Test.Tasty (defaultMain, TestTree, testGroup)
@@ -26,7 +28,14 @@ import Test.Tasty.HUnit
 import qualified Text.Megaparsec as MP
 import System.FilePath
 import System.Directory
+
+import What4.Config
 import What4.ProgramLoc
+import What4.Solver.Z3 (z3Options)
+
+
+
+import Overrides as TestOvrs
 
 for = flip map
 
@@ -58,10 +67,18 @@ findParseTests wd =
        , let goodFile = replaceExtension input ".out.good"
        ]
 
+testOptions :: [ConfigDesc]
+testOptions = z3Options
+
 testSimulator :: FilePath -> FilePath -> IO ()
 testSimulator inFile outFile =
   do contents <- T.readFile inFile
-     withFile outFile WriteMode $ simulateProgram inFile contents
+     withFile outFile WriteMode $ \outh ->
+       simulateProgram inFile contents outh Nothing testOptions
+         (\sym ha ->
+           do os1 <- SyntaxOvrs.setupOverrides sym ha
+              os2 <- TestOvrs.setupOverrides sym ha
+              return $ concat [os1,os2])
 
 findSimTests :: FilePath -> IO TestTree
 findSimTests wd =
@@ -84,9 +101,11 @@ data Lam = Lam [Text] (Datum TrivialAtom) deriving (Eq, Show)
 syntaxParsing :: TestTree
 syntaxParsing =
   let
+    anyUnit :: SyntaxParse TrivialAtom h ()
     anyUnit = anything *> pure ()
+    vars :: SyntaxParse TrivialAtom h [TrivialAtom]
     vars = describe "sequence of variable bindings" $ rep atomic
-    distinctVars :: SyntaxParse TrivialAtom [TrivialAtom]
+    distinctVars :: SyntaxParse TrivialAtom h [TrivialAtom]
     distinctVars = sideCondition' "sequence of distinct variable bindings" (\xs -> nub xs == xs) vars
     lambda =
       fmap (\(_, (xs, (body, ()))) -> Lam [x | TrivialAtom x <- xs] (syntaxToDatum body))
@@ -97,7 +116,7 @@ syntaxParsing =
        [ testCase "Empty list is empty list" $
          syntaxTest "()" emptyList @?= Right ()
        , testCase "Empty list is not atom" $
-         syntaxTest "()" (atom "foo") @?=
+         syntaxTest "()" (atom ("foo" :: TrivialAtom)) @?=
            Left
              (SyntaxError $ pure $
                Reason { expr = Syntax {unSyntax = Posd {pos = fakeFilePos 1 1, pos_val = List []}}
@@ -205,8 +224,8 @@ fakeFile = "test input"
 fakeFilePos :: Int -> Int -> Position
 fakeFilePos = SourcePos fakeFile
 
-syntaxTest :: Text -> SyntaxParse TrivialAtom a -> Either (SyntaxError TrivialAtom) a
+syntaxTest :: Text -> (forall h. SyntaxParse TrivialAtom h a) -> Either (SyntaxError TrivialAtom) a
 syntaxTest txt p =
   case MP.parse (skipWhitespace *> sexp (TrivialAtom <$> identifier) <* MP.eof) (T.unpack fakeFile) txt of
-     Left err -> error $ "Reader error: " ++ MP.parseErrorPretty' txt err
+     Left err -> error $ "Reader error: " ++ MP.errorBundlePretty err
      Right sexpr -> syntaxParse p sexpr

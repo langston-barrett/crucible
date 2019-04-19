@@ -48,6 +48,7 @@ module Lang.Crucible.Simulator
   , emptyRegMap
   , regVal
   , assignReg
+  , reg
 
     -- * SimError
   , SimErrorReason(..)
@@ -74,6 +75,7 @@ module Lang.Crucible.Simulator
   , ExecResult(..)
   , ExecState(..)
   , ExecCont
+  , execResultContext
 
     -- * Simulator context
     -- ** Function bindings
@@ -93,6 +95,7 @@ module Lang.Crucible.Simulator
   , ctxSymInterface
   , functionBindings
   , cruciblePersonality
+  , profilingMetrics
 
     -- * SimState
   , SimState
@@ -100,6 +103,7 @@ module Lang.Crucible.Simulator
   , defaultAbortHandler
   , AbortHandler(..)
   , CrucibleState
+  , stateContext
 
     -- * Intrinsic types
   , IntrinsicClass
@@ -115,6 +119,10 @@ module Lang.Crucible.Simulator
   , stepStmt
   , stepTerm
   , stepBasicBlock
+  , ExecutionFeature
+  , GenericExecutionFeature
+  , genericToExecutionFeature
+  , timeoutFeature
 
     -- * OverrideSim monad
   , module Lang.Crucible.Simulator.OverrideSim

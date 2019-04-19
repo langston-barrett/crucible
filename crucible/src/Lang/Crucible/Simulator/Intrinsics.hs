@@ -31,9 +31,10 @@ module Lang.Crucible.Simulator.Intrinsics
   , typeError
   ) where
 
+import           Data.Kind
 import qualified Data.Parameterized.Map as MapF
 import           Data.Parameterized.SymbolRepr
-import qualified GHC.TypeLits
+import qualified GHC.TypeLits (Symbol)
 import           GHC.Stack
 
 import           What4.Interface
@@ -53,17 +54,17 @@ import           Lang.Crucible.Types
 -- Note: Instances of this will typically end up as orphan instances.
 -- This warning is normally quite important, as orphan instances allow
 -- one to define multiple instances for a particular class.  However, in
--- this case, "IntrinsicClass" contains a type family, and GHC will globally
+-- this case, 'IntrinsicClass' contains a type family, and GHC will globally
 -- check consistency of all type family instances.  Consequently, there
 -- can be at most one implementation of InstrinsicClass in a program.
-class IntrinsicClass (sym :: *) (nm :: GHC.TypeLits.Symbol) where
-  -- | The `Intrinsic` type family defines, for a given backend and symbol name,
-  --   the runtime implementation of that Crucible intrisnic type.
-  type Intrinsic (sym :: *) (nm :: GHC.TypeLits.Symbol) (ctx :: Ctx CrucibleType) :: *
+class IntrinsicClass (sym :: Type) (nm :: GHC.TypeLits.Symbol) where
+  -- | The 'Intrinsic' type family defines, for a given backend and symbol name,
+  --   the runtime implementation of that Crucible intrinsic type.
+  type Intrinsic (sym :: Type) (nm :: GHC.TypeLits.Symbol) (ctx :: Ctx CrucibleType) :: Type
 
   -- | The push branch function is called when an intrinsic value is
-  --   passed through a symbolic branch.  This allows it to to any
-  --   necessary bookeeping to prepare for an upcomming merge.
+  --   passed through a symbolic branch.  This allows it to do any
+  --   necessary bookkeeping to prepare for an upcoming merge.
   --   A push branch should eventually be followed by a matching
   --   abort or mux call.
   pushBranchIntrinsic
@@ -99,7 +100,7 @@ class IntrinsicClass (sym :: *) (nm :: GHC.TypeLits.Symbol) where
 
 
 -- | The `IntrinsicMuxFn` datatype allows an `IntrinsicClass` instance
---   to be packaged up into a value.  This allows us to get access to IntrinsicClass
+--   to be packaged up into a value.  This allows us to get access to 'IntrinsicClass'
 --   instance methods (the `muxIntrinsic` method in particular) at runtime even
 --   for symbol names that are not known statically.
 --
@@ -107,7 +108,7 @@ class IntrinsicClass (sym :: *) (nm :: GHC.TypeLits.Symbol) where
 --   same signature as `muxIntrinsic`) we get the compiler to ensure that a single
 --   distinguished implementation is always used for each backend/symbol name combination.
 --   This prevents any possible confusion between different parts of the system.
-data IntrinsicMuxFn (sym :: *) (nm :: Symbol) where
+data IntrinsicMuxFn (sym :: Type) (nm :: Symbol) where
   IntrinsicMuxFn :: IntrinsicClass sym nm => IntrinsicMuxFn sym nm
 
 

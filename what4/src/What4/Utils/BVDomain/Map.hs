@@ -15,6 +15,7 @@ abstract interpretation purposes.
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 #if MIN_VERSION_base(4,9,0)
 {-# OPTIONS_GHC -fno-warn-redundant-constraints #-}
@@ -33,6 +34,7 @@ module What4.Utils.BVDomain.Map
   , ult
   , testBit
   , domainsOverlap
+  , ranges
     -- * Operations
   , empty
   , any
@@ -54,7 +56,6 @@ module What4.Utils.BVDomain.Map
   , ashr
   , zext
   , sext
-  , trunc
   , What4.Utils.BVDomain.Map.not
   , and
   , or
@@ -72,17 +73,18 @@ import qualified Data.Map.Strict as Map
 import           Data.Parameterized.NatRepr
 import           Data.Set (Set)
 import qualified Data.Set as Set
-
-import           GHC.TypeLits
+import           Numeric.Natural
+import           GHC.TypeNats
 
 import           Prelude hiding (any, concat, negate, and, or)
 
 -- | @halfRange n@ returns @2^(n-1)@.
 halfRange :: NatRepr w -> Integer
-halfRange w = 2^(natValue w - 1)
+halfRange w = bit (widthVal w - 1)
 
+-- | @rangeSize n@ returns @2^n@.
 rangeSize :: NatRepr w -> Integer
-rangeSize w = 2^(natValue w)
+rangeSize w = bit (widthVal w)
 
 ------------------------------------------------------------------------
 -- ModRange
@@ -110,8 +112,8 @@ modRange w lbound ubound
         ExclusiveRange low_ubound low_lbound
       -- Otherwise return all elements.
     | otherwise = AnyRange
-  where high_lbound = lbound `shiftR` fromInteger (natValue w)
-        high_ubound = ubound `shiftR` fromInteger (natValue w)
+  where high_lbound = lbound `shiftR` widthVal w
+        high_ubound = ubound `shiftR` widthVal w
         low_lbound  = maxUnsigned w .&. lbound
         low_ubound  = maxUnsigned w .&. ubound
 
@@ -158,6 +160,10 @@ isValidBVDomain w d =
 
 ------------------------------------------------------------------------
 -- Projection functions
+
+-- | Convert domain to list of ranges.
+ranges :: NatRepr w -> BVDomain w -> [(Integer, Integer)]
+ranges _w d = toList d
 
 -- | Convert domain to list of ranges.
 toList :: BVDomain w -> [(Integer, Integer)]
@@ -299,13 +305,13 @@ ult _ _ _ = Nothing
 -- | Return true if bits in domain are set.
 testBit :: NatRepr w
         -> BVDomain w
-        -> Integer -- ^ Index of bit (least-significant bit has index 0)
+        -> Natural -- ^ Index of bit (least-significant bit has index 0)
         -> Maybe Bool
 testBit w d i = assert (i < natValue w) $
     case uncurry testRange <$> toList d of
       (mb@Just{}:r) | all (== mb) r -> mb
       _ -> Nothing
-  where j = fromInteger i
+  where j = fromIntegral i
         testRange :: Integer -> Integer -> Maybe Bool
         testRange l h | (l `shiftR` j) == (h `shiftR` j) =
                         Just (l `Bits.testBit` j)
@@ -388,7 +394,7 @@ boundedBVDomain :: String -- ^ Name of function calling this
                 -> NatRepr w
                 -> InterBVDomain
                 -> BVDomain w
-boundedBVDomain nm params w input = BVDomain { domainRanges = d }
+boundedBVDomain _nm params _w input = BVDomain { domainRanges = d }
   where gm = interGaps input
         m0 = interMap input
         cnt = rangeLimit params
@@ -432,26 +438,26 @@ insertRange l h inputs = seq l $ seq h $ seq inputs $
 
 -- | Convert unsigned ranges to signed ranges
 toSignedRanges :: (1 <= w) => NatRepr w -> BVDomain w -> [(Integer,Integer)]
-toSignedRanges w d = go (toList d)
-  where go :: [(Integer,Integer)] -> [(Integer,Integer)]
-        go [] = []
-        go ((l,h):r)
-          | h <= maxSigned w = (l,h):go r
-          | l <= maxSigned w =
-            (l, maxSigned w) : (minSigned w, h - rangeSize w) : go2 r
-          | otherwise =
-            go2 r
-        -- Decrement each pair
-        go2 :: [(Integer,Integer)] -> [(Integer,Integer)]
-        go2 = fmap (\(l,h) -> (l - rangeSize w, h - rangeSize w))
+toSignedRanges w d = concatMap go (toList d)
+  where go :: (Integer,Integer) -> [(Integer,Integer)]
+        go (l,h)
+            -- both l and h represent nonnegative numbers
+          | h <= maxSigned w = [(l,h)]
+            -- only h is negative, split the range
+          | l <= maxSigned w = [(l, maxSigned w), (minSigned w, h - rangeSize w)]
+            -- both l and h are negative
+          | otherwise = [(l - rangeSize w, h - rangeSize w)]
 
 -- | Return list of signed ranges in domain.
 signedToUnsignedRanges :: NatRepr w -> [(Integer,Integer)] -> [(Integer,Integer)]
 signedToUnsignedRanges w l0 = concatMap go l0
   where go :: (Integer,Integer) -> [(Integer,Integer)]
         go (l,h)
+            -- both l and h are negative
           | h < 0 = [(toUnsigned w l, toUnsigned w h)]
+            -- only l is negative, split the range
           | l < 0 = [(toUnsigned w l, maxUnsigned w), (0,h)]
+            -- both positive
           | otherwise = [(l,h)]
 
 
@@ -514,12 +520,12 @@ fromList :: (1 <= w)
          -> NatRepr w
          -> [(Integer, Integer)]
          -> BVDomain w
-fromList nm params w ranges
-  | Prelude.not (checkRanges w ranges) =
+fromList nm params w rgs
+  | Prelude.not (checkRanges w rgs) =
       error $ nm ++ " provided invalid values to range with width " ++ show w ++ "\n  "
-         ++ show ranges
+         ++ show rgs
   | otherwise = boundedBVDomain nm params w $
-    Fold.foldl' (\p (l,h) -> insertRange l h p) emptyInterBVDomain ranges
+    Fold.foldl' (\p (l,h) -> insertRange l h p) emptyInterBVDomain rgs
 
 -- | Create a BVdomain from a list of ranges.
 --
@@ -535,9 +541,9 @@ modList :: forall u
              -- List of ranges
 
           -> BVDomain u
-modList nm params w ranges
+modList nm params w rgs
     -- If the width exceeds maxInt, then just return anything (otherwise we can't even shift.
-  | natValue w > toInteger (maxBound :: Int) = any w
+  | natValue w > fromIntegral (maxBound :: Int) = any w
   | otherwise =
     -- This entries over each range, and returns either @Nothing@ if
     -- the range contains all elements or the range.
@@ -553,7 +559,7 @@ modList nm params w ranges
                 mapRange ((0, low_ubound) : (low_lbound, rangeSize w - 1) : processed)
                          next
             AnyRange -> any w
-     in mapRange [] ranges
+     in mapRange [] rgs
 
 -- | @concat x y@ returns domain where each element in @x@ has been
 -- concatenated with an element in @y@.  The most-significant bits
@@ -597,8 +603,17 @@ concat params wx x wy y = do
 
 
 -- | @select i n d@ selects @n@ bits starting from index @i@ from @d@.
-select :: (1 <= u) => Integer -> NatRepr u -> BVDomain w -> BVDomain u
-select _i n _d = any n -- TODO
+select
+  :: (1 <= n, i + n <= w)
+  => BVDomainParams
+  -> NatRepr i
+  -> NatRepr n
+  -> BVDomain w
+  -> BVDomain n
+select params i n x
+  | Just Refl <- testEquality i (knownNat @0)
+  = modList "select" params n (toList x)
+  | otherwise = any n -- TODO
 
 negate :: (1 <= w) => BVDomainParams -> NatRepr w -> BVDomain w -> BVDomain w
 negate params w d = fromList "negate" params w r
@@ -625,13 +640,31 @@ udiv :: (1 <= w) => NatRepr w -> BVDomain w -> BVDomain w -> BVDomain w
 udiv w _x _y = any w -- TODO
 
 urem :: (1 <= w) => NatRepr w -> BVDomain w -> BVDomain w -> BVDomain w
-urem w _x _y = any w -- TODO
+urem w x y
+  | Just (ylo,yhi) <- ubounds w y, 0 < ylo
+  = let hi = case ubounds w x of
+               Just (_,xhi) -> min (yhi - 1) xhi
+               Nothing      -> (yhi - 1)
+     in range w 0 hi
+
+  | otherwise = any w
 
 sdiv :: (1 <= w) => NatRepr w -> BVDomain w -> BVDomain w -> BVDomain w
 sdiv w _x _y = any w -- TODO
 
 srem :: (1 <= w) => NatRepr w -> BVDomain w -> BVDomain w -> BVDomain w
-srem w _x _y = any w -- TODO
+srem w x y
+  | Just (ylo,yhi) <- sbounds w y, 0 < ylo
+  , Just (xlo,xhi) <- sbounds w x, 0 <= xlo
+  = range w 0 (min (yhi - 1) xhi)
+
+  | Just (ylo,yhi) <- sbounds w y, 0 < ylo
+  , Just (xlo,xhi) <- sbounds w x, xhi < 0
+  = range w (max (-(yhi - 1)) xlo) 0
+
+  -- TODO, we could probably add ranges for negative denominators as well
+
+  | otherwise = any w
 
 -- | Return union of two domains.
 union :: (1 <= w)
@@ -654,14 +687,13 @@ ashr w _x _y = any w -- TODO
 zext :: (1 <= w, w+1 <= u) => BVDomain w -> NatRepr u -> BVDomain u
 zext x _ = BVDomain (domainRanges x)
 
-sext :: forall w u
-     .  (1 <= w, w+1 <= u)
-     => BVDomainParams
-     -> NatRepr w
-     -> BVDomain w
-     -> NatRepr u
-     -> BVDomain u
-sext params uw x w = do
+sext :: forall w u. (1 <= w, w+1 <= u) =>
+  BVDomainParams ->
+  NatRepr w ->
+  BVDomain w ->
+  NatRepr u ->
+  BVDomain u
+sext params w x u = do
   let wProof :: LeqProof 1 w
       wProof = LeqProof
       uProof :: LeqProof (w+1) u
@@ -669,12 +701,8 @@ sext params uw x w = do
       fProof :: LeqProof 1 u
       fProof = leqTrans (leqAdd wProof (knownNat :: NatRepr 1)) uProof
   case fProof of
-    LeqProof -> fromList "sext" params w $ do
-      signedToUnsignedRanges w (toSignedRanges uw x)
-
--- | Truncate a domain to a smaller domain.
-trunc :: (1 <= u, u+1 <= w) => BVDomainParams -> BVDomain w -> NatRepr u -> BVDomain u
-trunc params x w = modList "trunc" params w (toList x)
+    LeqProof -> fromList "sext" params u $
+      signedToUnsignedRanges u (toSignedRanges w x)
 
 -- | Complement bits in range.
 not :: (1 <= w) => NatRepr w -> BVDomain w -> BVDomain w

@@ -19,6 +19,8 @@ if structs are supported or nested arrays if they are not.
 The solver should detect when something is not supported and give an
 error rather than sending invalid output to a file.
 -}
+{-# LANGUAGE AllowAmbiguousTypes #-}
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -26,6 +28,7 @@ error rather than sending invalid output to a file.
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
@@ -34,44 +37,50 @@ error rather than sending invalid output to a file.
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 module What4.Protocol.SMTWriter
   ( -- * Type classes
     SupportTermOps(..)
+  , ArrayConstantFn
   , SMTWriter(..)
   , SMTReadWriter (..)
   , SMTEvalBVArrayFn
   , SMTEvalBVArrayWrapper(..)
     -- * Terms
-  , Term(..)
-  , term_app
-  , bin_app
-  , un_app
+  , Term
   , app
   , app_list
   , builder_list
-  , fromText
-  , asConfigValue
     -- * SMTWriter
   , WriterConn( supportFunctionDefs
               , supportFunctionArguments
               , supportQuantifiers
+              , supportedFeatures
+              , connHandle
+              , smtWriterName
               )
   , connState
   , newWriterConn
   , resetEntryStack
+  , entryStackHeight
   , pushEntryStack
   , popEntryStack
-  , Command(..)
+  , Command
   , addCommand
+  , addCommandNoAck
   , mkFreeVar
-  , SMT_Type(..)
-  , SMTFloatPrecision(..)
+  , TypeMap(..)
   , freshBoundVarName
   , assumeFormula
+  , assumeFormulaWithName
+  , assumeFormulaWithFreshName
+  , DefineStyle(..)
+  , AcknowledgementAction(..)
+  , nullAcknowledgementAction
     -- * SMTWriter operations
   , assume
+  , mkSMTTerm
   , mkFormula
+  , mkAtomicFormula
   , SMTEvalFunctions(..)
   , smtExprGroundEvalFn
     -- * Reexports
@@ -80,39 +89,38 @@ module What4.Protocol.SMTWriter
 
 import           Control.Exception
 import           Control.Lens hiding ((.>))
-import           Control.Monad
+import           Control.Monad.Extra
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
 import           Control.Monad.ST
 import           Control.Monad.State.Strict
 import           Control.Monad.Trans.Maybe
-import qualified Data.Bimap as Bimap
+import           Data.Bits (shiftL)
 import           Data.IORef
+import           Data.Kind
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
-import           Data.Monoid
+import           Data.Parameterized.Classes (ShowF(..))
 import qualified Data.Parameterized.Context as Ctx
 import qualified Data.Parameterized.HashTable as PH
 import           Data.Parameterized.Nonce (Nonce)
 import           Data.Parameterized.Some
 import           Data.Parameterized.TraversableFC
 import           Data.Ratio
+import           Data.Semigroup( (<>) )
 import           Data.Text (Text)
 import qualified Data.Text as Text
 import           Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Builder.Int as Builder (decimal)
 import qualified Data.Text.Lazy as Lazy
-import qualified Data.Text.Lazy.IO as Lazy
 import           Data.Word
 import           Numeric.Natural
-import           System.IO
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
-import           Data.ByteString(ByteString)
+import           System.IO.Streams (OutputStream)
 import qualified System.IO.Streams as Streams
 
 import           What4.BaseTypes
-import           What4.Concrete
 import           What4.Interface (ArrayResultWrapper(..), IndexLit(..), RoundingMode(..))
 import           What4.ProblemFeatures
 import           What4.Expr.Builder
@@ -122,21 +130,13 @@ import qualified What4.Expr.UnaryBV as UnaryBV
 import           What4.ProgramLoc
 import           What4.SatResult
 import           What4.Symbol
+import           What4.Utils.AbstractDomains
+import qualified What4.Utils.BVDomain as BVD
 import           What4.Utils.Complex
 import qualified What4.Utils.Hashable as Hash
 
-
 ------------------------------------------------------------------------
 -- Term construction typeclasses
-
-infixr 3 .&&
-infixr 2 .||
-infix 4 .==
-infix 4 ./=
-infix 4 .>
-infix 4 .>=
-infix 4 .<
-infix 4 .<=
 
 -- | 'TypeMap' defines how a given 'BaseType' maps to an SMTLIB type.
 --
@@ -175,6 +175,22 @@ data TypeMap (tp::BaseType) where
   StructTypeMap :: !(Ctx.Assignment TypeMap idx)
                 -> TypeMap (BaseStructType idx)
 
+
+instance ShowF TypeMap
+
+instance Show (TypeMap a) where
+  show BoolTypeMap              = "BoolTypeMap"
+  show NatTypeMap               = "NatTypeMap"
+  show IntegerTypeMap           = "IntegerTypeMap"
+  show RealTypeMap              = "RealTypeMap"
+  show (BVTypeMap n)            = "BVTypeMap " ++ show n
+  show (FloatTypeMap x)         = "FloatTypeMap " ++ show x
+  show (ComplexToStructTypeMap) = "ComplexToStructTypeMap"
+  show ComplexToArrayTypeMap    = "ComplexToArrayTypeMap"
+  show (PrimArrayTypeMap ctx a) = "PrimArrayTypeMap " ++ showF ctx ++ " " ++ showF a
+  show (FnArrayTypeMap ctx a)   = "FnArrayTypeMap " ++ showF ctx ++ " " ++ showF a
+  show (StructTypeMap ctx)      = "StructTypeMap " ++ showF ctx
+
 instance Eq (TypeMap tp) where
   x == y = isJust (testEquality x y)
 
@@ -206,53 +222,15 @@ instance TestEquality TypeMap where
     Just Refl
   testEquality _ _ = Nothing
 
--- | Return the SMT_Type underlying a TypeMap.
-asSMTType :: TypeMap tp -> SMT_Type
-asSMTType BoolTypeMap    = SMT_BoolType
-asSMTType NatTypeMap     = SMT_IntegerType
-asSMTType IntegerTypeMap = SMT_IntegerType
-asSMTType RealTypeMap    = SMT_RealType
-asSMTType (BVTypeMap w) = SMT_BVType (natValue w)
-asSMTType (FloatTypeMap fpp) = SMT_FloatType $ asSMTFloatPrecision fpp
-asSMTType ComplexToStructTypeMap = SMT_StructType [ SMT_RealType, SMT_RealType ]
-asSMTType ComplexToArrayTypeMap  = SMT_ArrayType [SMT_BoolType] SMT_RealType
-asSMTType (PrimArrayTypeMap i r) =
-  SMT_ArrayType (toListFC asSMTType i) (asSMTType r)
-asSMTType (FnArrayTypeMap i r) =
-  SMT_FnType (toListFC asSMTType i) (asSMTType r)
-asSMTType (StructTypeMap f) = SMT_StructType (toListFC asSMTType f)
-
-data SMT_Type
-   = SMT_BoolType
-   | SMT_BVType Integer
-   | SMT_IntegerType
-   | SMT_RealType
-   | SMT_FloatType SMTFloatPrecision
-   | SMT_ArrayType [SMT_Type] SMT_Type
-   | SMT_StructType [SMT_Type]
-     -- | A function type.
-   | SMT_FnType [SMT_Type] SMT_Type
-  deriving (Eq, Ord)
-
-data SMTFloatPrecision = SMTFloatPrecision Integer Integer deriving (Eq, Ord)
-
-asSMTFloatPrecision :: FloatPrecisionRepr fpp -> SMTFloatPrecision
-asSMTFloatPrecision (FloatingPointPrecisionRepr eb sb) =
-  SMTFloatPrecision (natValue eb) (natValue sb)
-
 semiRingTypeMap :: SemiRingRepr tp -> TypeMap tp
 semiRingTypeMap SemiRingNat  = NatTypeMap
 semiRingTypeMap SemiRingInt  = IntegerTypeMap
 semiRingTypeMap SemiRingReal = RealTypeMap
 
-data BaseTypeError = ComplexTypeUnsupported
-                   | ArrayUnsupported
-                   | StringTypeUnsupported
-
 type ArrayConstantFn v
-   = [SMT_Type]
+   = [Some TypeMap]
      -- ^ Type for indices
-     -> SMT_Type
+     -> Some TypeMap
      -- ^ Type for value.
      -> v
      -- ^ Constant to assign all values.
@@ -283,14 +261,8 @@ class Num v => SupportTermOps v where
   impliesExpr :: v -> v -> v
   impliesExpr x y = notExpr x .|| y
 
-  -- | Create a forall expression
-  forallExpr :: [(Text, SMT_Type)] -> v -> v
-
-  -- | Create an exists expression
-  existsExpr :: [(Text, SMT_Type)] -> v -> v
-
   -- | Create a let expression.
-  letExpr :: [(Text, Term h)] -> v -> v
+  letExpr :: [(Text, v)] -> v -> v
 
   -- | Create an if-then-else expression.
   ite :: v -> v -> v -> v
@@ -367,20 +339,24 @@ class Num v => SupportTermOps v where
   -- bitvector.   @v@ must contain at least @w@ elements, and @i+n@
   -- must be less than or equal to @w@.  The result has @n@ elements.
   -- The least significant bit of @v@ should have index @0@.
-  bvExtract :: NatRepr w -> Integer -> Integer -> v -> v
+  bvExtract :: NatRepr w -> Natural -> Natural -> v -> v
 
   -- | @bvTestBit w i x@ returns predicate that holds if bit @i@
   -- in @x@ is set to true.  @w@ should be the number of bits in @x@.
-  bvTestBit :: NatRepr w -> Integer -> v -> v
+  bvTestBit :: NatRepr w -> Natural -> v -> v
   bvTestBit w i x = (bvExtract w i 1 x .== bvTerm w1 1)
     where w1 :: NatRepr 1
           w1 = knownNat
 
-  floatPZero :: SMTFloatPrecision -> v
-  floatNZero :: SMTFloatPrecision -> v
-  floatNaN   :: SMTFloatPrecision -> v
-  floatPInf  :: SMTFloatPrecision -> v
-  floatNInf  :: SMTFloatPrecision -> v
+  bvSumExpr :: NatRepr w -> [v] -> v
+  bvSumExpr w [] = bvTerm w 0
+  bvSumExpr _ (h:r) = foldl bvAdd h r
+
+  floatPZero :: FloatPrecisionRepr fpp -> v
+  floatNZero :: FloatPrecisionRepr fpp  -> v
+  floatNaN   :: FloatPrecisionRepr fpp  -> v
+  floatPInf  :: FloatPrecisionRepr fpp -> v
+  floatNInf  :: FloatPrecisionRepr fpp -> v
 
   floatNeg  :: v -> v
   floatAbs  :: v -> v
@@ -409,41 +385,25 @@ class Num v => SupportTermOps v where
   floatIsSubnorm  :: v -> v
   floatIsNorm     :: v -> v
 
-  floatCast       :: SMTFloatPrecision -> RoundingMode -> v -> v
-  floatFromBinary :: SMTFloatPrecision -> v -> v
-  bvToFloat       :: SMTFloatPrecision -> RoundingMode -> v -> v
-  sbvToFloat      :: SMTFloatPrecision -> RoundingMode -> v -> v
-  realToFloat     :: SMTFloatPrecision -> RoundingMode -> v -> v
-  floatToBV       :: Integer -> RoundingMode -> v -> v
-  floatToSBV      :: Integer -> RoundingMode -> v -> v
+  floatCast       :: FloatPrecisionRepr fpp -> RoundingMode -> v -> v
+  floatRound      :: RoundingMode -> v -> v
+  floatFromBinary :: FloatPrecisionRepr fpp -> v -> v
+  bvToFloat       :: FloatPrecisionRepr fpp -> RoundingMode -> v -> v
+  sbvToFloat      :: FloatPrecisionRepr fpp -> RoundingMode -> v -> v
+  realToFloat     :: FloatPrecisionRepr fpp -> RoundingMode -> v -> v
+  floatToBV       :: Natural -> RoundingMode -> v -> v
+  floatToSBV      :: Natural -> RoundingMode -> v -> v
   floatToReal     :: v -> v
-
-  -- | 'arrayUpdate a i v' returns an array that contains value 'v' at
-  -- index 'i', and the same value as in 'a' at every other index.
-  arrayUpdate :: v -> [v] -> v -> v
-
-  -- | Select an element from an array
-  arraySelect :: v -> [v] -> v
 
   -- | Create a struct with the given fields.
   structCtor :: [v] -- ^ Fields to struct
              -> v
 
   -- | Select a field from a struct.
-  --
-  -- The first argument contains the type of the fields of the struct.
-  -- The second argument contains the stuct value.
-  -- The third argument defines the index.
   structFieldSelect :: Int -- ^ Number of struct fields.
-                    -> v
+                    -> v   -- ^ Struct value to select from
                     -> Int -- ^ 0-based index of field.
                     -> v
-
-  -- | Create a constant array
-  --
-  -- This may return Nothing if the solver does not support constant arrays.
-  arrayConstant :: Maybe (ArrayConstantFn v)
-  arrayConstant = Nothing
 
   -- | Predicate that holds if a real number is an integer.
   realIsInteger :: v -> v
@@ -475,26 +435,20 @@ class Num v => SupportTermOps v where
   --
   -- Yices support lambda expressions, but SMTLIB2 does not.
   -- The function takes arguments and the expression.
-  lambdaTerm :: Maybe ([(Text, SMT_Type)] -> v -> v)
+  lambdaTerm :: Maybe ([(Text, Some TypeMap)] -> v -> v)
   lambdaTerm = Nothing
 
+  fromText :: Text -> v
 
--- | Attempt to interpret a Config value as a solver value.
-asConfigValue ::
-  forall f s tp.
-  SupportTermOps (Term s) =>
-  f s -> ConcreteVal tp -> Maybe Builder
-asConfigValue _ v =
-  case v of
-    ConcreteBool x    -> Just (render (boolExpr x))
-    ConcreteReal x    -> Just (render (rationalTerm x))
-    ConcreteInteger x -> Just (render (integerTerm x))
-    ConcreteString x  -> Just (Builder.fromText x) -- XXX: overload?
-    _                 -> Nothing
 
-  where
-  render :: Term s -> Builder
-  render = renderTerm
+infixr 3 .&&
+infixr 2 .||
+infix 4 .==
+infix 4 ./=
+infix 4 .>
+infix 4 .>=
+infix 4 .<
+infix 4 .<=
 
 ------------------------------------------------------------------------
 -- Term
@@ -505,16 +459,11 @@ structComplexRealPart c = structFieldSelect 2 c 0
 structComplexImagPart :: SupportTermOps v => v -> v
 structComplexImagPart c = structFieldSelect 2 c 1
 
-arrayComplexRealPart :: SupportTermOps v => v -> v
-arrayComplexRealPart c = arraySelect c [boolExpr False]
+arrayComplexRealPart :: forall h . SMTWriter h => Term h -> Term h
+arrayComplexRealPart c = arraySelect @h c [boolExpr False]
 
-arrayComplexImagPart :: SupportTermOps v => v -> v
-arrayComplexImagPart c = arraySelect c [boolExpr True]
-
--- | A term in the output language.
--- The parameter is a phantom parameter that is intended to enable clients to avoid
--- mixing terms from different languages.
-newtype Term (h :: *) = T { renderTerm :: Builder }
+arrayComplexImagPart :: forall h . SMTWriter h => Term h -> Term h
+arrayComplexImagPart c = arraySelect @h c [boolExpr True]
 
 app :: Builder -> [Builder] -> Builder
 app o [] = o
@@ -529,14 +478,11 @@ builder_list :: [Builder] -> Builder
 builder_list [] = "()"
 builder_list (h:l) = app_list h l
 
-term_app :: Builder -> [Term h] -> Term h
-term_app o args = T (app o (renderTerm <$> args))
+------------------------------------------------------------------------
+-- Term
 
-bin_app :: Builder -> Term h -> Term h -> Term h
-bin_app o x y = term_app o [x,y]
-
-un_app :: Builder -> Term h -> Term h
-un_app o x = term_app o [x]
+-- | A term in the output language.
+type family Term (h :: Type) :: Type
 
 ------------------------------------------------------------------------
 -- SMTExpr
@@ -604,24 +550,26 @@ freshVarName' prefix = do
 ------------------------------------------------------------------------
 -- SMTWriter
 
-fromText :: Text -> Term h
-fromText t = T (Builder.fromText t)
-
 data SMTSymFn ctx where
   SMTSymFn :: !Text
            -> !(Ctx.Assignment TypeMap args)
            -> !(TypeMap ret)
            -> SMTSymFn (args Ctx.::> ret)
 
+data StackEntry t (h :: Type) = StackEntry
+  { symExprCache :: !(IdxCache t (SMTExpr h))
+  , symFnCache :: !(PH.HashTable PH.RealWorld (Nonce t) SMTSymFn)
+  }
+
 -- The writer connection maintains a connection to the SMT solver.
 --
 -- It is responsible for knowing the capabilities of the solver; generating
 -- fresh names when needed; maintaining the stack of pushes and pops, and
 -- sending queries to the solver.
-data WriterConn t (h :: *) =
+data WriterConn t (h :: Type) =
   WriterConn { smtWriterName :: !String
                -- ^ Name of writer for error reporting purposes.
-             , connHandle :: !Handle
+             , connHandle :: !(OutputStream Text)
                -- ^ Handle to write to
              , supportFunctionDefs :: !Bool
                -- ^ Indicates if the writer can define constants or functions in terms
@@ -638,32 +586,60 @@ data WriterConn t (h :: *) =
                -- ^ Allow the SMT writer to generate problems with quantifiers.
              , supportedFeatures :: !ProblemFeatures
                -- ^ Indicates features supported by the solver.
-             , smtFnCache :: !(PH.HashTable PH.RealWorld (Nonce t) SMTSymFn)
-               -- ^ Allow the SMT writer to generate problems with quantifiers.
-             , entryStack :: !(IORef [IdxCache t (SMTExpr h)])
-               -- ^ A stack of hash tables, corresponding to the lexical scopes induced by
-               --   frame push/pops.  The entire stack of tables is searched top-down when
-               --   looking up element nonce values.  Elements that are to persist across
-               --   pops are written through the entire stack.
+             , entryStack :: !(IORef [StackEntry t h])
+               -- ^ A stack of pairs of hash tables, each stack entry corresponding to
+               --   a lexical scope induced by frame push/pops. The entire stack is searched
+               --   top-down when looking up element nonce values. Elements that are to
+               --   persist across pops are written through the entire stack.
              , stateRef :: !(IORef WriterState)
                -- ^ Reference to current state
              , varBindings :: !(SymbolVarBimap t)
                -- ^ Symbol variables.
              , connState :: !h
                -- ^ The specific connection information.
+             , consumeAcknowledgement :: AcknowledgementAction t h
+               -- ^ Consume an acknowledgement notifications the solver, if
+               --   it produces one
              }
+
+-- | An action for consuming an acknowledgement message from the solver,
+--   if it is configured to produce ack messages.
+newtype AcknowledgementAction t h =
+  AckAction { runAckAction :: WriterConn t h -> Command h -> IO () }
+
+-- | An acknowledgement action that does nothing
+nullAcknowledgementAction :: AcknowledgementAction t h
+nullAcknowledgementAction = AckAction (\_ _ -> return ())
+
+newStackEntry :: IO (StackEntry t h)
+newStackEntry = do
+  exprCache <- newIdxCache
+  fnCache   <- stToIO $ PH.new
+  return StackEntry
+    { symExprCache = exprCache
+    , symFnCache   = fnCache
+    }
 
 -- | Clear the entry stack, and start with a fresh one.
 resetEntryStack :: WriterConn t h -> IO ()
 resetEntryStack c = do
-  h <- newIdxCache
-  writeIORef (entryStack c) [h]
+  entry <- newStackEntry
+  writeIORef (entryStack c) [entry]
+
+-- | Return the number of pushed stack frames.  Note, this is one
+--   fewer than the number of entries in the stack beacuse the
+--   base entry is the top-level context that is not in the scope
+--   of any push.
+entryStackHeight :: WriterConn t h -> IO Int
+entryStackHeight c =
+  do es <- readIORef (entryStack c)
+     return (length es - 1)
 
 -- | Push a new frame to the stack for maintaining the writer cache.
 pushEntryStack :: WriterConn t h -> IO ()
 pushEntryStack c = do
-  h <- newIdxCache
-  modifyIORef' (entryStack c) $ (h:)
+  entry <- newStackEntry
+  modifyIORef' (entryStack c) $ (entry:)
 
 popEntryStack :: WriterConn t h -> IO ()
 popEntryStack c = do
@@ -673,7 +649,9 @@ popEntryStack c = do
    [_] -> fail "Could not pop from empty entry stack."
    (_:r) -> writeIORef (entryStack c) r
 
-newWriterConn :: Handle
+newWriterConn :: OutputStream Text
+              -> AcknowledgementAction t cs
+              -- ^ An action to consume solver acknowledgement responses
               -> String
               -- ^ Name of solver for reporting purposes.
               -> ProblemFeatures
@@ -681,47 +659,69 @@ newWriterConn :: Handle
               -> SymbolVarBimap t
               -- ^ A bijective mapping between variables and their
               -- canonical name (if any).
-              -> cs
-                 -- ^ State information specific to the type of connection
+              -> cs -- ^ State information specific to the type of connection
               -> IO (WriterConn t cs)
-newWriterConn h solver_name features bindings cs = do
-  fnCache   <- stToIO $ PH.new
+newWriterConn h ack solver_name features bindings cs = do
+  entry <- newStackEntry
+  stk_ref <- newIORef [entry]
   r <- newIORef emptyState
-  c <- newIdxCache
-  stk_ref <- newIORef [c]
   return $! WriterConn { smtWriterName = solver_name
                        , connHandle    = h
                        , supportFunctionDefs      = False
                        , supportFunctionArguments = False
                        , supportQuantifiers       = False
                        , supportedFeatures        = features
-                       , smtFnCache   = fnCache
                        , entryStack   = stk_ref
                        , stateRef     = r
                        , varBindings  = bindings
                        , connState    = cs
+                       , consumeAcknowledgement = ack
                        }
 
-cacheLookup :: WriterConn t h -> Nonce t tp -> IO (Maybe (SMTExpr h tp))
-cacheLookup c n = go =<< readIORef (entryStack c)
- where go [] = return Nothing
-       go (h:r) = do
-           lookupIdx h n >>= \case
-              Nothing -> go r
-              Just x  -> return $ Just x
+-- | Status to indicate when term value will be uncached.
+data TermLifetime
+   = DeleteNever
+     -- ^ Never delete the term
+   | DeleteOnPop
+     -- ^ Delete the term when the current frame is popped.
+  deriving (Eq)
 
-cacheValue :: WriterConn t h -> Nonce t tp -> TermLifetime -> SMTExpr h tp -> IO ()
-cacheValue c n lifetime x = do
-  stk <- readIORef (entryStack c)
-  case stk of
-     [] -> error "cacheValue: empty cache stack!"
-     (h:r) -> do insertIdxValue h n x
-                 case lifetime of
-                    DeleteOnPop -> return ()
-                    DeleteNever -> writethrough r
- where writethrough [] = return ()
-       writethrough (h:r) = do insertIdxValue h n x
-                               writethrough r
+cacheValue
+  :: WriterConn t h
+  -> TermLifetime
+  -> (StackEntry t h -> IO ())
+  -> IO ()
+cacheValue conn lifetime insert_action =
+  readIORef (entryStack conn) >>= \case
+    s@(h:_) -> case lifetime of
+      DeleteOnPop -> insert_action h
+      DeleteNever -> mapM_ insert_action s
+    [] -> error "cacheValue: empty cache stack!"
+
+cacheLookup
+  :: WriterConn t h
+  -> (StackEntry t h -> IO (Maybe a))
+  -> IO (Maybe a)
+cacheLookup conn lookup_action =
+  readIORef (entryStack conn) >>= firstJustM lookup_action
+
+cacheLookupExpr :: WriterConn t h -> Nonce t tp -> IO (Maybe (SMTExpr h tp))
+cacheLookupExpr c n = cacheLookup c $ \entry ->
+  lookupIdx (symExprCache entry) n
+
+cacheLookupFn :: WriterConn t h -> Nonce t ctx -> IO (Maybe (SMTSymFn ctx))
+cacheLookupFn c n = cacheLookup c $ \entry ->
+  stToIO $ PH.lookup (symFnCache entry) n
+
+cacheValueExpr
+  :: WriterConn t h -> Nonce t tp -> TermLifetime -> SMTExpr h tp -> IO ()
+cacheValueExpr conn n lifetime value = cacheValue conn lifetime $ \entry ->
+  insertIdxValue (symExprCache entry) n value
+
+cacheValueFn
+  :: WriterConn t h -> Nonce t ctx -> TermLifetime -> SMTSymFn ctx -> IO ()
+cacheValueFn conn n lifetime value = cacheValue conn lifetime $ \entry ->
+  stToIO $ PH.insert (symFnCache entry) n value
 
 -- | Run state with handle.
 withWriterState :: WriterConn t h -> State WriterState a -> IO a
@@ -735,16 +735,40 @@ withWriterState c m = do
 updateProgramLoc :: WriterConn t h -> ProgramLoc -> IO ()
 updateProgramLoc c l = withWriterState c $ position .= plSourceLoc l
 
-newtype Command h = Cmd Builder
+type family Command (h :: Type) :: Type
 
 -- | Typeclass need to generate SMTLIB commands.
 class (SupportTermOps (Term h)) => SMTWriter h where
+
+  -- | Create a forall expression
+  forallExpr :: [(Text, Some TypeMap)] -> Term h -> Term h
+
+  -- | Create an exists expression
+  existsExpr :: [(Text, Some TypeMap)] -> Term h -> Term h
+
+  -- | Create a constant array
+  --
+  -- This may return Nothing if the solver does not support constant arrays.
+  arrayConstant :: Maybe (ArrayConstantFn (Term h))
+  arrayConstant = Nothing
+
+  -- | Select an element from an array
+  arraySelect :: Term h -> [Term h] -> Term h
+
+  -- | 'arrayUpdate a i v' returns an array that contains value 'v' at
+  -- index 'i', and the same value as in 'a' at every other index.
+  arrayUpdate :: Term h -> [Term h] -> Term h -> Term h
 
   -- | Create a command that just defines a comment.
   commentCommand :: f h -> Builder -> Command h
 
   -- | Create a command that asserts a formula.
   assertCommand :: f h -> Term h -> Command h
+
+  -- | Create a command that asserts a formula and attaches
+  --   the given name to it (primarily for the purposes of
+  --   later reporting unsatisfiable cores).
+  assertNamedCommand :: f h -> Term h -> Text -> Command h
 
   -- | Push 1 new scope
   pushCommand   :: f h -> Command h
@@ -758,23 +782,37 @@ class (SupportTermOps (Term h)) => SMTWriter h where
   -- | Check if the current set of assumption is satisfiable
   checkCommand  :: f h -> Command h
 
+  -- | Check if a collection of assumptions is satisfiable in the current context.
+  --   The assumptions must be given as the names of literals already in scope.
+  checkWithAssumptionsCommand :: f h -> [Text] -> Command h
+
+  -- | Ask the solver to return an unsatisfiable core from among the assumptions
+  --   passed into the previous "check with assumptions" command.
+  getUnsatAssumptionsCommand :: f h -> Command h
+
+  -- | Ask the solver to return an unsatisfiable core from among the named assumptions
+  --   previously asserted using the `assertNamedCommand` after an unsatisfiable
+  --   `checkCommand`.
+  getUnsatCoreCommand :: f h -> Command h
+
   -- | Set an option/parameter.
-  setOptCommand :: f h -> Text -> Builder -> Command h
+  setOptCommand :: f h -> Text -> Text -> Command h
 
   -- | Declare a new symbol with the given name, arguments types, and result type.
   declareCommand :: f h
                  -> Text
-                 -> [SMT_Type]
-                 -> SMT_Type
+                 -> Ctx.Assignment TypeMap args
+                 -> TypeMap rtp
                  -> Command h
 
   -- | Define a new symbol with the given name, arguments, result type, and
   -- associated expression.
   --
   -- The argument contains the variable name and the type of the variable.
-  defineCommand :: Text -- ^ Name of variable
-                -> [(Text, SMT_Type)]
-                -> SMT_Type
+  defineCommand :: f h
+                -> Text -- ^ Name of variable
+                -> [(Text, Some TypeMap)]
+                -> TypeMap rtp
                 -> Term h
                 -> Command h
 
@@ -782,16 +820,18 @@ class (SupportTermOps (Term h)) => SMTWriter h where
   -- arguments in the struct.
   declareStructDatatype :: WriterConn t h -> Int -> IO ()
 
-
--- | Write a command to the connection.
-writeCommand :: WriterConn t h -> Command h -> IO ()
-writeCommand conn (Cmd cmd) =
-  Lazy.hPutStrLn (connHandle conn) (Builder.toLazyText cmd)
+  -- | Write a command to the connection.
+  writeCommand :: WriterConn t h -> Command h -> IO ()
 
 -- | Write a command to the connection along with position information
 -- if it differs from the last position.
 addCommand :: SMTWriter h => WriterConn t h -> Command h -> IO ()
 addCommand conn cmd = do
+  addCommandNoAck conn cmd
+  runAckAction (consumeAcknowledgement conn) conn cmd
+
+addCommandNoAck :: SMTWriter h => WriterConn t h -> Command h -> IO ()
+addCommandNoAck conn cmd = do
   las <- withWriterState conn $ use lastPosition
   cur <- withWriterState conn $ use position
 
@@ -802,56 +842,77 @@ addCommand conn cmd = do
     withWriterState conn $ lastPosition .= cur
 
   writeCommand conn cmd
-  hFlush (connHandle conn)
 
 -- | Create a new variable with the given name.
 mkFreeVar :: SMTWriter h
           => WriterConn t h
-          -> [SMT_Type]
-          -> SMT_Type
+          -> Ctx.Assignment TypeMap args
+          -> TypeMap rtp
           -> IO Text
 mkFreeVar conn arg_types return_type = do
   var <- withWriterState conn $ freshVarName
   addCommand conn $ declareCommand conn var arg_types return_type
   return var
 
+mkFreeVar' :: SMTWriter h => WriterConn t h -> TypeMap tp -> IO (SMTExpr h tp)
+mkFreeVar' conn tp = SMTName tp <$> mkFreeVar conn Ctx.empty tp
+
 -- | Assume that the given formula holds.
 assumeFormula :: SMTWriter h => WriterConn t h -> Term h -> IO ()
 assumeFormula c p = addCommand c (assertCommand c p)
 
--- | Create a variable name eqivalent to the given expression.
-freshBoundVarName :: SMTWriter h
-                  => WriterConn t h
-                  -> [(Text, SMT_Type)]
-                     -- ^ Names of variables in term and associated type.
-                  -> SMT_Type -- ^ Type of expression.
-                  -> Term h
-                  -> IO Text
-freshBoundVarName conn args return_type expr = do
-  var <- withWriterState conn $ freshVarName
-  defineSMTVar conn var args return_type expr
-  return var
+assumeFormulaWithName :: SMTWriter h => WriterConn t h -> Term h -> Text -> IO ()
+assumeFormulaWithName conn p nm =
+  do unless (supportedFeatures conn `hasProblemFeature` useUnsatCores) $
+       fail $ show $ text (smtWriterName conn) <+> text "is not configured to produce UNSAT cores"
+     addCommand conn (assertNamedCommand conn p nm)
+
+assumeFormulaWithFreshName :: SMTWriter h => WriterConn t h -> Term h -> IO Text
+assumeFormulaWithFreshName conn p =
+  do var <- withWriterState conn $ freshVarName
+     assumeFormulaWithName conn p var
+     return var
+
+
+data DefineStyle
+  = FunctionDefinition
+  | EqualityDefinition
+ deriving (Eq, Show)
 
 -- | Create a variable name eqivalent to the given expression.
 defineSMTVar :: SMTWriter h
              => WriterConn t h
+             -> DefineStyle
              -> Text
                 -- ^ Name of variable to define
                 -- Should not be defined or declared in the current SMT context
-             -> [(Text, SMT_Type)]
+             -> [(Text, Some TypeMap)]
                 -- ^ Names of variables in term and associated type.
-             -> SMT_Type -- ^ Type of expression.
+             -> TypeMap rtp -- ^ Type of expression.
              -> Term h
              -> IO ()
-defineSMTVar conn var args return_type expr
-  | supportFunctionDefs conn = do
-    addCommand conn $ defineCommand var args return_type expr
+defineSMTVar conn defSty var args return_type expr
+  | supportFunctionDefs conn && defSty == FunctionDefinition = do
+    addCommand conn $ defineCommand conn var args return_type expr
   | otherwise = do
     when (not (null args)) $ do
       fail $ smtWriterName conn ++ " interface does not support defined functions."
-    addCommand conn $ declareCommand conn var [] return_type
+    addCommand conn $ declareCommand conn var Ctx.empty return_type
     assumeFormula conn $ fromText var .== expr
 
+-- | Create a variable name eqivalent to the given expression.
+freshBoundVarName :: SMTWriter h
+                  => WriterConn t h
+                  -> DefineStyle
+                  -> [(Text, Some TypeMap)]
+                     -- ^ Names of variables in term and associated type.
+                  -> TypeMap rtp -- ^ Type of expression.
+                  -> Term h
+                  -> IO Text
+freshBoundVarName conn defSty args return_type expr = do
+  var <- withWriterState conn $ freshVarName
+  defineSMTVar conn defSty var args return_type expr
+  return var
 
 -- | Function for create a new name given a base type.
 data FreshVarFn h = FreshVarFn (forall tp . TypeMap tp -> IO (SMTExpr h tp))
@@ -862,7 +923,7 @@ data FreshVarFn h = FreshVarFn (forall tp . TypeMap tp -> IO (SMTExpr h tp))
 data SMTCollectorState t h
   = SMTCollectorState
     { scConn :: !(WriterConn t h)
-    , freshBoundTermFn :: !(Text -> [(Text, SMT_Type)] -> SMT_Type -> Term h -> IO ())
+    , freshBoundTermFn :: !(forall rtp . Text -> [(Text, Some TypeMap)] -> TypeMap rtp -> Term h -> IO ())
       -- ^ 'freshBoundTerm nm args ret_type ret' will record that 'nm(args) = ret'
       -- 'ret_type' should be the type of 'ret'.
     , freshConstantFn  :: !(Maybe (FreshVarFn h))
@@ -890,25 +951,29 @@ freshConstant nm tpr = do
    Just (FreshVarFn f) ->
     liftIO $ f tpr
 
+data BaseTypeError = ComplexTypeUnsupported
+                   | ArrayUnsupported
+                   | StringTypeUnsupported
+
 -- | Given a solver connection and a base type repr, 'typeMap' attempts to
 -- find the best encoding for a variable of that type supported by teh solver.
 typeMap :: WriterConn t h  -> BaseTypeRepr tp -> Either BaseTypeError (TypeMap tp)
 typeMap conn tp0 = do
-  case typeMapNoFunction conn tp0 of
+  case typeMapFirstClass conn tp0 of
     Right tm -> Right tm
     -- Recover from array unsupported if possible.
     Left ArrayUnsupported
       | supportFunctionDefs conn
       , BaseArrayRepr idxTp eltTp <- tp0 ->
-        FnArrayTypeMap <$> traverseFC (typeMapNoFunction conn) idxTp
-                       <*> typeMapNoFunction conn eltTp
+        FnArrayTypeMap <$> traverseFC (typeMapFirstClass conn) idxTp
+                       <*> typeMapFirstClass conn eltTp
     -- Pass other functions on.
     Left e -> Left e
 
 -- | This is a helper function for 'typeMap' that only returns values that can
 -- be passed as arguments to a function.
-typeMapNoFunction :: WriterConn t h -> BaseTypeRepr tp -> Either BaseTypeError (TypeMap tp)
-typeMapNoFunction conn tp0 = do
+typeMapFirstClass :: WriterConn t h -> BaseTypeRepr tp -> Either BaseTypeError (TypeMap tp)
+typeMapFirstClass conn tp0 = do
   let feat = supportedFeatures conn
   case tp0 of
     BaseBoolRepr -> Right $! BoolTypeMap
@@ -923,13 +988,15 @@ typeMapNoFunction conn tp0 = do
       | feat `hasProblemFeature` useSymbolicArrays -> Right $! ComplexToArrayTypeMap
       | otherwise -> Left $! ComplexTypeUnsupported
     BaseArrayRepr idxTp eltTp -> do
-      -- Check that solver supports primitive arrays, failing if not.
-      unless (feat `hasProblemFeature` useSymbolicArrays) $ do
-        Left $! ArrayUnsupported
-      PrimArrayTypeMap <$> traverseFC (typeMapNoFunction conn) idxTp
-                       <*> typeMapNoFunction conn eltTp
+      -- This is a proxy for the property we want, because we assume that EITHER
+      -- the solver uses symbolic arrays, OR functions are first-class objects
+      let mkArray = if feat `hasProblemFeature` useSymbolicArrays
+                    then PrimArrayTypeMap
+                    else FnArrayTypeMap
+      mkArray <$> traverseFC (typeMapFirstClass conn) idxTp
+              <*> typeMapFirstClass conn eltTp
     BaseStructRepr flds ->
-      StructTypeMap <$> traverseFC (typeMapNoFunction conn) flds
+      StructTypeMap <$> traverseFC (typeMapFirstClass conn) flds
 
 getBaseSMT_Type :: ExprBoundVar t tp -> SMTCollector t h (TypeMap tp)
 getBaseSMT_Type v = do
@@ -948,17 +1015,8 @@ getBaseSMT_Type v = do
     Right smtType                -> return smtType
 
 -- | Create a fresh bound term from the SMT expression with the given name.
-freshBoundTerm :: TypeMap tp -> Term h -> SMTCollector t h (SMTExpr h tp)
-freshBoundTerm tp t = SMTName tp <$> freshBoundFn [] (asSMTType tp) t
-
--- | Create a fresh bound term from the SMT expression with the given name.
-freshBoundTerm' :: SupportTermOps (Term h) => SMTExpr h tp -> SMTCollector t h (SMTExpr h tp)
-freshBoundTerm' t = SMTName tp <$> freshBoundFn [] (asSMTType tp) (asBase t)
-  where tp = smtExprType t
-
--- | Create a fresh bound term from the SMT expression with the given name.
-freshBoundFn :: [(Text, SMT_Type)] -- ^ Arguments expected for function.
-             -> SMT_Type -- ^ Type of result
+freshBoundFn :: [(Text, Some TypeMap)] -- ^ Arguments expected for function.
+             -> TypeMap rtp -- ^ Type of result
              -> Term h   -- ^ Result of function
              -> SMTCollector t h Text
 freshBoundFn args tp t = do
@@ -969,11 +1027,20 @@ freshBoundFn args tp t = do
     f var args tp t
     return var
 
+-- | Create a fresh bound term from the SMT expression with the given name.
+freshBoundTerm :: TypeMap tp -> Term h -> SMTCollector t h (SMTExpr h tp)
+freshBoundTerm tp t = SMTName tp <$> freshBoundFn [] tp t
+
+-- | Create a fresh bound term from the SMT expression with the given name.
+freshBoundTerm' :: SupportTermOps (Term h) => SMTExpr h tp -> SMTCollector t h (SMTExpr h tp)
+freshBoundTerm' t = SMTName tp <$> freshBoundFn [] tp (asBase t)
+  where tp = smtExprType t
 
 -- | Assert a predicate holds as a side condition to some formula.
-addSideCondition :: String     -- ^ Reason that condition is being added.
-                 -> Term h     -- ^ Predicate that should hold.
-                 -> SMTCollector t h ()
+addSideCondition ::
+   String {- ^ Reason that condition is being added. -} ->
+   Term h {- ^ Predicate that should hold. -} ->
+   SMTCollector t h ()
 addSideCondition nm t = do
   conn <- asks scConn
   mf <- asks recordSideCondFn
@@ -985,15 +1052,93 @@ addSideCondition nm t = do
      fail $ "Cannot add a side condition within a function needed to define the "
        ++ nm ++ " term created at " ++ show loc ++ "."
 
-mkFreeVar' :: SMTWriter h => WriterConn t h -> TypeMap tp -> IO (SMTExpr h tp)
-mkFreeVar' conn tp = SMTName tp <$> mkFreeVar conn [] (asSMTType tp)
+addPartialSideCond ::
+  forall t h tp.
+  SMTWriter h =>
+  Term h ->
+  TypeMap tp ->
+  Maybe (AbstractValue tp) ->
+  SMTCollector t h ()
+
+-- NB, nats have a side condition even if there is no abstract domain
+addPartialSideCond t NatTypeMap Nothing =
+  do addSideCondition "nat_range" $ t .>= 0
+
+-- in all other cases, no abstract domain information means unconstrained values
+addPartialSideCond _ _ Nothing = return ()
+
+addPartialSideCond t BoolTypeMap (Just abv) =
+  case abv of
+    Nothing -> return ()
+    Just b  -> addSideCondition "bool_val" $ t .== boolExpr b
+
+addPartialSideCond t NatTypeMap (Just rng) =
+  do addSideCondition "nat_range" $ t .>= integerTerm (toInteger (natRangeLow rng))
+     case natRangeHigh rng of
+       Unbounded -> return ()
+       Inclusive hi -> addSideCondition "nat_range" $ t .<= integerTerm (toInteger hi)
+
+addPartialSideCond t IntegerTypeMap (Just rng) =
+  do case rangeLowBound rng of
+       Unbounded -> return ()
+       Inclusive lo -> addSideCondition "int_range" $ t .>= integerTerm lo
+     case rangeHiBound rng of
+       Unbounded -> return ()
+       Inclusive hi -> addSideCondition "int_range" $ t .<= integerTerm hi
+
+addPartialSideCond t RealTypeMap (Just rng) =
+  do case rangeLowBound (ravRange rng) of
+       Unbounded -> return ()
+       Inclusive lo -> addSideCondition "real_range" $ t .>= rationalTerm lo
+     case rangeHiBound (ravRange rng) of
+       Unbounded -> return ()
+       Inclusive hi -> addSideCondition "real_range" $ t .<= rationalTerm hi
+
+addPartialSideCond t (BVTypeMap w) (Just rng) = mapM_ assertRange (BVD.ranges w rng)
+ where
+ assertRange (lo,hi) =
+   do when (lo > 0)
+           (addSideCondition "bv_range" $ bvULe (bvTerm w lo) t)
+      when (hi < maxUnsigned w)
+           (addSideCondition "bv_range" $ bvULe t (bvTerm w hi))
+
+addPartialSideCond _ (FloatTypeMap _) (Just ()) = return ()
+
+addPartialSideCond t ComplexToStructTypeMap (Just (realRng :+ imagRng)) =
+  do let r = arrayComplexRealPart @h t
+     let i = arrayComplexImagPart @h t
+     addPartialSideCond r RealTypeMap (Just realRng)
+     addPartialSideCond i RealTypeMap (Just imagRng)
+
+addPartialSideCond t ComplexToArrayTypeMap (Just (realRng :+ imagRng)) =
+  do let r = arrayComplexRealPart @h t
+     let i = arrayComplexImagPart @h t
+     addPartialSideCond r RealTypeMap (Just realRng)
+     addPartialSideCond i RealTypeMap (Just imagRng)
+
+addPartialSideCond t (StructTypeMap ctx) (Just abvs) =
+  do let len = Ctx.sizeInt (Ctx.size ctx)
+     Ctx.forIndex (Ctx.size ctx)
+        (\start i ->
+            do start
+               addPartialSideCond
+                 (structFieldSelect len t (Ctx.indexVal i))
+                 (ctx Ctx.! i)
+                 (Just (unwrapAV (abvs Ctx.! i))))
+        (return ())
+
+addPartialSideCond _t (PrimArrayTypeMap _idxTp _resTp) (Just _abv) =
+  fail "SMTWriter.addPartialSideCond: bounds on array values not supported"
+addPartialSideCond _t (FnArrayTypeMap _idxTp _resTp) (Just _abv) =
+  fail "SMTWriter.addPartialSideCond: bounds on array values not supported"
+
 
 -- | This runs the collector on the connection
 runOnLiveConnection :: SMTWriter h => WriterConn t h -> SMTCollector t h a -> IO a
 runOnLiveConnection conn coll = runReaderT coll s
   where s = SMTCollectorState
               { scConn = conn
-              , freshBoundTermFn = defineSMTVar conn
+              , freshBoundTermFn = defineSMTVar conn FunctionDefinition
               , freshConstantFn  = Just $! FreshVarFn (mkFreeVar' conn)
               , recordSideCondFn = Just $! assumeFormula conn
               }
@@ -1001,12 +1146,12 @@ runOnLiveConnection conn coll = runReaderT coll s
 prependToRefList :: IORef [a] -> a -> IO ()
 prependToRefList r a = seq a $ modifyIORef' r (a:)
 
-freshSandboxBoundTerm :: SupportTermOps (Term h)
-                      => IORef [(Text, Term h)]
+freshSandboxBoundTerm :: SupportTermOps v
+                      => IORef [(Text, v)]
                       -> Text -- ^ Name to define.
-                      -> [(Text, SMT_Type)] -- Argument name and types.
-                      -> SMT_Type
-                      -> Term h
+                      -> [(Text, Some TypeMap)] -- Argument name and types.
+                      -> TypeMap rtp
+                      -> v
                       -> IO ()
 freshSandboxBoundTerm ref var [] _ t = do
   prependToRefList ref (var,t)
@@ -1019,12 +1164,12 @@ freshSandboxBoundTerm ref var args _ t = do
       seq r $ prependToRefList ref (var, r)
 
 freshSandboxConstant :: WriterConn t h
-                     -> IORef [(Text, SMT_Type)]
+                     -> IORef [(Text, Some TypeMap)]
                      -> TypeMap tp
                      -> IO (SMTExpr h tp)
 freshSandboxConstant conn ref tp = do
   var <- withWriterState conn $ freshVarName
-  prependToRefList ref (var, asSMTType tp)
+  prependToRefList ref (var, Some tp)
   return $! SMTName tp var
 
 -- | This describes the result that was collected from the solver.
@@ -1033,18 +1178,19 @@ data CollectorResults h a =
                      -- ^ Result from sandboxed computation.
                    , crBindings :: !([(Text, Term h)])
                      -- ^ List of bound variables.
-                   , crFreeConstants :: !([(Text, SMT_Type)])
+                   , crFreeConstants :: !([(Text, Some TypeMap)])
                      -- ^ Constants added during generation.
                    , crSideConds :: !([Term h])
                      -- ^ List of Boolean predicates asserted by collector.
                    }
 
 -- | Create a forall expression from a CollectorResult.
-forallResult :: SupportTermOps (Term h)
+forallResult :: forall h
+             .  SMTWriter h
              => CollectorResults h (Term h)
              -> Term h
 forallResult cr =
-  forallExpr (crFreeConstants cr) $
+  forallExpr @h (crFreeConstants cr) $
     letExpr (crBindings cr) $
       impliesAllExpr (crSideConds cr) (crResult cr)
 
@@ -1054,11 +1200,12 @@ impliesAllExpr :: SupportTermOps v => [v] -> v -> v
 impliesAllExpr l r = orAll ((notExpr <$> l) ++ [r])
 
 -- | Create a forall expression from a CollectorResult.
-existsResult :: SupportTermOps (Term h)
+existsResult :: forall h
+             .  SMTWriter h
              => CollectorResults h (Term h)
              -> Term h
 existsResult cr =
-  existsExpr (crFreeConstants cr) $
+  existsExpr @h (crFreeConstants cr) $
     letExpr (crBindings cr) $
       andAll (crSideConds cr ++ [crResult cr])
 
@@ -1071,7 +1218,7 @@ runInSandbox conn sc = do
   -- A list of bound terms.
   boundTermRef    <- newIORef []
   -- A list of free constants
-  freeConstantRef <- newIORef []
+  freeConstantRef <- (newIORef [] :: IO (IORef [(Text, Some TypeMap)]))
   -- A list of references to side conditions.
   sideCondRef     <- newIORef []
 
@@ -1092,48 +1239,6 @@ runInSandbox conn sc = do
                              , crSideConds = reverse sideConds
                              }
 
--- | 'defineSMTFunction conn var action' will introduce a function
---
--- It returns the return type of the value.
--- Note: This function is declared at a global scope.  It bypasses
--- any subfunctions.  We need to investigate how to support nested
--- functions.
-defineSMTFunction :: SMTWriter h
-                  => WriterConn t h
-                  -> Text
-                  -> (FreshVarFn h -> SMTCollector t h (SMTExpr h ret))
-                     -- ^ Action to generate
-                  -> IO (TypeMap ret)
-defineSMTFunction conn var action =
-  withConnEntryStack conn $ do
-    -- A list of bound terms.
-    freeConstantRef <- newIORef []
-    boundTermRef    <- newIORef []
-    let s = SMTCollectorState { scConn = conn
-                              , freshBoundTermFn = freshSandboxBoundTerm boundTermRef
-                              , freshConstantFn  = Nothing
-                              , recordSideCondFn = Nothing
-                              }
-    -- Associate a variable with each bound variable
-    let varFn = FreshVarFn (freshSandboxConstant conn freeConstantRef)
-    pair <- flip runReaderT s (action varFn)
-
-    args       <- readIORef freeConstantRef
-    boundTerms <- readIORef boundTermRef
-
-    let res = letExpr (reverse boundTerms) (asBase pair)
-
-    defineSMTVar conn var (reverse args) (asSMTType (smtExprType pair)) res
-    return $! smtExprType pair
-
--- | Status to indicate when term value will be uncached.
-data TermLifetime
-   = DeleteNever
-     -- ^ Never delete the term
-   | DeleteOnPop
-     -- ^ Delete the term when the current frame is popped.
-  deriving (Eq)
-
 -- | Cache the result of writing an Expr named by the given nonce.
 cacheWriterResult :: Nonce t tp
                      -- ^ Nonce to associate term with
@@ -1144,14 +1249,12 @@ cacheWriterResult :: Nonce t tp
                   -> SMTCollector t h (SMTExpr h tp)
 cacheWriterResult n lifetime fallback = do
   c <- asks scConn
-  mr <- liftIO $ cacheLookup c n
-  case mr of
-   Just x -> return x
-   Nothing -> do
-     x <- fallback
-     liftIO $ do
-       cacheValue c n lifetime x
-       return x
+  (liftIO $ cacheLookupExpr c n) >>= \case
+    Just x -> return x
+    Nothing -> do
+      x <- fallback
+      liftIO $ cacheValueExpr c n lifetime x
+      return x
 
 -- | Associate a bound variable with the givne SMT Expression until
 -- the a
@@ -1164,26 +1267,23 @@ bindVar v x  = do
   let n = bvarId v
   c <- asks scConn
   liftIO $ do
-    mr <- cacheLookup c n
-    case mr of
-      Just{} -> fail "Variable is already bound."
-      Nothing -> return ()
-    cacheValue c n DeleteOnPop x
+    whenM (isJust <$> cacheLookupExpr c n) $ fail "Variable is already bound."
+    cacheValueExpr c n DeleteOnPop x
 
 ------------------------------------------------------------------------
 -- Evaluate applications.
 
--- @bvIntTerm w x@ builds an integer term term that has the same
--- value as the unsigned integer value of the bitvector @x@.
--- This is done by explicitly decomposing the positional
--- notation of the bitvector into a sum of powers of 2.
+-- @bvIntTerm w x@ builds an integer term that has the same value as
+-- the unsigned integer value of the bitvector @x@.  This is done by
+-- explicitly decomposing the positional notation of the bitvector
+-- into a sum of powers of 2.
 bvIntTerm :: forall v w
            . (SupportTermOps v, 1 <= w)
           => NatRepr w
           -> v
           -> v
 bvIntTerm w x = sumExpr ((\i -> digit (i-1)) <$> [1..natValue w])
- where digit :: Integer -> v
+ where digit :: Natural -> v
        digit d = ite (bvTestBit w d x)
                      (fromInteger (2^d))
                      (fromInteger 0)
@@ -1196,14 +1296,14 @@ sbvIntTerm w0 x0 = sumExpr (signed_offset : go w0 x0 (natValue w0 - 2))
  where signed_offset = ite (bvTestBit w0 (natValue w0 - 1) x0)
                            (fromInteger (negate (2^(widthVal w0 - 1))))
                            (fromInteger 0)
-       go :: SupportTermOps v => NatRepr w -> v -> Integer -> [v]
+       go :: SupportTermOps v => NatRepr w -> v -> Natural -> [v]
        go w x n
         | n > 0     = digit w x n : go w x (n-1)
         | n == 0    = [digit w x 0]
         | otherwise = [] -- this branch should only be called in the degenerate case
                          -- of length 1 signed bitvectors
 
-       digit :: SupportTermOps v => NatRepr w -> v -> Integer -> v
+       digit :: SupportTermOps v => NatRepr w -> v -> Natural -> v
        digit w x d = ite (bvTestBit w d x)
                          (fromInteger (2^d))
                          (fromInteger 0)
@@ -1229,6 +1329,246 @@ checkVarTypeSupport var = do
     BaseComplexRepr -> checkLinearSupport t
     _ -> return ()
 
+theoryUnsupported :: Monad m => WriterConn t h -> String -> Expr t tp -> m a
+theoryUnsupported conn theory_name t =
+  fail $ show $
+    text (smtWriterName conn) <+> text "does not support the" <+> text theory_name
+    <+> text "term generated at" <+> pretty (plSourceLoc (exprLoc t)) <> text ":" <$$>
+    indent 2 (pretty t)
+
+
+checkIntegerSupport :: Expr t tp -> SMTCollector t h ()
+checkIntegerSupport t = do
+  conn <- asks scConn
+  unless (supportedFeatures conn `hasProblemFeature` useIntegerArithmetic) $ do
+    theoryUnsupported conn "integer arithmetic" t
+
+checkLinearSupport :: Expr t tp -> SMTCollector t h ()
+checkLinearSupport t = do
+  conn <- asks scConn
+  unless (supportedFeatures conn `hasProblemFeature` useLinearArithmetic) $ do
+    theoryUnsupported conn "linear arithmetic" t
+
+checkNonlinearSupport :: Expr t tp -> SMTCollector t h ()
+checkNonlinearSupport t = do
+  conn <- asks scConn
+  unless (supportedFeatures conn `hasProblemFeature` useNonlinearArithmetic) $ do
+    theoryUnsupported conn "non-linear arithmetic" t
+
+checkComputableSupport :: Expr t tp -> SMTCollector t h ()
+checkComputableSupport t = do
+  conn <- asks scConn
+  unless (supportedFeatures conn `hasProblemFeature` useComputableReals) $ do
+    theoryUnsupported conn "computable arithmetic" t
+
+checkQuantifierSupport :: String -> Expr t p -> SMTCollector t h ()
+checkQuantifierSupport nm t = do
+  conn <- asks scConn
+  when (supportQuantifiers conn == False) $ do
+    theoryUnsupported conn nm t
+
+-- | Check that the types can be passed to functions.
+checkArgumentTypes :: WriterConn t h -> Ctx.Assignment TypeMap args -> IO ()
+checkArgumentTypes conn types = do
+  forMFC_ types $ \tp -> do
+    case tp of
+      FnArrayTypeMap{} | supportFunctionArguments conn == False -> do
+          fail $ show $ text (smtWriterName conn)
+             <+> text  "does not allow arrays encoded as functions to be function arguments."
+      _ ->
+        return ()
+
+-- | This generates an error message from a solver and a type error.
+--
+-- It issed for error reporting
+type SMTSource = String -> BaseTypeError -> Doc
+
+ppBaseTypeError :: BaseTypeError -> Doc
+ppBaseTypeError ComplexTypeUnsupported = text "complex values"
+ppBaseTypeError ArrayUnsupported = text "arrays encoded as a functions"
+ppBaseTypeError StringTypeUnsupported = text "string values"
+
+eltSource :: Expr t tp -> SMTSource
+eltSource e solver_name cause =
+  text solver_name <+>
+  text "does not support" <+> ppBaseTypeError cause <>
+  text ", and cannot interpret the term generated at" <+>
+  pretty (plSourceLoc (exprLoc e)) <> text ":" <$$>
+  indent 2 (pretty e) <> text "."
+
+fnSource :: SolverSymbol -> ProgramLoc -> SMTSource
+fnSource fn_name loc solver_name cause =
+  text solver_name <+>
+  text "does not support" <+> ppBaseTypeError cause <>
+  text ", and cannot interpret the function" <+> text (show fn_name) <+>
+  text "generated at" <+> pretty (plSourceLoc loc) <> text "."
+
+-- | Evaluate a base type repr as a first class SMT type.
+--
+-- First class types are those that can be passed as function arguments and
+-- returned by functions.
+evalFirstClassTypeRepr :: Monad m
+                       => WriterConn t h
+                       -> SMTSource
+                       -> BaseTypeRepr tp
+                       -> m (TypeMap tp)
+evalFirstClassTypeRepr conn src base_tp =
+  case typeMapFirstClass conn base_tp of
+    Left e -> fail $ show $ src (smtWriterName conn) e
+    Right smt_ret -> return smt_ret
+
+withConnEntryStack :: WriterConn t h -> IO a -> IO a
+withConnEntryStack conn = bracket_ (pushEntryStack conn) (popEntryStack conn)
+
+-- | Convert structure to list.
+mkIndexLitTerm :: SupportTermOps v
+               => IndexLit tp
+               -> v
+mkIndexLitTerm (NatIndexLit i) = fromIntegral i
+mkIndexLitTerm (BVIndexLit w i) = bvTerm w i
+
+-- | Convert structure to list.
+mkIndexLitTerms :: SupportTermOps v
+                => Ctx.Assignment IndexLit ctx
+                -> [v]
+mkIndexLitTerms = toListFC mkIndexLitTerm
+
+-- | Create index arguments with given type.
+--
+-- Returns the name of the argument and the type.
+createTypeMapArgsForArray :: forall t h args
+                          .  WriterConn t h
+                          -> Ctx.Assignment TypeMap args
+                          -> IO [(Text, Some TypeMap)]
+createTypeMapArgsForArray conn types = do
+  -- Create names for index variables.
+  let mkIndexVar :: TypeMap utp -> IO (Text, Some TypeMap)
+      mkIndexVar base_tp = do
+        i_nm <- withWriterState conn $ freshVarName' "i!"
+        return (i_nm, Some base_tp)
+  -- Get SMT arguments.
+  sequence $ toListFC mkIndexVar types
+
+smt_array_select :: forall h idxl idx tp
+                 .  SMTWriter h
+                 => SMTExpr h (BaseArrayType (idxl Ctx.::> idx) tp)
+                 -> [Term h]
+                 -> SMTExpr h tp
+smt_array_select aexpr idxl =
+  case smtExprType aexpr of
+    PrimArrayTypeMap _ res_type ->
+      SMTExpr res_type $ arraySelect @h (asBase aexpr) idxl
+    FnArrayTypeMap _ res_type ->
+      SMTExpr res_type $ smtFnApp (asBase aexpr) idxl
+
+-- | Get name associated with symbol binding if defined, creating it if needed.
+getSymbolName :: WriterConn t h -> SymbolBinding t -> IO Text
+getSymbolName conn b =
+  case lookupSymbolOfBinding b (varBindings conn) of
+    Just sym -> return $! solverSymbolAsText sym
+    Nothing -> withWriterState conn $ freshVarName
+
+-- | 'defineSMTFunction conn var action' will introduce a function
+--
+-- It returns the return type of the value.
+-- Note: This function is declared at a global scope.  It bypasses
+-- any subfunctions.  We need to investigate how to support nested
+-- functions.
+defineSMTFunction :: SMTWriter h
+                  => WriterConn t h
+                  -> Text
+                  -> (FreshVarFn h -> SMTCollector t h (SMTExpr h ret))
+                     -- ^ Action to generate
+                  -> IO (TypeMap ret)
+defineSMTFunction conn var action =
+  withConnEntryStack conn $ do
+    -- A list of bound terms.
+    freeConstantRef <- (newIORef [] :: IO (IORef [(Text, Some TypeMap)]))
+    boundTermRef    <- newIORef []
+    let s = SMTCollectorState { scConn = conn
+                              , freshBoundTermFn = freshSandboxBoundTerm boundTermRef
+                              , freshConstantFn  = Nothing
+                              , recordSideCondFn = Nothing
+                              }
+    -- Associate a variable with each bound variable
+    let varFn = FreshVarFn (freshSandboxConstant conn freeConstantRef)
+    pair <- flip runReaderT s (action varFn)
+
+    args       <- readIORef freeConstantRef
+    boundTerms <- readIORef boundTermRef
+
+    let res = letExpr (reverse boundTerms) (asBase pair)
+
+    defineSMTVar conn FunctionDefinition var (reverse args) (smtExprType pair) res
+    return $! smtExprType pair
+
+------------------------------------------------------------------------
+-- Mutually recursive functions for translating What4 expressions to SMTLIB definitions.
+
+-- | Convert an expression into a SMT Expression.
+mkExpr :: SMTWriter h => Expr t tp -> SMTCollector t h (SMTExpr h tp)
+mkExpr t@(SemiRingLiteral SemiRingNat n _) = do
+  checkLinearSupport t
+  return (SMTExpr NatTypeMap (fromIntegral n))
+mkExpr t@(SemiRingLiteral SemiRingInt i _) = do
+  checkLinearSupport t
+  return (SMTExpr IntegerTypeMap (fromIntegral i))
+mkExpr t@(SemiRingLiteral SemiRingReal r _) = do
+  checkLinearSupport t
+  return (SMTExpr RealTypeMap (rationalTerm r))
+mkExpr t@(StringExpr{}) =
+  do conn <- asks scConn
+     theoryUnsupported conn "strings" t
+mkExpr (BVExpr w x _) =
+  return $ SMTExpr (BVTypeMap w) $ bvTerm w x
+mkExpr (NonceAppExpr ea) =
+  cacheWriterResult (nonceExprId ea) DeleteOnPop $
+    predSMTExpr ea
+mkExpr (AppExpr ea) =
+  cacheWriterResult (appExprId ea) DeleteOnPop $ do
+    appSMTExpr ea
+mkExpr (BoundVarExpr var) = do
+  case bvarKind var of
+   QuantifierVarKind -> do
+     conn <- asks scConn
+     mr <- liftIO $ cacheLookupExpr conn (bvarId var)
+     case mr of
+      Just x -> return x
+      Nothing -> do
+        fail $ "Internal error in SMTLIB exporter due to unbound variable "
+            ++ show (bvarId var) ++ " defined at "
+            ++ show (plSourceLoc (bvarLoc var)) ++ "."
+   LatchVarKind ->
+     fail $ "SMTLib exporter does not support the latch defined at "
+            ++ show (plSourceLoc (bvarLoc var)) ++ "."
+   UninterpVarKind -> do
+     conn <- asks scConn
+     cacheWriterResult (bvarId var) DeleteOnPop $ do
+       checkVarTypeSupport var
+       -- Use predefined var name if it has not been defined.
+       var_name <- liftIO $ getSymbolName conn (VarSymbolBinding var)
+
+       smt_type <- getBaseSMT_Type var
+
+       -- Add command
+       liftIO $ addCommand conn $ declareCommand conn var_name Ctx.empty smt_type
+
+       -- Add assertion based on var type.
+       addPartialSideCond (fromText var_name) smt_type (bvarAbstractValue var)
+
+       -- Return variable name
+       return $ SMTName smt_type var_name
+
+-- | Convert an element to a base expression.
+mkBaseExpr :: SMTWriter h => Expr t tp -> SMTCollector t h (Term h)
+mkBaseExpr e = asBase <$> mkExpr e
+
+-- | Convert structure to list.
+mkIndicesTerms :: SMTWriter h
+               => Ctx.Assignment (Expr t) ctx
+               -> SMTCollector t h [Term h]
+mkIndicesTerms = foldrFC (\e r -> (:) <$> mkBaseExpr e <*> r) (pure [])
+
 predSMTExpr :: forall t h tp
              . SMTWriter h
             => NonceAppExpr t tp
@@ -1250,7 +1590,7 @@ predSMTExpr e0 = do
           t <- liftIO $ f smtType
           bindVar var t
 
-          addPartialSideCond (asBase t) (bvarType var)
+          addPartialSideCond (asBase t) smtType (bvarAbstractValue var)
           mkBaseExpr e
       freshBoundTerm BoolTypeMap $ forallResult cr
     Exists var e -> do
@@ -1264,7 +1604,7 @@ predSMTExpr e0 = do
           t <- liftIO $ f smtType
           bindVar var t
 
-          addPartialSideCond (asBase t) (bvarType var)
+          addPartialSideCond (asBase t) smtType (bvarAbstractValue var)
           mkBaseExpr e
       freshBoundTerm BoolTypeMap $ existsResult cr
 
@@ -1325,228 +1665,6 @@ predSMTExpr e0 = do
       (smt_f, ret_type) <- liftIO $ getSMTSymFn conn f (fmapFC smtExprType smt_args)
       freshBoundTerm ret_type $! smtFnApp (fromText smt_f) (toListFC asBase smt_args)
 
-theoryUnsupported :: Monad m => WriterConn t h -> String -> Expr t tp -> m a
-theoryUnsupported conn theory_name t =
-  fail $ show $
-    text (smtWriterName conn) <+> text "does not support the" <+> text theory_name
-    <+> text "term generated at" <+> pretty (plSourceLoc (exprLoc t)) <> text ":" <$$>
-    indent 2 (pretty t)
-
-checkIntegerSupport :: Expr t tp -> SMTCollector t h ()
-checkIntegerSupport t = do
-  conn <- asks scConn
-  unless (supportedFeatures conn `hasProblemFeature` useIntegerArithmetic) $ do
-    theoryUnsupported conn "integer arithmetic" t
-
-checkLinearSupport :: Expr t tp -> SMTCollector t h ()
-checkLinearSupport t = do
-  conn <- asks scConn
-  unless (supportedFeatures conn `hasProblemFeature` useLinearArithmetic) $ do
-    theoryUnsupported conn "linear arithmetic" t
-
-checkNonlinearSupport :: Expr t tp -> SMTCollector t h ()
-checkNonlinearSupport t = do
-  conn <- asks scConn
-  unless (supportedFeatures conn `hasProblemFeature` useNonlinearArithmetic) $ do
-    theoryUnsupported conn "non-linear arithmetic" t
-
-checkComputableSupport :: Expr t tp -> SMTCollector t h ()
-checkComputableSupport t = do
-  conn <- asks scConn
-  unless (supportedFeatures conn `hasProblemFeature` useComputableReals) $ do
-    theoryUnsupported conn "computable arithmetic" t
-
-checkQuantifierSupport :: String -> Expr t p -> SMTCollector t h ()
-checkQuantifierSupport nm t = do
-  conn <- asks scConn
-  when (supportQuantifiers conn == False) $ do
-    theoryUnsupported conn nm t
-
--- | Generate a SMTLIB function for a ExprBuilder function.
---
--- Since SimpleBuilder different simple builder values with the same type may
--- have different SMTLIB types (particularly arrays), getSMTSymFn requires the
--- argument types to call the function with.  This is enforced to be compatible
--- with the argument types expected by the simplebuilder.
---
--- This function caches the result, and we currently generate the function based
--- on the argument types provided the first time getSMTSymFn is called with a
--- particular simple builder function.  In subsequent calls, we validate that
--- the same argument types are provided.  In principal, a function could be
--- called with one type of arguments, and then be called with a different type
--- and this check would fail.  However, due to limitations in the solvers we
--- expect to support, this should never happen as the only time these may differ
--- when arrays are used and one array is encoded using the theory of arrays, while
--- the other uses a defined function.  However, SMTLIB2 does not allow functions
--- to be passed to other functions; yices does, but always encodes arrays as functions.
---
--- Returns the name of the function and the type of the result.
-getSMTSymFn :: SMTWriter h
-            => WriterConn t h
-            -> ExprSymFn t args ret -- ^ Function to
-            -> Ctx.Assignment TypeMap args
-            -> IO (Text, TypeMap ret)
-getSMTSymFn conn fn arg_types = do
-  let n = symFnId fn
-  let cache = smtFnCache conn
-  me <- stToIO $ PH.lookup cache n
-  case me of
-    Just (SMTSymFn nm param_types ret) -> do
-      when (arg_types /= param_types) $ do
-        fail $ "Illegal arguments to function " ++ Text.unpack nm ++ "."
-      return (nm, ret)
-    Nothing -> do
-      -- Check argument types can be passed to a function.
-      checkArgumentTypes conn arg_types
-      -- Generate name.
-      nm <- getSymbolName conn (FnSymbolBinding fn)
-      ret_type <- mkSMTSymFn conn nm fn arg_types
-      stToIO $ PH.insert cache n $! SMTSymFn nm arg_types ret_type
-      return $! (nm, ret_type)
-
--- | Check that the types can be passed to functions.
-checkArgumentTypes :: WriterConn t h -> Ctx.Assignment TypeMap args -> IO ()
-checkArgumentTypes conn types = do
-  forMFC_ types $ \tp -> do
-    case tp of
-      FnArrayTypeMap{} | supportFunctionArguments conn == False -> do
-          fail $ show $ text (smtWriterName conn)
-             <+> text  "does not allow arrays encoded as functions to be function arguments."
-      _ ->
-        return ()
-
--- | This generates an error message from a solver and a type error.
---
--- It issed for error reporting
-type SMTSource = String -> BaseTypeError -> Doc
-
-ppBaseTypeError :: BaseTypeError -> Doc
-ppBaseTypeError ComplexTypeUnsupported = text "complex values"
-ppBaseTypeError ArrayUnsupported = text "arrays encoded as a functions"
-ppBaseTypeError StringTypeUnsupported = text "string values"
-
-eltSource :: Expr t tp -> SMTSource
-eltSource e solver_name cause =
-  text solver_name <+>
-  text "does not support" <+> ppBaseTypeError cause <>
-  text ", and cannot interpret the term generated at" <+>
-  pretty (plSourceLoc (exprLoc e)) <> text ":" <$$>
-  indent 2 (pretty e) <> text "."
-
-fnSource :: SolverSymbol -> ProgramLoc -> SMTSource
-fnSource fn_name loc solver_name cause =
-  text solver_name <+>
-  text "does not support" <+> ppBaseTypeError cause <>
-  text ", and cannot interpret the function" <+> text (show fn_name) <+>
-  text "generated at" <+> pretty (plSourceLoc loc) <> text "."
-
--- | Evaluate a base type repr as a first class SMT type.
---
--- First class types are those that can be passed as function arguments and
--- returned by functions.
-evalFirstClassTypeRepr :: Monad m
-                       => WriterConn t h
-                       -> SMTSource
-                       -> BaseTypeRepr tp
-                       -> m (TypeMap tp)
-evalFirstClassTypeRepr conn src base_tp =
-  case typeMapNoFunction conn base_tp of
-    Left e -> fail $ show $ src (smtWriterName conn) e
-    Right smt_ret -> return smt_ret
-
-defineFn :: SMTWriter h
-         => WriterConn t h
-         -> Text
-         -> Ctx.Assignment (ExprBoundVar t) a
-         -> Expr t r
-         -> Ctx.Assignment TypeMap a
-         -> IO (TypeMap r)
-defineFn conn nm arg_vars return_value arg_types =
-  -- Define the SMT function
-  defineSMTFunction conn nm $ \(FreshVarFn freshVar) -> do
-    -- Create SMT expressions and bind them to vars
-    Ctx.forIndexM (Ctx.size arg_vars) $ \i -> do
-      let v = arg_vars Ctx.! i
-      let smtType = arg_types Ctx.! i
-      checkVarTypeSupport v
-      x <- liftIO $ freshVar smtType
-      bindVar v x
-    -- Evaluate return value
-    mkExpr return_value
-
--- | Create a SMT symbolic function from the ExprSymFn.
---
--- Returns the return type of the function.
---
--- This is only called by 'getSMTSymFn'.
-mkSMTSymFn :: SMTWriter h
-           => WriterConn t h
-           -> Text
-           -> ExprSymFn t args ret
-           -> Ctx.Assignment TypeMap args
-           -> IO (TypeMap ret)
-mkSMTSymFn conn nm f arg_types =
-  case symFnInfo f of
-    UninterpFnInfo _ return_type -> do
-      let fnm = symFnName f
-      let l = symFnLoc f
-      smt_ret <- evalFirstClassTypeRepr conn (fnSource fnm l) return_type
-      addCommand conn $
-        declareCommand conn nm (toListFC asSMTType arg_types) (asSMTType smt_ret)
-      return $! smt_ret
-    DefinedFnInfo arg_vars return_value _ -> do
-      defineFn conn nm arg_vars return_value arg_types
-    MatlabSolverFnInfo _ arg_vars return_value -> do
-      defineFn conn nm arg_vars return_value arg_types
-
-withConnEntryStack :: WriterConn t h -> IO a -> IO a
-withConnEntryStack conn = bracket_ (pushEntryStack conn) (popEntryStack conn)
-
--- | Convert structure to list.
-mkIndicesTerms :: SMTWriter h
-               => Ctx.Assignment (Expr t) ctx
-               -> SMTCollector t h [Term h]
-mkIndicesTerms = foldrFC (\e r -> (:) <$> mkBaseExpr e <*> r) (pure [])
-
--- | Convert structure to list.
-mkIndexLitTerms :: SupportTermOps v
-                => Ctx.Assignment IndexLit ctx
-                -> [v]
-mkIndexLitTerms = toListFC mkIndexLitTerm
-
--- | Convert structure to list.
-mkIndexLitTerm :: SupportTermOps v
-               => IndexLit tp
-               -> v
-mkIndexLitTerm (NatIndexLit i) = fromIntegral i
-mkIndexLitTerm (BVIndexLit w i) = bvTerm w i
-
--- | Create index arguments with given type.
---
--- Returns the name of the argument and the type.
-createTypeMapArgsForArray :: forall t h args
-                          .  WriterConn t h
-                          -> Ctx.Assignment TypeMap args
-                          -> IO [(Text, SMT_Type)]
-createTypeMapArgsForArray conn types = do
-  -- Create names for index variables.
-  let mkIndexVar :: TypeMap utp -> IO (Text, SMT_Type)
-      mkIndexVar base_tp = do
-        i_nm <- withWriterState conn $ freshVarName' "i!"
-        return (i_nm, asSMTType base_tp)
-  -- Get SMT arguments.
-  sequence $ toListFC mkIndexVar types
-
-smt_array_select :: SupportTermOps (Term h)
-                 => SMTExpr h (BaseArrayType (idxl Ctx.::> idx) tp)
-                 -> [Term h]
-                 -> SMTExpr h tp
-smt_array_select aexpr idxl =
-  case smtExprType aexpr of
-    PrimArrayTypeMap _ res_type ->
-      SMTExpr res_type $ arraySelect (asBase aexpr) idxl
-    FnArrayTypeMap _ res_type ->
-      SMTExpr res_type $ smtFnApp (asBase aexpr) idxl
 
 appSMTExpr :: forall t h tp
             . SMTWriter h
@@ -1557,7 +1675,6 @@ appSMTExpr ae = do
   let i = AppExpr ae
   liftIO $ updateProgramLoc conn (appExprLoc ae)
   case appExprApp ae of
-
     TrueBool  ->
       return $! SMTExpr BoolTypeMap (boolExpr True)
     FalseBool ->
@@ -1599,7 +1716,7 @@ appSMTExpr ae = do
         ite pb (bvTerm (knownNat @1) 1) (bvTerm (knownNat @1) 0)
     BVTestBit n xe -> do
       x <- mkBaseExpr xe
-      let this_bit = bvExtract (bvWidth xe) (toInteger n) 1 x
+      let this_bit = bvExtract (bvWidth xe) n 1 x
           one = bvTerm (knownNat :: NatRepr 1) 1
       freshBoundTerm BoolTypeMap $ this_bit .== one
     BVEq xe ye -> do
@@ -1875,8 +1992,8 @@ appSMTExpr ae = do
     BVZext w' xe -> do
       let w = bvWidth xe
       x <- mkBaseExpr xe
-      let n = widthVal w' - widthVal w
-      case someNat (fromIntegral n) of
+      let n = intValue w' - intValue w
+      case someNat n of
         Just (Some w2) | Just LeqProof <- isPosNat w' -> do
           let zeros = bvTerm w2 0
           freshBoundTerm (BVTypeMap w') $ bvConcat zeros x
@@ -1885,7 +2002,7 @@ appSMTExpr ae = do
     BVSext w' xe -> do
       let w = bvWidth xe
       x <- mkBaseExpr xe
-      let n = natValue w' - natValue w
+      let n = intValue w' - intValue w
       case someNat n of
         Just (Some w2) | Just LeqProof <- isPosNat w' -> do
           let zeros = bvTerm w2 0
@@ -1894,10 +2011,28 @@ appSMTExpr ae = do
           freshBoundTerm (BVTypeMap w') $ bvConcat (ite sgn ones zeros) x
         _ -> fail "invalid sign extension"
 
-    BVTrunc w' xe -> do
-      let w = bvWidth xe
-      x <- mkBaseExpr xe
-      freshBoundTerm (BVTypeMap w') $ bvExtract w 0 (natValue w') x
+    BVPopcount w xe ->
+      do x <- mkBaseExpr xe
+         let zs = [ ite (bvTestBit w idx x) (bvTerm w 1) (bvTerm w 0)
+                  | idx <- [ 0 .. natValue w - 1 ]
+                  ]
+         freshBoundTerm (BVTypeMap w) $! bvSumExpr w zs
+
+    BVCountLeadingZeros w xe ->
+      do x <- mkBaseExpr xe
+         freshBoundTerm (BVTypeMap w) $! go 0 x
+     where
+     go !idx x
+       | idx < natValue w = ite (bvTestBit w (natValue w - idx - 1) x) (bvTerm w (toInteger idx)) (go (idx+1) x)
+       | otherwise = bvTerm w (intValue w)
+
+    BVCountTrailingZeros w xe ->
+      do x <- mkBaseExpr xe
+         freshBoundTerm (BVTypeMap w) $! go 0 x
+     where
+     go !idx x
+       | idx < natValue w = ite (bvTestBit w idx x) (bvTerm w (toInteger idx)) (go (idx+1) x)
+       | otherwise = bvTerm w (intValue w)
 
     BVBitNot w xe -> do
       x <- mkBaseExpr xe
@@ -1918,15 +2053,15 @@ appSMTExpr ae = do
     ------------------------------------------
     -- Floating-point operations
     FloatPZero fpp ->
-      freshBoundTerm (FloatTypeMap fpp) $ floatPZero $ asSMTFloatPrecision fpp
+      freshBoundTerm (FloatTypeMap fpp) $ floatPZero fpp
     FloatNZero fpp ->
-      freshBoundTerm (FloatTypeMap fpp) $ floatNZero $ asSMTFloatPrecision fpp
+      freshBoundTerm (FloatTypeMap fpp) $ floatNZero fpp
     FloatNaN fpp ->
-      freshBoundTerm (FloatTypeMap fpp) $ floatNaN $ asSMTFloatPrecision fpp
+      freshBoundTerm (FloatTypeMap fpp) $ floatNaN fpp
     FloatPInf fpp ->
-      freshBoundTerm (FloatTypeMap fpp) $ floatPInf $ asSMTFloatPrecision fpp
+      freshBoundTerm (FloatTypeMap fpp) $ floatPInf fpp
     FloatNInf fpp ->
-      freshBoundTerm (FloatTypeMap fpp) $ floatNInf $ asSMTFloatPrecision fpp
+      freshBoundTerm (FloatTypeMap fpp) $ floatNInf fpp
     FloatNeg fpp x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $ floatNeg xe
@@ -2021,23 +2156,38 @@ appSMTExpr ae = do
     FloatCast fpp r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
-        floatCast (asSMTFloatPrecision fpp) r xe
+        floatCast fpp r xe
+    FloatRound fpp r x -> do
+      xe <- mkBaseExpr x
+      freshBoundTerm (FloatTypeMap fpp)$ floatRound r xe
+    FloatToBinary fpp@(FloatingPointPrecisionRepr eb sb) x -> do
+      xe <- mkBaseExpr x
+      val <- asBase <$> (freshConstant "float_binary" $ BVTypeMap $ addNat eb sb)
+      -- (assert (= ((_ to_fp eb sb) val) xe))
+      addSideCondition "float_binary" $
+        floatFromBinary fpp val .== xe
+      -- qnan: 0b0 0b1..1 0b10..0
+      let qnan = bvTerm (addNat eb sb) $ shiftL
+                  (2 ^ (natValue eb + 1) - 1)
+                  (fromIntegral (natValue sb - 2))
+      -- return (ite (fp.isNaN xe) qnan val)
+      freshBoundTerm (BVTypeMap $ addNat eb sb) $ ite (floatIsNaN xe) qnan val
     FloatFromBinary fpp x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
-        floatFromBinary (asSMTFloatPrecision fpp) xe
+        floatFromBinary fpp xe
     BVToFloat fpp r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
-        bvToFloat (asSMTFloatPrecision fpp) r xe
+        bvToFloat fpp r xe
     SBVToFloat fpp r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
-        sbvToFloat (asSMTFloatPrecision fpp) r xe
+        sbvToFloat fpp r xe
     RealToFloat fpp r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
-        realToFloat (asSMTFloatPrecision fpp) r xe
+        realToFloat fpp r xe
     FloatToBV w r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (BVTypeMap w) $ floatToBV (natValue w) r xe
@@ -2062,7 +2212,7 @@ appSMTExpr ae = do
                            -> Term h
                            -> Term h
               set_at_index ma idx elt =
-                arrayUpdate ma (mkIndexLitTerms idx) elt
+                arrayUpdate @h ma (mkIndexLitTerms idx) elt
           freshBoundTerm array_type $
             Map.foldlWithKey set_at_index (asBase base_array) elt_exprs
 
@@ -2098,31 +2248,33 @@ appSMTExpr ae = do
               -- Get final expression for definition.
               let expr = Map.foldlWithKey set_at_index base_lookup elt_exprs
               -- Add command
-              SMTName array_type <$> freshBoundFn args (asSMTType resType) expr
+              SMTName array_type <$> freshBoundFn args resType expr
 
     ConstantArray idxRepr _bRepr ve -> do
       v <- mkExpr ve
       let value_type = smtExprType v
-      let smt_value_type = asSMTType value_type
+          feat = supportedFeatures conn
+          mkArray = if feat `hasProblemFeature` useSymbolicArrays
+                    then PrimArrayTypeMap
+                    else FnArrayTypeMap
       idx_types <- liftIO $
         traverseFC (evalFirstClassTypeRepr conn (eltSource i)) idxRepr
-      case arrayConstant of
+      case arrayConstant @h of
         Just constFn
           | otherwise -> do
-            let idx_smt_types :: [SMT_Type]
-                idx_smt_types = toListFC asSMTType idx_types
-            let tp = PrimArrayTypeMap idx_types value_type
+            let idx_smt_types = toListFC Some idx_types
+            let tp = mkArray idx_types value_type
             freshBoundTerm tp $!
-              constFn idx_smt_types smt_value_type (asBase v)
+              constFn idx_smt_types (Some value_type) (asBase v)
         Nothing -> do
           when (not (supportFunctionDefs conn)) $ do
             fail $ show $ text (smtWriterName conn) <+>
               text "cannot encode constant arrays."
           -- Constant functions use unnamed variables.
-          let array_type = FnArrayTypeMap idx_types value_type
+          let array_type = mkArray idx_types value_type
           -- Create names for index variables.
           args <- liftIO $ createTypeMapArgsForArray conn idx_types
-          SMTName array_type <$> freshBoundFn args (asSMTType value_type) (asBase v)
+          SMTName array_type <$> freshBoundFn args value_type (asBase v)
 
     MuxArray _idxRepr _bRepr ce xe ye -> do
       c <- mkExpr ce
@@ -2150,7 +2302,7 @@ appSMTExpr ae = do
       case array_type of
         PrimArrayTypeMap _ _ -> do
             freshBoundTerm array_type $
-              arrayUpdate (asBase a) updated_idx value
+              arrayUpdate @h (asBase a) updated_idx value
         FnArrayTypeMap idxTypes resType  -> do
           case smtFnUpdate of
             Just updateFn -> do
@@ -2163,7 +2315,7 @@ appSMTExpr ae = do
               let base_array_value = smtFnApp (asBase a) idx_terms
               let cond = andAll (zipWith (.==) updated_idx idx_terms)
               let expr = ite cond value base_array_value
-              SMTName array_type <$> freshBoundFn args (asSMTType resType) expr
+              SMTName array_type <$> freshBoundFn args resType expr
 
     ------------------------------------------------------------------------
     -- Conversions.
@@ -2260,13 +2412,13 @@ appSMTExpr ae = do
           | feat `hasProblemFeature` useSymbolicArrays -> do
             let tp = ComplexToArrayTypeMap
             ra <-
-              case arrayConstant of
-              Just constFn  ->
-                return (constFn [SMT_BoolType] SMT_RealType r')
-              Nothing -> do
-                a <- asBase <$> freshConstant "complex lit" tp
-                return $! arrayUpdate a [boolExpr False] r'
-            freshBoundTerm tp $! arrayUpdate ra [boolExpr True] i'
+              case arrayConstant @h of
+                Just constFn  ->
+                  return (constFn [Some BoolTypeMap] (Some RealTypeMap) r')
+                Nothing -> do
+                  a <- asBase <$> freshConstant "complex lit" tp
+                  return $! arrayUpdate @h a [boolExpr False] r'
+            freshBoundTerm tp $! arrayUpdate @h ra [boolExpr True] i'
           | otherwise ->
             theoryUnsupported conn "complex literals" i
 
@@ -2276,14 +2428,14 @@ appSMTExpr ae = do
         ComplexToStructTypeMap ->
           freshBoundTerm RealTypeMap $ structComplexRealPart (asBase c)
         ComplexToArrayTypeMap ->
-          freshBoundTerm RealTypeMap $ arrayComplexRealPart (asBase c)
+          freshBoundTerm RealTypeMap $ arrayComplexRealPart @h (asBase c)
     ImagPart e -> do
       c <- mkExpr e
       case smtExprType c of
         ComplexToStructTypeMap ->
           freshBoundTerm RealTypeMap $ structComplexImagPart (asBase c)
         ComplexToArrayTypeMap ->
-          freshBoundTerm RealTypeMap $ arrayComplexImagPart (asBase c)
+          freshBoundTerm RealTypeMap $ arrayComplexImagPart @h (asBase c)
 
     --------------------------------------------------------------------
     -- Structures
@@ -2312,83 +2464,109 @@ appSMTExpr ae = do
       let tp = smtExprType xe
       freshBoundTerm tp $ ite (asBase pe) (asBase xe) (asBase ye)
 
+defineFn :: SMTWriter h
+         => WriterConn t h
+         -> Text
+         -> Ctx.Assignment (ExprBoundVar t) a
+         -> Expr t r
+         -> Ctx.Assignment TypeMap a
+         -> IO (TypeMap r)
+defineFn conn nm arg_vars return_value arg_types =
+  -- Define the SMT function
+  defineSMTFunction conn nm $ \(FreshVarFn freshVar) -> do
+    -- Create SMT expressions and bind them to vars
+    Ctx.forIndexM (Ctx.size arg_vars) $ \i -> do
+      let v = arg_vars Ctx.! i
+      let smtType = arg_types Ctx.! i
+      checkVarTypeSupport v
+      x <- liftIO $ freshVar smtType
+      bindVar v x
+    -- Evaluate return value
+    mkExpr return_value
+
+-- | Create a SMT symbolic function from the ExprSymFn.
+--
+-- Returns the return type of the function.
+--
+-- This is only called by 'getSMTSymFn'.
+mkSMTSymFn :: SMTWriter h
+           => WriterConn t h
+           -> Text
+           -> ExprSymFn t args ret
+           -> Ctx.Assignment TypeMap args
+           -> IO (TypeMap ret)
+mkSMTSymFn conn nm f arg_types =
+  case symFnInfo f of
+    UninterpFnInfo _ return_type -> do
+      let fnm = symFnName f
+      let l = symFnLoc f
+      smt_ret <- evalFirstClassTypeRepr conn (fnSource fnm l) return_type
+      addCommand conn $
+        declareCommand conn nm arg_types smt_ret
+      return $! smt_ret
+    DefinedFnInfo arg_vars return_value _ -> do
+      defineFn conn nm arg_vars return_value arg_types
+    MatlabSolverFnInfo _ arg_vars return_value -> do
+      defineFn conn nm arg_vars return_value arg_types
+
+-- | Generate a SMTLIB function for a ExprBuilder function.
+--
+-- Since SimpleBuilder different simple builder values with the same type may
+-- have different SMTLIB types (particularly arrays), getSMTSymFn requires the
+-- argument types to call the function with.  This is enforced to be compatible
+-- with the argument types expected by the simplebuilder.
+--
+-- This function caches the result, and we currently generate the function based
+-- on the argument types provided the first time getSMTSymFn is called with a
+-- particular simple builder function.  In subsequent calls, we validate that
+-- the same argument types are provided.  In principal, a function could be
+-- called with one type of arguments, and then be called with a different type
+-- and this check would fail.  However, due to limitations in the solvers we
+-- expect to support, this should never happen as the only time these may differ
+-- when arrays are used and one array is encoded using the theory of arrays, while
+-- the other uses a defined function.  However, SMTLIB2 does not allow functions
+-- to be passed to other functions; yices does, but always encodes arrays as functions.
+--
+-- Returns the name of the function and the type of the result.
+getSMTSymFn :: SMTWriter h
+            => WriterConn t h
+            -> ExprSymFn t args ret -- ^ Function to
+            -> Ctx.Assignment TypeMap args
+            -> IO (Text, TypeMap ret)
+getSMTSymFn conn fn arg_types = do
+  let n = symFnId fn
+  cacheLookupFn conn n >>= \case
+    Just (SMTSymFn nm param_types ret) -> do
+      when (arg_types /= param_types) $ do
+        fail $ "Illegal arguments to function " ++ Text.unpack nm ++ ".\n"
+              ++ "\tExpected arguments: " ++ show param_types ++"\n"
+              ++ "\tActual arguments: " ++ show arg_types
+      return (nm, ret)
+    Nothing -> do
+      -- Check argument types can be passed to a function.
+      checkArgumentTypes conn arg_types
+      -- Generate name.
+      nm <- getSymbolName conn (FnSymbolBinding fn)
+      ret_type <- mkSMTSymFn conn nm fn arg_types
+      cacheValueFn conn n DeleteOnPop $! SMTSymFn nm arg_types ret_type
+      return $! (nm, ret_type)
+
 ------------------------------------------------------------------------
 -- Writer high-level interface.
 
--- | Convert an element to a base expression.
-mkBaseExpr :: SMTWriter h => Expr t tp -> SMTCollector t h (Term h)
-mkBaseExpr e = asBase <$> mkExpr e
-
-addPartialSideCond :: SupportTermOps (Term h)
-                   => Term h -> BaseTypeRepr tp -> SMTCollector t h ()
-addPartialSideCond t BaseNatRepr = addSideCondition "nat" $ t .>= 0
-addPartialSideCond _ _ = return ()
-
--- | Get name associated with symbol binding if defined, creating it if needed.
-getSymbolName :: WriterConn t h -> SymbolBinding t -> IO Text
-getSymbolName conn b =
-  case Bimap.lookupR b (varBindings conn) of
-    Just sym -> return $! solverSymbolAsText sym
-    Nothing -> withWriterState conn $ freshVarName
-
--- | Convert an expression into a SMT Expression.
-mkExpr :: SMTWriter h => Expr t tp -> SMTCollector t h (SMTExpr h tp)
-mkExpr t@(SemiRingLiteral SemiRingNat n _) = do
-  checkLinearSupport t
-  return (SMTExpr NatTypeMap (fromIntegral n))
-mkExpr t@(SemiRingLiteral SemiRingInt i _) = do
-  checkLinearSupport t
-  return (SMTExpr IntegerTypeMap (fromIntegral i))
-mkExpr t@(SemiRingLiteral SemiRingReal r _) = do
-  checkLinearSupport t
-  return (SMTExpr RealTypeMap (rationalTerm r))
-mkExpr t@(StringExpr{}) =
-  do conn <- asks scConn
-     theoryUnsupported conn "strings" t
-mkExpr (BVExpr w x _) =
-  return $ SMTExpr (BVTypeMap w) $ bvTerm w x
-mkExpr (NonceAppExpr ea) =
-  cacheWriterResult (nonceExprId ea) DeleteOnPop $
-    predSMTExpr ea
-mkExpr (AppExpr ea) =
-  cacheWriterResult (appExprId ea) DeleteOnPop $ do
-    appSMTExpr ea
-mkExpr (BoundVarExpr var) = do
-  case bvarKind var of
-   QuantifierVarKind -> do
-     conn <- asks scConn
-     mr <- liftIO $ cacheLookup conn (bvarId var)
-     case mr of
-      Just x -> return x
-      Nothing -> do
-        fail $ "Internal error in SMTLIB exporter due to unbound variable "
-            ++ show (bvarId var) ++ " defined at "
-            ++ show (plSourceLoc (bvarLoc var)) ++ "."
-   LatchVarKind ->
-     fail $ "SMTLib exporter does not support the latch defined at "
-            ++ show (plSourceLoc (bvarLoc var)) ++ "."
-   UninterpVarKind -> do
-     conn <- asks scConn
-     cacheWriterResult (bvarId var) DeleteOnPop $ do
-       checkVarTypeSupport var
-
-       -- Use predefined var name if it has not been defined.
-       var_name <- liftIO $ getSymbolName conn (VarSymbolBinding var)
-
-       smt_type <- getBaseSMT_Type var
-
-       -- Add command
-       liftIO $ addCommand conn $ declareCommand conn var_name [] (asSMTType smt_type)
-
-       -- Add assertion based on var type.
-       addPartialSideCond (fromText var_name) (bvarType var)
-
-       -- Return variable name
-       return $ SMTName smt_type var_name
+-- | Write a expression to SMT
+mkSMTTerm :: SMTWriter h => WriterConn t h -> Expr t tp -> IO (Term h)
+mkSMTTerm conn p = runOnLiveConnection conn $ mkBaseExpr p
 
 -- | Write a logical expression.
 mkFormula :: SMTWriter h => WriterConn t h -> BoolExpr t -> IO (Term h)
-mkFormula conn p = runOnLiveConnection conn $ mkBaseExpr p
+mkFormula = mkSMTTerm
+
+mkAtomicFormula :: SMTWriter h => WriterConn t h -> BoolExpr t -> IO Text
+mkAtomicFormula conn p = runOnLiveConnection conn $
+  mkExpr p >>= \case
+    SMTName _ nm  -> return nm
+    SMTExpr ty tm -> freshBoundFn [] ty tm
 
 -- | Write assume formula predicates for asserting predicate holds.
 assume :: SMTWriter h => WriterConn t h -> BoolExpr t -> IO ()
@@ -2435,11 +2613,19 @@ data SMTEvalFunctions h
 class SMTWriter h => SMTReadWriter h where
   -- | Get functions for parsing values out of the solver.
   smtEvalFuns ::
-    WriterConn t h -> Streams.InputStream ByteString -> SMTEvalFunctions h
+    WriterConn t h -> Streams.InputStream Text -> SMTEvalFunctions h
 
   -- | Parse a set result from the solver's response.
-  smtSatResult :: f h -> Streams.InputStream ByteString -> IO (SatResult ())
+  smtSatResult :: f h -> Streams.InputStream Text -> IO (SatResult () ())
 
+  -- | Parse a list of names of assumptions that form an unsatisfiable core.
+  --   These correspond to previously-named assertions.
+  smtUnsatCoreResult :: f h -> Streams.InputStream Text -> IO [Text]
+
+  -- | Parse a list of names of assumptions that form an unsatisfiable core.
+  --   The boolean indicates the polarity of the atom: true for an ordinary
+  --   atom, false for a negated atom.
+  smtUnsatAssumptionsResult :: f h -> Streams.InputStream Text -> IO [(Bool,Text)]
 
 -- | Return the terms associated with the given ground index variables.
 smtIndicesTerms :: forall v idx
@@ -2457,11 +2643,12 @@ smtIndicesTerms tps vals = Ctx.forIndexRange 0 sz f []
                       BVTypeMap w -> bvTerm w v
                       _ -> error "Do not yet support other index types."
 
-getSolverVal :: forall h tp. SupportTermOps (Term h)
-              => SMTEvalFunctions h
-              -> TypeMap tp
-              -> Term h
-              -> IO (GroundValue tp)
+getSolverVal :: forall h tp
+             .  SMTWriter h
+             => SMTEvalFunctions h
+             -> TypeMap tp
+             -> Term h
+             -> IO (GroundValue tp)
 getSolverVal smtFns BoolTypeMap   tm = smtEvalBool smtFns tm
 getSolverVal smtFns (BVTypeMap w) tm = smtEvalBV smtFns (widthVal w) tm
 getSolverVal smtFns RealTypeMap   tm = smtEvalReal smtFns tm
@@ -2479,8 +2666,8 @@ getSolverVal smtFns ComplexToStructTypeMap tm =
   (:+) <$> smtEvalReal smtFns (structComplexRealPart tm)
        <*> smtEvalReal smtFns (structComplexImagPart tm)
 getSolverVal smtFns ComplexToArrayTypeMap tm =
-  (:+) <$> smtEvalReal smtFns (arrayComplexRealPart tm)
-       <*> smtEvalReal smtFns (arrayComplexImagPart tm)
+  (:+) <$> smtEvalReal smtFns (arrayComplexRealPart @h tm)
+       <*> smtEvalReal smtFns (arrayComplexImagPart @h tm)
 getSolverVal smtFns (PrimArrayTypeMap idx_types eltTp) tm
   | Just (SMTEvalBVArrayWrapper evalBVArray) <- smtEvalBvArray smtFns
   , Ctx.Empty Ctx.:> (BVTypeMap w) <- idx_types
@@ -2488,7 +2675,7 @@ getSolverVal smtFns (PrimArrayTypeMap idx_types eltTp) tm
       fromMaybe byIndex <$> evalBVArray w v tm
   | otherwise = return byIndex
   where byIndex = ArrayMapping $ \i -> do
-          let res = arraySelect tm (smtIndicesTerms idx_types i)
+          let res = arraySelect @h tm (smtIndicesTerms idx_types i)
           getSolverVal smtFns eltTp res
 getSolverVal smtFns (FnArrayTypeMap idx_types eltTp) tm = return $ ArrayMapping $ \i -> do
   let term = smtFnApp tm (smtIndicesTerms idx_types i)
@@ -2522,7 +2709,7 @@ smtExprGroundEvalFn conn smtFns = do
           Nothing -> evalGroundExpr cachedEval e
           Just e_id -> fmap unGVW $ idxCacheEval' groundCache e_id $ fmap GVW $ do
             -- See if we have bound the Expr e to a SMT expression.
-            me <- cacheLookup conn e_id
+            me <- cacheLookupExpr conn e_id
             case me of
               -- Otherwise, try the evalGroundExpr function to evaluate a ground element.
               Nothing -> evalGroundExpr cachedEval e

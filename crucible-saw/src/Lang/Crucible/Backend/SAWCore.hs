@@ -28,41 +28,42 @@ import           Data.Map ( Map )
 import qualified Data.Map as Map
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Nonce
+import           Data.Parameterized.TraversableFC
 import           Data.Ratio
 import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import           Data.Word(Word64)
 import qualified Data.Text as Text
 
-import qualified Data.AIG as AIG
 import           Numeric.Natural
 
 import           What4.BaseTypes
 import           What4.Config
-import           What4.Concrete
 import           What4.Interface
-import           What4.SatResult
 import qualified What4.Expr.Builder as B
 import qualified What4.Expr.WeightedSum as WSum
+import           What4.ProgramLoc
+import           What4.Protocol.Online
+import           What4.SatResult
+import qualified What4.Solver.Yices as Yices
 import           What4.Symbol
+import           What4.Utils.Hashable (hashedMap)
 
 import           Lang.Crucible.Panic(panic)
 import           Lang.Crucible.Backend
-import           Lang.Crucible.Backend.AssumptionStack as AS
+import           Lang.Crucible.Backend.Online
+import qualified Lang.Crucible.Backend.AssumptionStack as AS
 import           Lang.Crucible.Simulator.SimError
 
+import qualified Verifier.SAW.Recognizer as SC (asLambda)
 import qualified Verifier.SAW.SharedTerm as SC
-import qualified Verifier.SAW.Simulator.BitBlast as BBSim
 import qualified Verifier.SAW.TypedAST as SC
 
 data SAWCruciblePersonality sym = SAWCruciblePersonality
 
-data AIGProxy where
-  AIGProxy :: (AIG.IsAIG l g) => AIG.Proxy l g -> AIGProxy
-
 -- | The SAWCoreBackend is a crucible backend that represents symbolic values
 --   as SAWCore terms.
-data SAWCoreState n
+data SAWCoreState solver n
   = SAWCoreState
     { saw_ctx       :: SC.SharedContext                         -- ^ the main SAWCore datastructure for building shared terms
     , saw_inputs    :: IORef (Seq (SC.ExtCns SC.Term ))
@@ -70,26 +71,13 @@ data SAWCoreState n
       --   in the order they were created
 
     , saw_symMap :: !(Map Word64 (SC.SharedContext -> [SC.Term] -> IO SC.Term))
-      -- ^ What to do with uninterpred functions.
+      -- ^ What to do with uninterpreted functions.
       -- The key is the "indexValue" of the "symFunId" for the function
 
     , saw_elt_cache :: B.IdxCache n SAWExpr
 
-    , saw_assumptions :: AssumptionStack (B.BoolExpr n) AssumptionReason SimError
-    , saw_aig_proxy :: AIGProxy
+    , saw_online_state :: OnlineBackendState solver n
     }
-
-sawCheckPathSat :: ConfigOption BaseBoolType
-sawCheckPathSat = configOption BaseBoolRepr "saw.check_path_sat"
-
-sawOptions :: [ConfigDesc]
-sawOptions =
-  [ opt sawCheckPathSat (ConcreteBool False)
-    "Check the satisfiability of path conditions on branches"
-  ]
-
-getAssumptionStack :: SAWCoreBackend n fs -> IO (AssumptionStack (B.BoolExpr n) AssumptionReason SimError)
-getAssumptionStack sym = saw_assumptions <$> readIORef (B.sbStateManager sym)
 
 data SAWExpr (bt :: BaseType) where
   SAWExpr :: !SC.Term -> SAWExpr bt
@@ -101,7 +89,7 @@ data SAWExpr (bt :: BaseType) where
   -- implicit nat-to-integer conversion.
   NatToIntSAWExpr :: !(SAWExpr BaseNatType) -> SAWExpr BaseIntegerType
 
-type SAWCoreBackend n fs = B.ExprBuilder n SAWCoreState fs
+type SAWCoreBackend n solver fs = B.ExprBuilder n (SAWCoreState solver) fs
 
 
 -- | Run the given IO action with the given SAW backend.
@@ -111,7 +99,7 @@ type SAWCoreBackend n fs = B.ExprBuilder n SAWCoreState fs
 --   assertions and proof obligations start empty while
 --   running the action.  After the action completes, the
 --   state of these fields is restored.
-inFreshNamingContext :: SAWCoreBackend n fs -> IO a -> IO a
+inFreshNamingContext :: SAWCoreBackend n solver fs -> IO a -> IO a
 inFreshNamingContext sym f =
   do old <- readIORef (B.sbStateManager sym)
      bracket (mkNew (B.exprCounter sym) old) (restore old) action
@@ -124,43 +112,38 @@ inFreshNamingContext sym f =
  restore old _new =
    do writeIORef (B.sbStateManager sym) old
 
- mkNew gen old =
+ mkNew _gen old =
    do ch <- B.newIdxCache
       iref <- newIORef mempty
-      stk <- initAssumptionStack gen
       let new = SAWCoreState
                 { saw_ctx = saw_ctx old
                 , saw_inputs = iref
                 , saw_symMap = mempty
                 , saw_elt_cache = ch
-                , saw_assumptions = stk
-                , saw_aig_proxy = saw_aig_proxy old
+                , saw_online_state = saw_online_state old
                 }
       return new
 
-getInputs :: SAWCoreBackend n fs -> IO (Seq (SC.ExtCns SC.Term))
+getInputs :: SAWCoreBackend n solver fs -> IO (Seq (SC.ExtCns SC.Term))
 getInputs sym =
   do st <- readIORef (B.sbStateManager sym)
      readIORef (saw_inputs st)
 
 baseSCType ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   BaseTypeRepr tp ->
   IO SC.Term
-baseSCType sym ctx bt =
+baseSCType sym sc bt =
   case bt of
-    BaseBoolRepr -> SC.scBoolType ctx
-    BaseBVRepr w -> SC.scBitvector ctx $ fromIntegral (natValue w)
-    BaseNatRepr  -> SC.scNatType ctx
-    BaseIntegerRepr -> SC.scIntegerType ctx
+    BaseBoolRepr -> SC.scBoolType sc
+    BaseBVRepr w -> SC.scBitvector sc $ fromIntegral (natValue w)
+    BaseNatRepr  -> SC.scNatType sc
+    BaseIntegerRepr -> SC.scIntegerType sc
     BaseArrayRepr indexTypes range ->
-      case Ctx.viewAssign indexTypes of
-        Ctx.AssignExtend b dom -> do
-          when (not (Ctx.null b)) $ do
-            unsupported sym "SAW backend only supports single element arrays."
-          join $ SC.scFun ctx <$> baseSCType sym ctx dom
-                              <*> baseSCType sym ctx range
+      do ts <- baseSCTypes indexTypes
+         t <- baseSCType sym sc range
+         SC.scFunAll sc ts t
     BaseFloatRepr _ ->
       unsupported sym "SAW backend does not support IEEE-754 floating point values: baseSCType"
     BaseStringRepr   ->
@@ -169,11 +152,18 @@ baseSCType sym ctx bt =
       unsupported sym "SAW backend does not support complex values: baseSCType"
     BaseRealRepr     ->
       unsupported sym "SAW backend does not support real values: baseSCType"
-    BaseStructRepr _ ->
-      unsupported sym "FIXME baseSCType for structures"
+    BaseStructRepr ts ->
+      SC.scTupleType sc =<< baseSCTypes ts
+  where
+    baseSCTypes :: Ctx.Assignment BaseTypeRepr args -> IO [SC.Term]
+    baseSCTypes Ctx.Empty = return []
+    baseSCTypes (xs Ctx.:> x) =
+      do ts <- baseSCTypes xs
+         t <- baseSCType sym sc x
+         return (ts ++ [t])
 
 -- | Create a new symbolic variable.
-sawCreateVar :: SAWCoreBackend n fs
+sawCreateVar :: SAWCoreBackend n solver fs
              -> String                                       -- ^ the name of the variable
              -> SC.Term
              -> IO SC.Term
@@ -186,7 +176,7 @@ sawCreateVar sym nm tp = do
   modifyIORef (saw_inputs st) (\xs -> xs Seq.|> ec)
   return t
 
-bindSAWTerm :: SAWCoreBackend n fs
+bindSAWTerm :: SAWCoreBackend n solver fs
             -> BaseTypeRepr bt
             -> SC.Term
             -> IO (B.Expr n bt)
@@ -197,33 +187,34 @@ bindSAWTerm sym bt t = do
   return sbVar
 
 newSAWCoreBackend ::
-  (AIG.IsAIG l g) =>
-  AIG.Proxy l g ->
   SC.SharedContext ->
   NonceGenerator IO s ->
-  IO (SAWCoreBackend s fs)
-newSAWCoreBackend proxy sc gen = do
+  IO (SAWCoreBackend s (Yices.Connection s) fs)
+newSAWCoreBackend sc gen = do
   inpr <- newIORef Seq.empty
   ch   <- B.newIdxCache
-  stk  <- initAssumptionStack gen
+  let feats = Yices.yicesDefaultFeatures
+  ob_st  <- initialOnlineBackendState gen feats
   let st = SAWCoreState
               { saw_ctx = sc
               , saw_inputs = inpr
               , saw_symMap = Map.empty
               , saw_elt_cache = ch
-              , saw_assumptions = stk
-              , saw_aig_proxy = AIGProxy proxy
+              , saw_online_state = ob_st
               }
   sym <- B.newExprBuilder st gen
-  extendConfig sawOptions (getConfiguration sym)
+  let options = onlineBackendOptions ++ Yices.yicesOptions
+  extendConfig options (getConfiguration sym)
+  writeIORef (B.sbStateManager sym) st
   return sym
 
 
--- | Register an interpretation for a symbolic function.
--- This is not used during simulation, but rather, when we translate
--- crucible values back into SAW.
+-- | Register an interpretation for a symbolic function. This is not
+-- used during simulation, but rather, when we translate Crucible
+-- values back into SAW. The interpretation function takes a list of
+-- arguments in regular (left-to-right) order.
 sawRegisterSymFunInterp ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   B.ExprSymFn n args ret ->
   (SC.SharedContext -> [SC.Term] -> IO SC.Term) ->
   IO ()
@@ -232,12 +223,12 @@ sawRegisterSymFunInterp sym f i =
       s { saw_symMap = Map.insert (indexValue (B.symFnId f)) i (saw_symMap s) }
 
 
-sawBackendSharedContext :: SAWCoreBackend n fs -> IO SC.SharedContext
+sawBackendSharedContext :: SAWCoreBackend n solver fs -> IO SC.SharedContext
 sawBackendSharedContext sym =
   saw_ctx <$> readIORef (B.sbStateManager sym)
 
 
-toSC :: SAWCoreBackend n fs -> B.Expr n tp -> IO SC.Term
+toSC :: SAWCoreBackend n solver fs -> B.Expr n tp -> IO SC.Term
 toSC sym elt =
   do st <- readIORef $ B.sbStateManager sym
      evaluateExpr sym (saw_ctx st) (saw_elt_cache st) elt
@@ -245,7 +236,7 @@ toSC sym elt =
 
 -- | Return a shared term with type nat from a SAWExpr.
 scAsIntExpr ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   IO SC.Term
@@ -258,7 +249,7 @@ scAsIntExpr sym _ SAWExpr{} = unsupported sym
 --
 -- This fails on non-integer expressions.
 scRealLit ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   Rational ->
   IO (SAWExpr BaseRealType)
@@ -285,7 +276,7 @@ scNatLit sc n = SAWExpr <$> SC.scNat sc (fromIntegral n)
 
 scRealCmpop ::
   (SC.SharedContext -> SAWExpr BaseIntegerType -> SAWExpr BaseIntegerType -> IO (SAWExpr BaseBoolType)) ->
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -297,7 +288,7 @@ scRealCmpop _ sym _ _ _ =
 
 scRealBinop ::
   (SC.SharedContext -> SAWExpr BaseIntegerType -> SAWExpr BaseIntegerType -> IO (SAWExpr BaseIntegerType)) ->
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -343,7 +334,7 @@ scIntCmpop _natOp intOp sc (SAWExpr x) (SAWExpr y) =
   SAWExpr <$> intOp sc x y
 
 scAddReal ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -364,7 +355,7 @@ scAddNat sc (SAWExpr x) (SAWExpr y) = SAWExpr <$> SC.scAddNat sc x y
 
 
 scMulReal ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -384,7 +375,7 @@ scMulNat :: SC.SharedContext
 scMulNat sc (SAWExpr x) (SAWExpr y) = SAWExpr <$> SC.scMulNat sc x y
 
 scIteReal ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SC.Term ->
   SAWExpr BaseRealType ->
@@ -410,9 +401,27 @@ scIteNat :: SC.SharedContext
 scIteNat sc p (SAWExpr x) (SAWExpr y) =
   SAWExpr <$> (SC.scNatType sc >>= \tp -> SC.scIte sc tp p x y)
 
+scIte ::
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  BaseTypeRepr tp ->
+  SAWExpr BaseBoolType ->
+  SAWExpr tp ->
+  SAWExpr tp ->
+  IO (SAWExpr tp)
+scIte sym sc tp (SAWExpr p) x y =
+  case tp of
+    BaseRealRepr    -> scIteReal sym sc p x y
+    BaseNatRepr     -> scIteNat sc p x y
+    BaseIntegerRepr -> scIteInt sc p x y
+    _ ->
+      do tp' <- baseSCType sym sc tp
+         x' <- termOfSAWExpr sym sc x
+         y' <- termOfSAWExpr sym sc y
+         SAWExpr <$> SC.scIte sc tp' p x' y'
 
 scRealEq ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -431,9 +440,42 @@ scNatEq :: SC.SharedContext
         -> IO (SAWExpr BaseBoolType)
 scNatEq sc (SAWExpr x) (SAWExpr y) = SAWExpr <$> SC.scEqualNat sc x y
 
+scEq ::
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  BaseTypeRepr tp ->
+  SAWExpr tp ->
+  SAWExpr tp ->
+  IO (SAWExpr BaseBoolType)
+scEq sym sc tp x y =
+  case tp of
+    BaseRealRepr    -> scRealEq sym sc x y
+    BaseNatRepr     -> scNatEq sc x y
+    BaseIntegerRepr -> scIntEq sc x y
+    BaseBVRepr w    ->
+      do let SAWExpr x' = x
+         let SAWExpr y' = y
+         w' <- SC.scNat sc $ fromIntegral (natValue w)
+         SAWExpr <$> SC.scBvEq sc w' x' y'
+    _ -> unsupported sym "SAW backend: equality comparison on unsupported type"
+
+scAllEq ::
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  Ctx.Assignment BaseTypeRepr ctx ->
+  Ctx.Assignment SAWExpr ctx ->
+  Ctx.Assignment SAWExpr ctx ->
+  IO (SAWExpr BaseBoolType)
+scAllEq _sym sc Ctx.Empty _ _ = SAWExpr <$> SC.scBool sc True
+scAllEq sym sc (ctx Ctx.:> tp) (xs Ctx.:> x) (ys Ctx.:> y)
+  | Ctx.null ctx = scEq sym sc tp x y
+  | otherwise =
+    do SAWExpr p <- scAllEq sym sc ctx xs ys
+       SAWExpr q <- scEq sym sc tp x y
+       SAWExpr <$> SC.scAnd sc p q
 
 scRealLe ::
-  SAWCoreBackend n fs ->
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   SAWExpr BaseRealType ->
   SAWExpr BaseRealType ->
@@ -455,21 +497,181 @@ scNatLe sc (SAWExpr x) (SAWExpr y) =
      eq <- SC.scEqualNat sc x y
      SAWExpr <$> SC.scOr sc lt eq
 
-
--- | Note: first element in the result is the right-most value in the assignment
-evaluateAsgn ::
-  SAWCoreBackend n fs ->
+termOfSAWExpr ::
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
-  B.IdxCache n SAWExpr ->
-  Ctx.Assignment (B.Expr n) args ->
-  IO [SC.Term]
-evaluateAsgn sym sc cache xs =
-  case xs of
-    Ctx.Empty -> return []
-    ys Ctx.:> x ->
-      do v  <- evaluateExpr sym sc cache x
-         vs <- evaluateAsgn sym sc cache ys
-         return (v:vs)
+  SAWExpr tp -> IO SC.Term
+termOfSAWExpr sym sc expr =
+  case expr of
+    SAWExpr t -> return t
+    NatToIntSAWExpr (SAWExpr t) -> SC.scNatToInt sc t
+    IntToRealSAWExpr _
+      -> unsupported sym "SAW backend does not support real values"
+
+makeArray ::
+  forall n solver fs idx tp.
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  Ctx.Assignment BaseTypeRepr idx ->
+  (Ctx.Assignment SAWExpr idx -> IO (SAWExpr tp)) ->
+  IO (SAWExpr (BaseArrayType idx tp))
+makeArray sym sc idx k =
+  do vars <- mkVars 0 idx
+     body <- k vars >>= termOfSAWExpr sym sc
+     SAWExpr <$> mkLambdas idx body
+  where
+    mkVars :: Int -> Ctx.Assignment BaseTypeRepr idx' -> IO (Ctx.Assignment SAWExpr idx')
+    mkVars _ Ctx.Empty = return Ctx.Empty
+    mkVars i (tys Ctx.:> _) =
+      do v <- SAWExpr <$> SC.scLocalVar sc i
+         vs <- mkVars (i+1) tys
+         return (vs Ctx.:> v)
+
+    mkLambdas :: Ctx.Assignment BaseTypeRepr idx' -> SC.Term -> IO SC.Term
+    mkLambdas Ctx.Empty e = return e
+    mkLambdas (tys Ctx.:> ty) e =
+      do let x = "x" ++ show (Ctx.size tys)
+         ty' <- baseSCType sym sc ty
+         mkLambdas tys =<< SC.scLambda sc x ty' e
+
+applyArray ::
+  forall n solver fs idx tp.
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  SAWExpr (BaseArrayType idx tp) ->
+  Ctx.Assignment SAWExpr idx ->
+  IO (SAWExpr tp)
+applyArray sym sc (SAWExpr f) args = SAWExpr <$> go args
+  where
+    go :: Ctx.Assignment SAWExpr idx' -> IO SC.Term
+    go Ctx.Empty = return f
+    go (xs Ctx.:> x) =
+      do f' <- go xs
+         x' <- termOfSAWExpr sym sc x
+         -- beta-reduce application if possible
+         case SC.asLambda f' of
+           Just (_, _, body) -> SC.instantiateVar sc 0 x' body
+           Nothing           -> SC.scApply sc f' x'
+
+maxIndexLit :: IndexLit tp -> IndexLit tp -> IndexLit tp
+maxIndexLit (NatIndexLit x) (NatIndexLit y) = NatIndexLit (max x y)
+maxIndexLit (BVIndexLit w x) (BVIndexLit _ y) = BVIndexLit w (max x y)
+
+sizeIndexLit :: forall tp. IndexLit tp -> Integer
+sizeIndexLit (NatIndexLit n) = toInteger n + 1
+sizeIndexLit (BVIndexLit _ n) = n + 1
+
+evalIndexLit :: SC.SharedContext -> IndexLit tp -> IO (SAWExpr tp)
+evalIndexLit sc l =
+  case l of
+    NatIndexLit n ->
+      do SAWExpr <$> SC.scNat sc (fromInteger (toInteger n))
+    BVIndexLit w n ->
+      do w' <- SC.scNat sc (natValue w)
+         n' <- SC.scNat sc (fromInteger n)
+         SAWExpr <$> SC.scBvNat sc w' n'
+
+makeTable ::
+  SC.SharedContext ->
+  Ctx.Assignment IndexLit ctx {- ^ maximum index -} ->
+  (Ctx.Assignment IndexLit ctx -> IO SC.Term) {- ^ generating function -} ->
+  SC.Term {- ^ table element type -} ->
+  IO SC.Term
+makeTable _sc Ctx.Empty mkElem _elemTy = mkElem Ctx.Empty
+makeTable sc (idxs Ctx.:> idx) mkElem elemTy =
+  do len <- SC.scNat sc (fromInteger (sizeIndexLit idx))
+     elemTy' <- SC.scVecType sc len elemTy
+     let mkElem' vars =
+           do elems <- traverse (\v -> mkElem (vars Ctx.:> v)) (upto idx)
+              SC.scVector sc elemTy elems
+     makeTable sc idxs mkElem' elemTy'
+  where
+    upto :: IndexLit tp -> [IndexLit tp]
+    upto (NatIndexLit n) = [ NatIndexLit i | i <- [0 .. n] ]
+    upto (BVIndexLit w n) = [ BVIndexLit w i | i <- [0 .. n] ]
+
+applyTable ::
+  forall n solver fs ctx ret.
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  SC.Term {- ^ table (nested vectors) -} ->
+  Ctx.Assignment IndexLit ctx {- ^ maximum index -} ->
+  Ctx.Assignment SAWExpr ctx {- ^ indices -} ->
+  SC.Term {- ^ element type -} ->
+  SAWExpr ret {- ^ fallback value for out-of-bounds -} ->
+  IO (SAWExpr ret)
+applyTable sym sc t0 maxidx vars ret fallback =
+  do fallback' <- termOfSAWExpr sym sc fallback
+     SAWExpr <$> go ret maxidx vars fallback'
+  where
+    go ::
+      SC.Term ->
+      Ctx.Assignment IndexLit ctx' ->
+      Ctx.Assignment SAWExpr ctx' ->
+      SC.Term ->
+      IO SC.Term
+    go _ty Ctx.Empty Ctx.Empty _fb = return t0
+    go ty (imax Ctx.:> NatIndexLit n) (xs Ctx.:> SAWExpr x) fb =
+      do len <- SC.scNat sc (fromInteger (toInteger (n + 1)))
+         ty' <- SC.scVecType sc len ty
+         fb' <- SC.scGlobalApply sc (SC.mkIdent SC.preludeName "replicate") [len, ty, fb]
+         vec <- go ty' imax xs fb'
+         SC.scGlobalApply sc (SC.mkIdent SC.preludeName "atWithDefault") [len, ty, fb, vec, x]
+    go ty (imax Ctx.:> BVIndexLit w n) (xs Ctx.:> SAWExpr x) fb =
+      do len <- SC.scNat sc (fromInteger (n + 1))
+         ty' <- SC.scVecType sc len ty
+         fb' <- SC.scGlobalApply sc (SC.mkIdent SC.preludeName "replicate") [len, ty, fb]
+         vec <- go ty' imax xs fb'
+         x' <- SC.scBvToNat sc (natValue w) x
+         SC.scGlobalApply sc (SC.mkIdent SC.preludeName "atWithDefault") [len, ty, fb, vec, x']
+
+applyExprSymFn ::
+  forall n solver fs args ret.
+  SAWCoreBackend n solver fs ->
+  SC.SharedContext ->
+  B.ExprSymFn n args ret ->
+  Ctx.Assignment SAWExpr args ->
+  IO (SAWExpr ret)
+applyExprSymFn sym sc fn args =
+  do st <- readIORef (B.sbStateManager sym)
+     mk <-
+       case Map.lookup (indexValue (B.symFnId fn)) (saw_symMap st) of
+         Nothing -> panic "SAWCore.applyExprSymFn"
+                    [ "Unknown symbolic function."
+                    , "*** Name: " ++ show fn
+                    ]
+         Just mk -> return mk
+     ts <- evaluateAsgn args
+     SAWExpr <$> mk sc (reverse ts)
+  where
+    evaluateAsgn :: Ctx.Assignment SAWExpr args' -> IO [SC.Term]
+    evaluateAsgn Ctx.Empty = return []
+    evaluateAsgn (xs Ctx.:> x) =
+      do vs <- evaluateAsgn xs
+         v <- termOfSAWExpr sym sc x
+         return (v : vs)
+
+
+considerSatisfiability ::
+  (OnlineSolver n solver) =>
+  SAWCoreBackend n solver fs ->
+  Maybe ProgramLoc ->
+  B.BoolExpr n ->
+  IO BranchResult
+considerSatisfiability sym mbPloc p =
+  do proc <- getSolverProcess' (\sym' -> saw_online_state <$> readIORef (B.sbStateManager sym')) sym
+     pnot <- notPred sym p
+     let locDesc = case mbPloc of
+           Just ploc -> show (plSourceLoc ploc)
+           Nothing -> "(unknown location)"
+     let rsn = "branch sat: " ++ locDesc
+     p_res <- checkSatisfiable proc rsn p
+     pnot_res <- checkSatisfiable proc rsn pnot
+     case (p_res, pnot_res) of
+       (Unsat{}, Unsat{}) -> return UnsatisfiableContext
+       (_      , Unsat{}) -> return (NoBranch True)
+       (Unsat{}, _      ) -> return (NoBranch False)
+       _                  -> return IndeterminateBranchResult
 
 {- | Declare that we don't support something or other.
 This aborts the current path of execution, and adds a proof
@@ -477,50 +679,47 @@ obligation to ensure that we won't get there.
 These proof obligations are all tagged with "Unsupported", so that
 users of the library can choose if they will try to discharge them,
 fail in some other way, or just ignore them. -}
-unsupported :: SAWCoreBackend n fs -> String -> IO a
+unsupported :: SAWCoreBackend n solver fs -> String -> IO a
 unsupported sym x = addFailedAssertion sym (Unsupported x)
 
-evaluateExpr :: forall n tp fs.
-  SAWCoreBackend n fs ->
+evaluateExpr :: forall n solver tp fs.
+  SAWCoreBackend n solver fs ->
   SC.SharedContext ->
   B.IdxCache n SAWExpr ->
   B.Expr n tp ->
   IO SC.Term
 evaluateExpr sym sc cache = f
- where
-   -- Evaluate the element, and expect the result to have the same type.
-   f :: B.Expr n tp' -> IO SC.Term
-   f elt = g =<< eval elt
+  where
+    -- Evaluate the element, and expect the result to have the same type.
+    f :: B.Expr n tp' -> IO SC.Term
+    f elt = termOfSAWExpr sym sc =<< eval elt
 
-   g :: SAWExpr tp' -> IO SC.Term
-   g (SAWExpr t) = return t
-   g (NatToIntSAWExpr (SAWExpr t)) = SC.scNatToInt sc t
-   g (IntToRealSAWExpr _) = realFail
+    eval :: B.Expr n tp' -> IO (SAWExpr tp')
+    eval elt = B.idxCacheEval cache elt (go elt)
 
-   eval :: B.Expr n tp' -> IO (SAWExpr tp')
-   eval elt = B.idxCacheEval cache elt (go elt)
+    realFail :: IO a
+    realFail = unsupported sym "SAW backend does not support real values"
 
-   realFail :: IO a
-   realFail = unsupported sym "SAW backend does not support real values"
+    cplxFail :: IO a
+    cplxFail = unsupported sym "SAW backend does not support complex values"
 
-   cplxFail :: IO a
-   cplxFail = unsupported sym "SAW backend does not support complex values"
+    floatFail :: IO a
+    floatFail = unsupported sym "SAW backend does not support floating-point values"
 
-   floatFail :: IO a
-   floatFail = unsupported sym "SAW backend does not support floating-point values"
+    go :: B.Expr n tp' -> IO (SAWExpr tp')
 
-   go :: B.Expr n tp' -> IO (SAWExpr tp')
-   go (B.SemiRingLiteral sr x _) =
-     case sr of
-       B.SemiRingNat  -> SAWExpr <$> SC.scNat sc (fromIntegral x)
-       B.SemiRingInt  -> scIntLit sc x
-       B.SemiRingReal -> scRealLit sym sc x
-   go (B.BVExpr w i _) = SAWExpr <$> SC.scBvConst sc (fromIntegral (natValue w)) i
+    go (B.SemiRingLiteral sr x _) =
+      case sr of
+        B.SemiRingNat  -> SAWExpr <$> SC.scNat sc (fromIntegral x)
+        B.SemiRingInt  -> scIntLit sc x
+        B.SemiRingReal -> scRealLit sym sc x
 
-   go (B.StringExpr{}) =
+    go (B.BVExpr w i _) = SAWExpr <$> SC.scBvConst sc (fromIntegral (natValue w)) i
+
+    go (B.StringExpr{}) =
       unsupported sym "SAW backend does not support string values"
 
-   go (B.BoundVarExpr bv) =
+    go (B.BoundVarExpr bv) =
       case B.bvarKind bv of
         B.UninterpVarKind -> do
            tp <- baseSCType sym sc (B.bvarType bv)
@@ -532,31 +731,28 @@ evaluateExpr sym sc cache = f
         B.QuantifierVarKind ->
           unsupported sym "SAW backend does not support quantifier variables"
 
-   go (B.NonceAppExpr p) =
+    go (B.NonceAppExpr p) =
       case B.nonceExprApp p of
         B.Forall{} ->
           unsupported sym "SAW backend does not support quantifiers"
         B.Exists{} ->
           unsupported sym "SAW backend does not support quantifiers"
-        B.ArrayFromFn{} ->
-          unsupported sym "SAW backend does not support symbolic arrays"
-        B.MapOverArrays{} ->
-          unsupported sym "SAW backend does not support symbolic arrays"
+        B.ArrayFromFn fn ->
+          makeArray sym sc (B.symFnArgTypes fn) $ \vars ->
+          applyExprSymFn sym sc fn vars
+        B.MapOverArrays fn idxs arrs ->
+          makeArray sym sc idxs $ \vars ->
+          do args <- traverseFC
+                     (\arr -> do t <- eval (unwrapArrayResult arr); applyArray sym sc t vars)
+                     arrs
+             applyExprSymFn sym sc fn args
         B.ArrayTrueOnEntries{} ->
-          unsupported sym "SAW backend does not support symbolic arrays"
+          unsupported sym "SAW backend: not yet implemented: ArrayTrueOnEntries"
         B.FnApp fn asgn ->
-          do st <- readIORef (B.sbStateManager sym)
-             case Map.lookup (indexValue (B.symFnId fn)) (saw_symMap st) of
-               Nothing -> panic "SAWCore.evaluateExpr"
-                            [ "Unknown symbolic function."
-                            , "*** Name: " ++ show fn
-                            ]
-               Just mk ->
-                 do ts <- evaluateAsgn sym sc cache asgn
-                    SAWExpr <$> mk sc ts
+          do args <- traverseFC eval asgn
+             applyExprSymFn sym sc fn args
 
-
-   go a0@(B.AppExpr a) =
+    go a0@(B.AppExpr a) =
       let nyi = unsupported sym $
                   "Expression form not yet implemented in SAWCore backend:\n"
                         ++ show a0
@@ -694,12 +890,6 @@ evaluateExpr sym sc cache = f
            t <- SC.scBoolType sc
            x' <- f x
            SC.scSlice sc t i n o x'
-        B.BVTrunc num x -> fmap SAWExpr $ do
-           let w = bvWidth x
-           n <- SC.scNat sc (fromIntegral (widthVal num))
-           m <- SC.scNat sc (fromIntegral (widthVal w - widthVal num))
-           x' <- f x
-           SC.scBvTrunc sc m n x'
         B.BVZext w' x -> fmap SAWExpr $ do
           let w = bvWidth x
           n <- SC.scNat sc (fromIntegral (widthVal w))
@@ -713,55 +903,76 @@ evaluateExpr sym sc cache = f
           m <- SC.scNat sc (fromIntegral (widthVal w' - widthVal w))
           x' <- f x
           SC.scBvSExt sc m n x'
+        B.BVPopcount w x ->
+          do n  <- SC.scNat sc (fromIntegral (widthVal w))
+             x' <- f x
+             SAWExpr <$> SC.scBvPopcount sc n x'
+        B.BVCountLeadingZeros w x ->
+          do n  <- SC.scNat sc (fromIntegral (widthVal w))
+             x' <- f x
+             SAWExpr <$> SC.scBvCountLeadingZeros sc n x'
+        B.BVCountTrailingZeros w x ->
+          do n  <- SC.scNat sc (fromIntegral (widthVal w))
+             x' <- f x
+             SAWExpr <$> SC.scBvCountTrailingZeros sc n x'
 
-        B.ArrayMap{} -> unsupported sym "FIXME SAW backend does not support ArrayMap."
+        B.ArrayMap indexTypes range updates arr ->
+          do let m = hashedMap updates
+             let maxidx = foldr1 (Ctx.zipWith maxIndexLit) (Map.keys m)
+             let sizes = toListFC sizeIndexLit maxidx
+             case 2 * toInteger (Map.size m) >= product sizes of
+               -- Make vector table if it would be sufficiently (1/2) full.
+               True ->
+                 do elemTy <- baseSCType sym sc range
+                    arr' <- eval arr
+                    let mkElem idxs =
+                          termOfSAWExpr sym sc =<<
+                          case Map.lookup idxs m of
+                            Just x -> eval x
+                            Nothing ->
+                              do idxs' <- traverseFC (evalIndexLit sc) idxs
+                                 applyArray sym sc arr' idxs'
+                    table <- makeTable sc maxidx mkElem elemTy
+                    makeArray sym sc indexTypes $ \vars ->
+                      do fallback <- applyArray sym sc arr' vars
+                         applyTable sym sc table maxidx vars elemTy fallback
+               -- If table would be too sparse, treat as repeated updates.
+               False ->
+                 makeArray sym sc indexTypes $ \vars ->
+                 do arr' <- eval arr
+                    fallback <- applyArray sym sc arr' vars
+                    let upd fb (idxs, x) =
+                          do idxs' <- traverseFC (evalIndexLit sc) idxs
+                             x' <- eval x
+                             p <- scAllEq sym sc indexTypes vars idxs'
+                             scIte sym sc range p x' fb
+                    foldM upd fallback (Map.assocs m)
 
-        B.ConstantArray indexTypes _range v -> fmap SAWExpr $ do
-          case Ctx.viewAssign indexTypes of
-            Ctx.AssignExtend b dom -> do
-              when (not (Ctx.null b)) $ do
-                unsupported sym $ "SAW backend only supports single element arrays."
+        B.ConstantArray indexTypes _range v ->
+          makeArray sym sc indexTypes $ \_ -> eval v
 
-              ty <- baseSCType sym sc dom
-              v' <- SC.incVars sc 0 1 =<< f v
-              --v' <- f v
-              SC.scLambda sc "_" ty v'
+        B.SelectArray _ arr indexTerms ->
+          do arr' <- eval arr
+             xs <- traverseFC eval indexTerms
+             applyArray sym sc arr' xs
 
-        B.SelectArray _ arr indexTerms -> fmap SAWExpr $ do
-          case Ctx.viewAssign indexTerms of
-            Ctx.AssignExtend b idx -> do
-              when (not (Ctx.null b)) $ do
-                unsupported sym $ "SAW backend only supports single element arrays."
+        B.MuxArray indexTypes range p xs ys ->
+          makeArray sym sc indexTypes $ \vars ->
+          do p' <- eval p
+             xs' <- eval xs
+             ys' <- eval ys
+             x' <- applyArray sym sc xs' vars
+             y' <- applyArray sym sc ys' vars
+             scIte sym sc range p' x' y'
 
-              join $ SC.scApply sc <$> f arr <*> f idx
-
-        B.MuxArray indexTypes range p x y -> fmap SAWExpr $ do
-          case Ctx.viewAssign indexTypes of
-            Ctx.AssignExtend b dom -> do
-              when (not (Ctx.null b)) $ do
-                unsupported sym $ "SAW backend only supports single element arrays."
-              domTy   <- baseSCType sym sc dom
-              rangeTy <- baseSCType sym sc range
-              ty <- SC.scFun sc domTy rangeTy
-              join $ SC.scIte sc ty <$> f p <*> f x <*> f y
-
-        B.UpdateArray range _ arr indexTerms v -> fmap SAWExpr $ do
-          rangeTy <- baseSCType sym sc range
-          arr' <- f arr
-          v'   <- f v
-          case Ctx.viewAssign indexTerms of
-            Ctx.AssignExtend b idx -> do
-              when (not (Ctx.null b)) $ do
-                unsupported sym $ "SAW backend only supports single element arrays."
-              idx' <- f idx
-              case exprType idx of
-                BaseNatRepr -> do
-                  SC.scUpdNatFun sc rangeTy arr' idx' v'
-                BaseBVRepr w -> do
-                  n <- SC.scNat sc (fromIntegral (natValue w))
-                  SC.scUpdBvFun sc n rangeTy arr' idx' v'
-                _ -> do
-                  unsupported sym $ "SAWCore backend only currently supports integer and bitvector indices."
+        B.UpdateArray range indexTypes arr indexTerms v ->
+          makeArray sym sc indexTypes $ \vars ->
+          do idxs <- traverseFC eval indexTerms
+             p <- scAllEq sym sc indexTypes vars idxs
+             v' <- eval v
+             arr' <- eval arr
+             x <- applyArray sym sc arr' vars
+             scIte sym sc range p v' x
 
         B.NatToInteger x -> NatToIntSAWExpr <$> eval x
         B.IntegerToNat x ->
@@ -802,19 +1013,19 @@ evaluateExpr sym sc cache = f
              SAWExpr <$> (SC.scIntEq sc z =<< SC.scIntegerConst sc 0)
 
         B.BVToNat x ->
-          let n = fromInteger (natValue (bvWidth x)) in
+          let n = natValue (bvWidth x) in
           SAWExpr <$> (SC.scBvToNat sc n =<< f x)
 
         B.IntegerToBV x w ->
-          do n <- SC.scNat sc (fromInteger (natValue w))
+          do n <- SC.scNat sc (natValue w)
              SAWExpr <$> (SC.scIntToBv sc n =<< f x)
 
         B.BVToInteger x ->
-          do n <- SC.scNat sc (fromInteger (natValue (bvWidth x)))
+          do n <- SC.scNat sc (natValue (bvWidth x))
              SAWExpr <$> (SC.scBvToInt sc n =<< f x)
 
         B.SBVToInteger x ->
-          do n <- SC.scNat sc (fromInteger (natValue (bvWidth x)))
+          do n <- SC.scNat sc (natValue (bvWidth x))
              SAWExpr <$> (SC.scSbvToInt sc n =<< f x)
 
         -- Proper support for real and complex numbers will require additional
@@ -858,6 +1069,7 @@ evaluateExpr sym sc cache = f
         B.FloatIsNorm{}  -> floatFail
         B.FloatIte{}  -> floatFail
         B.FloatCast{}  -> floatFail
+        B.FloatRound{} -> floatFail
         B.FloatFromBinary{}  -> floatFail
         B.BVToFloat{}  -> floatFail
         B.SBVToFloat{}  -> floatFail
@@ -865,7 +1077,7 @@ evaluateExpr sym sc cache = f
         B.FloatToBV{} -> floatFail
         B.FloatToSBV{} -> floatFail
         B.FloatToReal{} -> floatFail
-
+        B.FloatToBinary{} -> floatFail
 
         B.RoundReal{} -> realFail
         B.FloorReal{} -> realFail
@@ -889,29 +1101,14 @@ evaluateExpr sym sc cache = f
         B.StructField{} -> nyi -- FIXME
         B.StructIte{} -> nyi -- FIXME
 
-checkSatisfiable ::
-  SAWCoreBackend n fs ->
-  (Pred (SAWCoreBackend n fs)) ->
-  IO (SatResult ())
-checkSatisfiable sym p = do
-  mgr <- readIORef (B.sbStateManager sym)
-  let sc = saw_ctx mgr
-      cache = saw_elt_cache mgr
-  AIGProxy proxy <- return (saw_aig_proxy mgr)
-  enabled <- getMaybeOpt =<< getOptionSetting sawCheckPathSat (getConfiguration sym)
-  case enabled of
-    Just True -> do
-      t <- evaluateExpr sym sc cache p
-      let bbPrims = const Map.empty
-      BBSim.withBitBlastedPred proxy sc bbPrims t $ \be lit _shapes -> do
-        satRes <- AIG.checkSat be lit
-        case satRes of
-          AIG.Unsat -> return Unsat
-          _ -> return (Sat ())
-    _ -> return (Sat ())
+getAssumptionStack ::
+  SAWCoreBackend s solver fs ->
+  IO (AssumptionStack (B.BoolExpr s) AssumptionReason SimError)
+getAssumptionStack sym =
+  (assumptionStack . saw_online_state) <$> readIORef (B.sbStateManager sym)
 
-instance IsBoolSolver (SAWCoreBackend n fs) where
-  addProofObligation sym a = do
+instance IsBoolSolver (SAWCoreBackend n solver fs) where
+  addProofObligation sym a =
     case asConstantPred (a^.labeledPred) of
       Just True  -> return ()
       _          -> AS.addProofObligation a =<< getAssumptionStack sym
@@ -933,23 +1130,6 @@ instance IsBoolSolver (SAWCoreBackend n fs) where
   collectAssumptions sym =
     AS.collectAssumptions =<< getAssumptionStack sym
 
-  evalBranch sym p0 =
-    case asConstantPred p0 of
-      Just True  -> return $! NoBranch True
-      Just False -> return $! NoBranch False
-      Nothing    ->
-        do p0_neg   <- notPred sym p0
-           p_prior  <- getPathCondition sym
-           p        <- andPred sym p_prior p0
-           p_neg    <- andPred sym p_prior p0_neg
-           p_res    <- checkSatisfiable sym p
-           notp_res <- checkSatisfiable sym p_neg
-           case (p_res, notp_res) of
-             (Unsat, Unsat) -> abortExecBecause InfeasibleBranch
-             (Unsat, _ )    -> return $! NoBranch False
-             (_    , Unsat) -> return $! NoBranch True
-             (_    , _)     -> return $! SymbolicBranch True
-
   getProofObligations sym = do
     stk <- getAssumptionStack sym
     AS.getProofObligations stk
@@ -965,6 +1145,14 @@ instance IsBoolSolver (SAWCoreBackend n fs) where
   popAssumptionFrame sym ident = do
     stk <- getAssumptionStack sym
     AS.popFrame ident stk
+
+  popAssumptionFrameAndObligations sym ident = do
+    stk <- getAssumptionStack sym
+    AS.popFrameAndGoals ident stk
+
+  popUntilAssumptionFrame sym ident = do
+    stk <- getAssumptionStack sym
+    void $ AS.popFramesUntil ident stk
 
   saveAssumptionState sym = do
     stk <- getAssumptionStack sym

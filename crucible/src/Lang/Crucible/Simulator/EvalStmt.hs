@@ -26,8 +26,14 @@ module Lang.Crucible.Simulator.EvalStmt
   ( -- * High-level evaluation
     singleStepCrucible
   , executeCrucible
+  , ExecutionFeature(..)
+  , GenericExecutionFeature(..)
+  , genericToExecutionFeature
+  , timeoutFeature
 
     -- * Lower-level evaluation operations
+  , dispatchExecState
+  , advanceCrucibleState
   , evalReg
   , evalReg'
   , evalExpr
@@ -37,9 +43,10 @@ module Lang.Crucible.Simulator.EvalStmt
   , stepStmt
   , stepTerm
   , stepBasicBlock
+  , readRef
+  , alterRef
   ) where
 
-import           Control.Applicative (liftA2)
 import qualified Control.Exception as Ex
 import           Control.Lens
 import           Control.Monad.Reader
@@ -47,12 +54,14 @@ import           Data.Maybe (fromMaybe)
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.TraversableFC
 import qualified Data.Text as Text
+import           Data.Time.Clock
 import           System.IO
 import           System.IO.Error as Ex
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
 
 import           What4.Config
 import           What4.Interface
+import           What4.InterpretedFloatingPoint (freshFloatConstant)
 import           What4.Partial
 import           What4.ProgramLoc
 import           What4.Symbol (emptySymbol)
@@ -65,7 +74,6 @@ import           Lang.Crucible.FunctionHandle
 import           Lang.Crucible.Simulator.CallFrame
 import           Lang.Crucible.Simulator.Evaluation
 import           Lang.Crucible.Simulator.ExecutionTree
-import           Lang.Crucible.Simulator.Frame
 import           Lang.Crucible.Simulator.Intrinsics (IntrinsicTypes)
 import           Lang.Crucible.Simulator.GlobalState
 import           Lang.Crucible.Simulator.Operations
@@ -74,14 +82,14 @@ import           Lang.Crucible.Simulator.SimError
 import           Lang.Crucible.Utils.MuxTree
 
 
--- | Retrieve the value of a register
+-- | Retrieve the value of a register.
 evalReg ::
   Monad m =>
   Reg ctx tp ->
   ReaderT (CrucibleState p sym ext rtp blocks r ctx) m (RegValue sym tp)
 evalReg r = (`regVal` r) <$> view (stateCrucibleFrame.frameRegs)
 
--- | Retrieve the value of a register, returning a 'RegEntry'
+-- | Retrieve the value of a register, returning a 'RegEntry'.
 evalReg' ::
   Monad m =>
   Reg ctx tp ->
@@ -128,7 +136,7 @@ evalArgs' m0 args = RegMap (fmapFC (getEntry m0) args)
         getEntry (RegMap m) r = m Ctx.! regIndex r
 {-# NOINLINE evalArgs' #-}
 
--- | Evaluate the actual arguments for a function call or block transfer
+-- | Evaluate the actual arguments for a function call or block transfer.
 evalArgs ::
   Monad m =>
   Ctx.Assignment (Reg ctx) args ->
@@ -136,14 +144,14 @@ evalArgs ::
 evalArgs args = ReaderT $ \s -> return $! evalArgs' (s^.stateCrucibleFrame.frameRegs) args
 {-# INLINE evalArgs #-}
 
--- | Resolve the arguments for a jump
+-- | Resolve the arguments for a jump.
 evalJumpTarget ::
   (IsSymInterface sym, Monad m) =>
   JumpTarget blocks ctx {- ^  Jump target to evaluate -} ->
   ReaderT (CrucibleState p sym ext rtp blocks r ctx) m (ResolvedJump sym blocks)
 evalJumpTarget (JumpTarget tgt _ a) = ResolvedJump tgt <$> evalArgs a
 
--- | Resolve the arguments for a switch target
+-- | Resolve the arguments for a switch target.
 evalSwitchTarget ::
   (IsSymInterface sym, Monad m) =>
   SwitchTarget blocks ctx tp {- ^ Switch target to evaluate -} ->
@@ -153,6 +161,8 @@ evalSwitchTarget (SwitchTarget tgt _tp a) x =
   do xs <- evalArgs a
      return (ResolvedJump tgt (assignReg' x xs))
 
+-- | Update a reference cell with a new value. Writing an unassigned
+-- value resets the reference cell to an uninitialized state.
 alterRef ::
   IsSymInterface sym =>
   sym ->
@@ -171,6 +181,7 @@ alterRef sym iTypes tpr rs newv globs = foldM upd globs (viewMuxTree rs)
        z <- mergePartial sym f p newv oldv
        return (gs & updateRef r z)
 
+-- | Read from a reference cell.
 readRef ::
   IsSymInterface sym =>
   sym ->
@@ -190,7 +201,7 @@ readRef sym iTypes tpr rs globs =
 -- | Evaluation operation for evaluating a single straight-line
 --   statement of the Crucible evaluator.
 --
---   This is allowed to throw user execeptions or SimError.
+--   This is allowed to throw user exceptions or 'SimError'.
 stepStmt :: forall p sym ext rtp blocks r ctx ctx'.
   (IsSymInterface sym, IsSyntaxExtension ext) =>
   Int {- ^ Current verbosity -} ->
@@ -264,6 +275,11 @@ stepStmt verb stmt rest =
             v <- liftIO $ freshConstant sym nm bt
             continueWith $ stateCrucibleFrame %~ extendFrame (baseToType bt) v rest
 
+       FreshFloat fi mnm ->
+         do let nm = fromMaybe emptySymbol mnm
+            v <- liftIO $ freshFloatConstant sym nm fi
+            continueWith $ stateCrucibleFrame %~ extendFrame (FloatRepr fi) v rest
+
        SetReg tp e ->
          do v <- evalExpr verb e
             continueWith $ stateCrucibleFrame %~ extendFrame tp v rest
@@ -280,16 +296,7 @@ stepStmt verb stmt rest =
        CallHandle ret_type fnExpr _types arg_exprs ->
          do hndl <- evalReg fnExpr
             args <- evalArgs arg_exprs
-            bindings <- view (stateContext.functionBindings)
-            case resolveCall bindings hndl args of
-              OverrideCall o f ->
-                withReaderT
-                  (stateTree %~ callFn (ReturnToCrucible ret_type rest) (OF f))
-                  (runOverride o)
-              CrucibleCall f ->
-                withReaderT
-                  (stateTree %~ callFn (ReturnToCrucible ret_type rest) (MF f))
-                  continue
+            callFunction hndl args (ReturnToCrucible ret_type rest)
 
        Print e ->
          do msg <- evalReg e
@@ -323,35 +330,12 @@ stepStmt verb stmt rest =
             continueWith (stateCrucibleFrame  . frameStmts .~ rest)
 
 
----------------------------------------------------------------
--- TODO, this should probably be moved to parameterized-utils
-
-newtype Collector m w a = Collector { runCollector :: m w }
-
-instance Functor (Collector m w) where
-  fmap _ (Collector x) = Collector x
-
-instance (Applicative m, Monoid w) => Applicative (Collector m w) where
-  pure _ = Collector (pure mempty)
-  Collector x <*> Collector y = Collector (liftA2 (<>) x y)
-
-traverseAndCollect ::
-  (Monoid w, Applicative m) =>
-  (forall tp. Ctx.Index ctx tp -> f tp -> m w) ->
-  Ctx.Assignment f ctx ->
-  m w
-traverseAndCollect f =
-  runCollector . Ctx.traverseWithIndex (\i x -> Collector (f i x))
-
---------------------------- END TODO ----------------------------
-
-
 {-# INLINABLE stepTerm #-}
 
 -- | Evaluation operation for evaluating a single block-terminator
 --   statement of the Crucible evaluator.
 --
---   This is allowed to throw user execeptions or SimError.
+--   This is allowed to throw user execeptions or 'SimError'.
 stepTerm :: forall p sym ext rtp blocks r ctx.
   (IsSymInterface sym, IsSyntaxExtension ext) =>
   Int {- ^ Verbosity -} ->
@@ -362,7 +346,7 @@ stepTerm _ (Jump tgt) =
   jumpToBlock =<< evalJumpTarget tgt
 
 stepTerm _ (Return arg) =
-  returnAndMerge =<< evalReg' arg
+  returnValue =<< evalReg' arg
 
 stepTerm _ (Br c x y) =
   do x_jump <- evalJumpTarget x
@@ -380,7 +364,7 @@ stepTerm _ (MaybeBranch tp e j n) =
 
 stepTerm _ (VariantElim ctx e cases) =
   do vs <- evalReg e
-     jmps <- ctx & traverseAndCollect (\i tp ->
+     jmps <- ctx & Ctx.traverseAndCollect (\i tp ->
                 case vs Ctx.! i of
                   VB Unassigned ->
                     return []
@@ -397,25 +381,16 @@ stepTerm _ (VariantElim ctx e cases) =
 --
 -- If there _are_ pending merges we instead treat the tail call as normal
 -- call-then-return sequence, pushing a new call frame on the top of our
--- current context (rather than replacing it).  The tailReturnToCrucible
--- function is invoked when the tail-called function returns; it immediately
--- invokes another return in the other caller, which is still present on the
--- stack in this scenerio.
-
+-- current context (rather than replacing it).  The TailReturnToCrucible
+-- return handler tells the simulator to immediately invoke another return
+-- in the caller, which is still present on the stack in this scenerio.
 stepTerm _ (TailCall fnExpr _types arg_exprs) =
-  do bindings <- view (stateContext.functionBindings)
-     cl   <- evalReg fnExpr
+  do cl   <- evalReg fnExpr
      args <- evalArgs arg_exprs
-     t <- view stateTree
-     case resolveCall bindings cl args of
-       OverrideCall o f ->
-         case replaceTailFrame t (OF f) of
-           Just t' -> withReaderT (stateTree .~ t') (runOverride o)
-           Nothing -> withReaderT (stateTree %~ callFn TailReturnToCrucible (OF f)) (runOverride o)
-       CrucibleCall f ->
-         case replaceTailFrame t (MF f) of
-           Just t' -> withReaderT (stateTree .~ t') continue
-           Nothing -> withReaderT (stateTree %~ callFn TailReturnToCrucible (MF f)) continue
+     ctx <- view (stateTree.actContext)
+     case unwindContext ctx of
+       Just vfv -> tailCallFunction cl args vfv
+       Nothing  -> callFunction cl args TailReturnToCrucible
 
 stepTerm _ (ErrorStmt msg) =
   do msg' <- evalReg msg
@@ -438,12 +413,12 @@ checkConsTerm verb =
 
         case cf^.frameStmts of
           ConsStmt _ _ _ -> stepBasicBlock verb
-          TermStmt _ _ -> continue
+          TermStmt _ _ -> continue (RunBlockEnd (cf^.frameBlockID))
 
 -- | Main evaluation operation for running a single step of
---   basic block evalaution.
+--   basic block evaluation.
 --
---   This is allowed to throw user execeptions or SimError.
+--   This is allowed to throw user execeptions or 'SimError'.
 stepBasicBlock ::
   (IsSymInterface sym, IsSyntaxExtension ext) =>
   Int {- ^ Current verbosity -} ->
@@ -476,33 +451,136 @@ ppStmtAndLoc h sh pl stmt = do
   hFlush h
 
 
+
+----------------------------------------------------------------------
+-- ExecState manipulations
+
+
+-- | Given an 'ExecState', examine it and either enter the continuation
+--   for final results, or construct the appropriate 'ExecCont' for
+--   continuing the computation and enter the provided intermediate continuation.
+dispatchExecState ::
+  (IsSymInterface sym, IsSyntaxExtension ext) =>
+  IO Int {- ^ Action to query the current verbosity -} ->
+  ExecState p sym ext rtp {- ^ Current execution state of the simulator -} ->
+  (ExecResult p sym ext rtp -> IO z) {- ^ Final continuation for results -} ->
+  (forall f a. ExecCont p sym ext rtp f a -> SimState p sym ext rtp f a -> IO z)
+    {- ^ Intermediate continuation for running states -} ->
+  IO z
+dispatchExecState getVerb exst kresult k =
+  case exst of
+    ResultState res ->
+      kresult res
+
+    InitialState simctx globals ah cont ->
+      let st = initSimState simctx globals ah in
+      k cont st
+
+    AbortState rsn st ->
+      let (AH handler) = st^.abortHandler in
+      k (handler rsn) st
+
+    OverrideState ovr st ->
+      k (overrideHandler ovr) st
+
+    SymbolicBranchState p a_frame o_frame tgt st ->
+      k (performIntraFrameSplit p a_frame o_frame tgt) st
+
+    ControlTransferState resumption st ->
+      k (performControlTransfer resumption) st
+
+    BranchMergeState tgt st ->
+      k (performIntraFrameMerge tgt) st
+
+    UnwindCallState vfv ar st ->
+      k (resumeValueFromValueAbort vfv ar) st
+
+    CallState retHandler frm st ->
+      k (performFunctionCall retHandler frm) st
+
+    TailCallState vfv frm st ->
+      k (performTailCall vfv frm) st
+
+    ReturnState fnm vfv ret st ->
+      k (performReturn fnm vfv ret) st
+
+    RunningState _runTgt st ->
+      do v <- getVerb
+         k (stepBasicBlock v) st
+{-# INLINE dispatchExecState #-}
+
+
+-- | Run the given @ExecCont@ on the given @SimState@,
+--   being careful to catch any simulator abort exceptions
+--   that are thrown and dispatch them to the abort handler.
+advanceCrucibleState ::
+  (IsSymInterface sym, IsSyntaxExtension ext) =>
+  ExecCont p sym ext rtp f a ->
+  SimState p sym ext rtp f a ->
+  IO (ExecState p sym ext rtp)
+advanceCrucibleState m st =
+     Ex.catches (runReaderT m st)
+                [ Ex.Handler $ \(e::AbortExecReason) ->
+                    runAbortHandler e st
+                , Ex.Handler $ \(e::Ex.IOException) ->
+                    if Ex.isUserError e then
+                      runGenericErrorHandler (Ex.ioeGetErrorString e) st
+                    else
+                      Ex.throwIO e
+                ]
+
+
 -- | Run a single step of the Crucible symbolic simulator.
---
---   'AbortExecReason' exceptions and 'UserError'
---   exceptions are NOT caught, and must be handled
---   by the calling context of 'singleStepCrucible'.
 singleStepCrucible ::
   (IsSymInterface sym, IsSyntaxExtension ext) =>
   Int {- ^ Current verbosity -} ->
   ExecState p sym ext rtp ->
   IO (ExecState p sym ext rtp)
 singleStepCrucible verb exst =
-  case exst of
-    ResultState res ->
-      return (ResultState res)
+  dispatchExecState
+    (return verb)
+    exst
+    (return . ResultState)
+    advanceCrucibleState
 
-    AbortState rsn st ->
-      let (AH handler) = st^.abortHandler in
-      runReaderT (handler rsn) st
 
-    OverrideState ovr st ->
-      runReaderT (overrideHandler ovr) st
 
-    ControlTransferState tgt st ->
-      runReaderT (performIntraFrameMerge tgt) st
+-- | An execution feature represents a computation that is allowed to intercept
+--   the processing of execution states to perform additional processing at
+--   each intermediate state.  A list of execution features is accepted by
+--   `executeCrucible`.  After each step of the simulator, the execution features
+--   are consulted, each in turn.  After all the execution features have run,
+--   the main simulator code is executed to advance the simulator one step.
+--
+--   If an execution feature wishes to make changes to the execution
+--   state before further execution happens, the return value can be
+--   used to return a modified state.  If this happens, the current
+--   stack of execution features is abandoned and a fresh step starts
+--   over immediately from the top of the exeuction features.  In
+--   essence, each execution feature can preempt all following
+--   execution features and the main simulator loop. In other words,
+--   the main simulator only gets reached if every execution feature
+--   returns @Nothing@.  It is important, therefore, that execution
+--   features make only a bounded number of modification in a row, or
+--   the main simulator loop will be starved out.
+newtype ExecutionFeature p sym ext rtp =
+  ExecutionFeature
+  { runExecutionFeature :: ExecState p sym ext rtp -> IO (Maybe (ExecState p sym ext rtp)) }
 
-    RunningState st ->
-      runReaderT (stepBasicBlock verb) st
+-- | A generic execution feature is an execution feature that is
+--   agnostic to the exeuction environmemnt, and is therefore
+--   polymorphic over the @p@, @ext@ and @rtp@ variables.
+newtype GenericExecutionFeature sym =
+  GenericExecutionFeature
+  { runGenericExecutionFeature :: forall p ext rtp.
+      (IsSymInterface sym, IsSyntaxExtension ext) =>
+        ExecState p sym ext rtp -> IO (Maybe (ExecState p sym ext rtp))
+  }
+
+genericToExecutionFeature ::
+  (IsSymInterface sym, IsSyntaxExtension ext) =>
+  GenericExecutionFeature sym -> ExecutionFeature p sym ext rtp
+genericToExecutionFeature (GenericExecutionFeature f) = ExecutionFeature f
 
 
 -- | Given a 'SimState' and an execution continuation,
@@ -513,46 +591,49 @@ singleStepCrucible verb exst =
 --   'AbortExecReason' exceptions and 'UserError'
 --   exceptions and invoking the 'errorHandler'
 --   contained in the state.
-executeCrucible :: forall p sym ext rtp f a.
-  (IsSymInterface sym, IsSyntaxExtension ext) =>
-  SimState p sym ext rtp f a {- ^ Initial simulator state -} ->
-  ExecCont p sym ext rtp f a {- ^ Execution continuation to run -} ->
+executeCrucible :: forall p sym ext rtp.
+  ( IsSymInterface sym
+  , IsSyntaxExtension ext
+  ) =>
+  [ ExecutionFeature p sym ext rtp ] {- ^ Execution features to install -} ->
+  ExecState p sym ext rtp   {- ^ Execution state to begin executing -} ->
   IO (ExecResult p sym ext rtp)
-executeCrucible st0 cont =
-  do let cfg = st0^.stateConfiguration
+executeCrucible execFeatures exst0 =
+  do let cfg = getConfiguration . view ctxSymInterface . execStateContext $ exst0
      verbOpt <- getOptionSetting verbosity cfg
-     loop verbOpt st0 cont
 
- where
- loop :: forall f' a'.
-   OptionSetting BaseIntegerType ->
-   SimState p sym ext rtp f' a' ->
-   ExecCont p sym ext rtp f' a' ->
-   IO (ExecResult p sym ext rtp)
- loop verbOpt st m =
-   do exst <- Ex.catches (runReaderT m st)
-                [ Ex.Handler $ \(e::AbortExecReason) ->
-                    runAbortHandler e st
-                , Ex.Handler $ \(e::Ex.IOException) ->
-                    if Ex.isUserError e then
-                      runGenericErrorHandler (Ex.ioeGetErrorString e) st
-                    else
-                      Ex.throwIO e
-                ]
-      case exst of
-        ResultState res ->
-          return res
+     let loop exst =
+           dispatchExecState
+             (fromInteger <$> getOpt verbOpt)
+             exst
+             return
+             (\m st -> knext =<< advanceCrucibleState m st)
 
-        AbortState rsn st' ->
-          let (AH handler) = st'^.abortHandler in
-          loop verbOpt st' (handler rsn)
+         applyExecutionFeature feat m =
+           \exst -> runExecutionFeature feat exst >>= \case
+                      Just exst' -> knext exst'
+                      Nothing    -> m exst
 
-        OverrideState ovr st' ->
-          loop verbOpt st' (overrideHandler ovr)
+         knext = foldr applyExecutionFeature loop execFeatures
 
-        ControlTransferState tgt st' ->
-          loop verbOpt st' (performIntraFrameMerge tgt)
+     knext exst0
 
-        RunningState st' ->
-          do verb <- fromInteger <$> getOpt verbOpt
-             loop verbOpt st' (stepBasicBlock verb)
+
+-- | This feature will terminate the execution of a crucible simulator
+--   with a @TimeoutResult@ after a given interval of wall-clock time
+--   has elapsed.
+timeoutFeature ::
+  NominalDiffTime ->
+  IO (GenericExecutionFeature sym)
+timeoutFeature timeout =
+  do startTime <- getCurrentTime
+     let deadline = addUTCTime timeout startTime
+     return $ GenericExecutionFeature $ \exst ->
+       case exst of
+         ResultState _ -> return Nothing
+         _ ->
+            do now <- getCurrentTime
+               if deadline >= now then
+                 return Nothing
+               else
+                 return (Just (ResultState (TimeoutResult exst)))

@@ -1,34 +1,34 @@
 Name:          crucible-llvm
-Version:       0.1
+Version:       0.3
 Author:        Galois Inc.
 Copyright:     (c) Galois, Inc 2014-2018
 Maintainer:    rdockins@galois.com
 License:       BSD3
 License-file:  LICENSE
 Build-type:    Simple
-Cabal-version: >= 1.9.2
+Cabal-version: >= 1.10
 Category:      Language
 Synopsis:      Support for translating and executing LLVM code in Crucible
 
 library
   build-depends:
-    base >= 4.7 && < 4.12,
+    base >= 4.7 && < 4.13,
     ansi-wl-pprint,
     attoparsec,
     bytestring,
     containers >= 0.5.8.0,
-    crucible,
-    what4 >= 0.4,
+    crucible >= 0.5,
+    what4 >= 0.4.1,
     deepseq,
     directory,
     ghc-prim,
     hashable,
     hashtables,
     lens,
-    llvm-pretty >= 0.7.2 && < 0.7.4,
+    itanium-abi,
+    llvm-pretty >= 0.8 && < 0.11,
     mtl,
-    parameterized-utils >= 1.0 && < 1.1,
-    template-haskell,
+    parameterized-utils >= 1.0.4 && < 2.1,
     text,
     transformers,
     unordered-containers,
@@ -40,25 +40,73 @@ library
   exposed-modules:
     Lang.Crucible.LLVM
     Lang.Crucible.LLVM.Arch
-    Lang.Crucible.LLVM.Arch.X86
     Lang.Crucible.LLVM.Arch.Util
+    Lang.Crucible.LLVM.Arch.X86
     Lang.Crucible.LLVM.Bytes
+    Lang.Crucible.LLVM.Ctors
     Lang.Crucible.LLVM.DataLayout
     Lang.Crucible.LLVM.Extension
+    Lang.Crucible.LLVM.Extension.Safety
+    Lang.Crucible.LLVM.Extension.Safety.Poison
+    Lang.Crucible.LLVM.Extension.Safety.UndefinedBehavior
+    Lang.Crucible.LLVM.Globals
     Lang.Crucible.LLVM.Intrinsics
-    Lang.Crucible.LLVM.LLVMContext
     Lang.Crucible.LLVM.MemModel
-    Lang.Crucible.LLVM.MemModel.Common
-    Lang.Crucible.LLVM.MemModel.Generic
-    Lang.Crucible.LLVM.MemModel.Pointer
-    Lang.Crucible.LLVM.MemModel.Type
     Lang.Crucible.LLVM.MemType
     Lang.Crucible.LLVM.PrettyPrint
     Lang.Crucible.LLVM.Printf
     Lang.Crucible.LLVM.Translation
+    Lang.Crucible.LLVM.TypeContext
+
+  other-modules:
+    Lang.Crucible.LLVM.Extension.Arch
+    Lang.Crucible.LLVM.Extension.Syntax
+    Lang.Crucible.LLVM.Extension.Safety.Standards
+    Lang.Crucible.LLVM.Intrinsics.Common
+    Lang.Crucible.LLVM.Intrinsics.Libc
+    Lang.Crucible.LLVM.Intrinsics.Libcxx
+    Lang.Crucible.LLVM.Intrinsics.LLVM
+    Lang.Crucible.LLVM.MemModel.Common
+    Lang.Crucible.LLVM.MemModel.Generic
+    Lang.Crucible.LLVM.MemModel.Partial
+    Lang.Crucible.LLVM.MemModel.Pointer
+    Lang.Crucible.LLVM.MemModel.Type
+    Lang.Crucible.LLVM.MemModel.Value
     Lang.Crucible.LLVM.Translation.Constant
+    Lang.Crucible.LLVM.Translation.Expr
+    Lang.Crucible.LLVM.Translation.Instruction
+    Lang.Crucible.LLVM.Translation.Monad
     Lang.Crucible.LLVM.Translation.Types
     Lang.Crucible.LLVM.Types
 
   ghc-options: -Wall
   ghc-prof-options: -O2 -fprof-auto-top
+  default-language: Haskell2010
+
+  if impl(ghc >= 8.6)
+    default-extensions: NoStarIsType
+
+
+test-suite crucible-llvm-tests
+  type: exitcode-stdio-1.0
+  main-is: Tests.hs
+  hs-source-dirs: test
+  default-language: Haskell2010
+  -- other-modules:
+  build-depends:
+    base,
+    containers,
+    crucible,
+    crucible-llvm,
+    directory,
+    filepath,
+    llvm-pretty,
+    llvm-pretty-bc-parser,
+    mtl,
+    parameterized-utils,
+    process,
+    what4,
+    tasty,
+    tasty-golden,
+    tasty-quickcheck,
+    tasty-hunit

@@ -1,11 +1,15 @@
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Lang.Crucible.Syntax.Prog where
 
+import Control.Lens (view)
 import Control.Monad.ST
 import Control.Monad
 
+import Data.Foldable (toList)
 import Data.List (find)
 import Data.Text (Text)
 import Data.String (IsString(..))
@@ -16,7 +20,8 @@ import System.Exit
 import Text.Megaparsec as MP
 
 import Data.Parameterized.Nonce
-import Data.Parameterized.Context as Ctx
+import qualified Data.Parameterized.Context as Ctx
+import Data.Parameterized.Some (Some(Some))
 
 import qualified Lang.Crucible.CFG.Core as C
 import Lang.Crucible.CFG.Reg
@@ -33,8 +38,14 @@ import Lang.Crucible.Backend.ProofGoals
 import Lang.Crucible.Backend.Simple
 import Lang.Crucible.FunctionHandle
 import Lang.Crucible.Simulator
+import Lang.Crucible.Simulator.Profiling
 
-import What4.Expr.Builder (Flags, FloatIEEE)
+import What4.Config
+import What4.Interface (getConfiguration,notPred)
+import What4.Expr.Builder (Flags, FloatIEEE, ExprBuilder)
+import What4.ProgramLoc
+import What4.SatResult
+import What4.Solver (defaultLogData, runZ3InOverride)
 
 
 -- | The main loop body, useful for both the program and for testing.
@@ -45,16 +56,17 @@ doParseCheck
    -> Handle   -- ^ A handle that will receive the output
    -> IO ()
 doParseCheck fn theInput pprint outh =
-  do ha <- newHandleAllocator
+  do Some ng <- stToIO $ newSTNonceGenerator
+     ha <- newHandleAllocator
      case MP.parse (skipWhitespace *> many (sexp atom) <* eof) fn theInput of
        Left err ->
-         do putStrLn $ parseErrorPretty' theInput err
+         do putStrLn $ errorBundlePretty err
             exitFailure
        Right v ->
          do when pprint $
               forM_ v $
                 \e -> T.hPutStrLn outh (printExpr e) >> hPutStrLn outh ""
-            cs <- stToIO $ top ha $ cfgs v
+            cs <- stToIO $ top ng ha [] $ cfgs v
             case cs of
               Left (SyntaxParseError e) -> T.hPutStrLn outh $ printSyntaxError e
               Left err -> hPutStrLn outh $ show err
@@ -69,54 +81,73 @@ simulateProgram
    :: FilePath -- ^ The name of the input (appears in source locations)
    -> Text     -- ^ The contents of the input
    -> Handle   -- ^ A handle that will receive the output
+   -> Maybe Handle -- ^ A handle to receive profiling data output
+   -> [ConfigDesc] -- ^ Options to install
+   -> (forall p sym ext t st fs. (IsSymInterface sym, sym ~ (ExprBuilder t st fs)) =>
+         sym -> HandleAllocator RealWorld -> IO [(FnBinding p sym ext,Position)]) -- ^ action to set up overrides
    -> IO ()
-simulateProgram fn theInput outh =
-  do ha <- newHandleAllocator
+simulateProgram fn theInput outh profh opts setup =
+  do Some ng <- stToIO $ newSTNonceGenerator
+     ha <- newHandleAllocator
      case MP.parse (skipWhitespace *> many (sexp atom) <* eof) fn theInput of
        Left err ->
-         do putStrLn $ parseErrorPretty' theInput err
+         do putStrLn $ errorBundlePretty err
             exitFailure
        Right v ->
-         do cs <- stToIO $ top ha $ cfgs v
-            case cs of
+         withIONonceGenerator $ \nonceGen ->
+         do sym <- newSimpleBackend @_ @(Flags FloatIEEE) nonceGen
+            extendConfig opts (getConfiguration sym)
+            ovrs <- setup @() @_ @() sym ha
+            let hdls = [ (SomeHandle h, p) | (FnBinding h _,p) <- ovrs ]
+            parseResult <- stToIO $ top ng ha hdls $ cfgs v
+            case parseResult of
               Left (SyntaxParseError e) -> T.hPutStrLn outh $ printSyntaxError e
               Left err -> hPutStrLn outh $ show err
-              Right ok -> runProgram outh ha ok
+              Right cs ->
+                case find isMain cs of
+                  Just (ACFG Ctx.Empty retType mn) ->
+                    do let mainHdl = cfgHandle mn
+                       let fnBindings = fnBindingsFromList
+                             [ case toSSA g of
+                                 C.SomeCFG ssa ->
+                                   FnBinding (cfgHandle g) (UseCFG ssa (postdomInfo ssa))
+                             | ACFG _ _ g <- cs
+                             ]
+                       let simCtx = initSimContext sym emptyIntrinsicTypes ha outh fnBindings emptyExtensionImpl ()
+                       let simSt  = InitialState simCtx emptyGlobals defaultAbortHandler $
+                                      runOverrideSim retType $
+                                        do mapM_ (registerFnBinding . fst) ovrs
+                                           regValue <$> callFnVal (HandleFnVal mainHdl) emptyRegMap
 
-runProgram ::
-  Handle ->
-  HandleAllocator RealWorld ->
-  [ACFG] ->
-  IO ()
-runProgram outh ha cs =
-  case find isMain cs of
-    Just (ACFG Ctx.Empty retType mn) ->
-      withIONonceGenerator $ \nonceGen ->
-      do sym <- newSimpleBackend @_ @(Flags FloatIEEE) nonceGen
+                       hPutStrLn outh "==== Begin Simulation ===="
 
-         let mainHdl = cfgHandle mn
-         let fnBindings = fnBindingsFromList
-                           [ case toSSA g of
-                               C.SomeCFG ssa ->
-                                 FnBinding (cfgHandle g) (UseCFG ssa (postdomInfo ssa))
-                           | ACFG _ _ g <- cs
-                           ]
-         let simCtx = initSimContext sym emptyIntrinsicTypes ha outh fnBindings emptyExtensionImpl ()
-         let simSt  = initSimState simCtx emptyGlobals defaultAbortHandler
+                       case profh of
+                         Nothing ->
+                           void $ executeCrucible [] simSt
+                         Just ph ->
+                           do proftab <- newProfilingTable
+                              pf <- profilingFeature proftab Nothing
+                              void $ executeCrucible [genericToExecutionFeature pf] simSt
+                              hPutStrLn ph =<< symProUIString "crucibler-prof" fn proftab
 
-         hPutStrLn outh "==== Begin Simulation ===="
+                       hPutStrLn outh "\n==== Finish Simulation ===="
 
-         _res <- executeCrucible simSt $ runOverrideSim retType (regValue <$> callFnVal (HandleFnVal mainHdl) emptyRegMap)
+                       getProofObligations sym >>= \case
+                         Nothing -> hPutStrLn outh "==== No proof obligations ===="
+                         Just gs ->
+                           do hPutStrLn outh "==== Proof obligations ===="
+                              forM_ (goalsToList gs) (\g ->
+                                do hPrint outh (ppProofObligation sym g)
+                                   neggoal <- notPred sym (view labeledPred (proofGoal g))
+                                   let bs = neggoal : map (view labeledPred) (toList (proofAssumptions g))
+                                   runZ3InOverride sym defaultLogData bs (\case
+                                     Sat _   -> hPutStrLn outh "COUNTEREXAMPLE"
+                                     Unsat _ -> hPutStrLn outh "PROVED"
+                                     Unknown -> hPutStrLn outh "UNKNOWN"
+                                     )
+                                )
 
-         hPutStrLn outh "\n==== Finish Simulation ===="
-
-         getProofObligations sym >>= \case
-           Nothing -> hPutStrLn outh "==== No proof obligations ===="
-           Just gs ->
-             do hPutStrLn outh "==== Proof obligations ===="
-                mapM_ (hPrint outh . ppProofObligation sym) (goalsToList gs)
-
-    _ -> hPutStrLn outh "No suitable main function found"
+                  _ -> hPutStrLn outh "No suitable main function found"
 
   where
   isMain (ACFG _ _ g) = handleName (cfgHandle g) == fromString "main"

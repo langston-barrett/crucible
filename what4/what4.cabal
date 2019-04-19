@@ -1,5 +1,5 @@
 Name:          what4
-Version:       0.4.0
+Version:       0.4.2
 Author:        Galois Inc.
 Maintainer:    jhendrix@galois.com, rdockins@galois.com
 Copyright:     (c) Galois, Inc 2014-2018
@@ -17,22 +17,26 @@ Description:
 
 library
   build-depends:
-    base >= 4.8 && < 4.12,
+    base >= 4.8 && < 5,
     attoparsec,
     ansi-wl-pprint,
     bimap >= 0.2,
+    bifunctors >= 5,
     bytestring,
+    deriving-compat >= 0.5,
     containers >= 0.5.0.0,
     data-binary-ieee754,
     deepseq,
     directory,
+    exceptions,
+    extra,
     filepath,
     hashable,
     hashtables,
     io-streams,
     lens,
     mtl,
-    parameterized-utils >= 1.0 && < 1.1,
+    parameterized-utils >= 1.0.8 && < 2.1,
     process,
     scientific,
     temporary >= 1.2,
@@ -40,6 +44,7 @@ library
     text,
     th-abstraction >=0.1 && <0.3,
     transformers,
+    unordered-containers,
     utf8-string,
     vector,
     ghc-prim
@@ -58,6 +63,7 @@ library
     What4.Interface
     What4.InterpretedFloatingPoint
     What4.Partial
+    What4.Partial.AssertionTree
     What4.ProblemFeatures
     What4.ProgramLoc
     What4.SatResult
@@ -85,6 +91,8 @@ library
 
     What4.Protocol.Online
     What4.Protocol.SMTLib2
+    What4.Protocol.SMTLib2.Parse
+    What4.Protocol.SMTLib2.Syntax
     What4.Protocol.SMTWriter
     What4.Protocol.ReadDecimal
     What4.Protocol.SExp
@@ -109,6 +117,8 @@ library
 
   ghc-options: -Wall
   ghc-prof-options: -O2 -fprof-auto-top
+  if impl(ghc >= 8.6)
+    default-extensions: NoStarIsType
 
 test-suite expr-builder-smtlib2
   type: exitcode-stdio-1.0

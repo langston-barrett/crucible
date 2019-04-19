@@ -21,6 +21,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
@@ -35,18 +36,27 @@ module Lang.Crucible.Simulator.Operations
   , conditionalBranch
   , variantCases
   , returnValue
-  , returnAndMerge
+  , callFunction
+  , tailCallFunction
   , runOverride
   , runAbortHandler
   , runErrorHandler
   , runGenericErrorHandler
   , performIntraFrameMerge
+  , performIntraFrameSplit
+  , performFunctionCall
+  , performTailCall
+  , performReturn
+  , performControlTransfer
   , resumeFrame
+  , resumeValueFromValueAbort
+  , overrideSymbolicBranch
 
     -- * Resolving calls
   , ResolvedCall(..)
   , UnresolvableFunction(..)
   , resolveCall
+  , resolvedCallName
 
     -- * Abort handlers
   , abortExecAndLog
@@ -54,17 +64,19 @@ module Lang.Crucible.Simulator.Operations
   , defaultAbortHandler
 
     -- * Call tree manipulations
-  , callFn
+  , pushCallFrame
   , replaceTailFrame
   , isSingleCont
   , unwindContext
   , extractCurrentPath
+  , asContFrame
   ) where
 
 import qualified Control.Exception as Ex
 import           Control.Lens
 import           Control.Monad.Reader
 import           Data.Monoid ((<>))
+import           Data.List (isPrefixOf)
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some
 import           Data.Sequence (Seq)
@@ -75,6 +87,7 @@ import qualified Text.PrettyPrint.ANSI.Leijen as PP
 
 import           What4.Config
 import           What4.Interface
+import           What4.FunctionName
 import           What4.ProgramLoc
 
 import           Lang.Crucible.Backend
@@ -84,7 +97,6 @@ import           Lang.Crucible.FunctionHandle
 import           Lang.Crucible.Panic(panic)
 import           Lang.Crucible.Simulator.CallFrame
 import           Lang.Crucible.Simulator.ExecutionTree
-import           Lang.Crucible.Simulator.Frame
 import           Lang.Crucible.Simulator.GlobalState
 import           Lang.Crucible.Simulator.Intrinsics
 import           Lang.Crucible.Simulator.RegMap
@@ -130,8 +142,8 @@ mergeCrucibleFrame ::
   IsSymInterface sym =>
   sym ->
   IntrinsicTypes sym ->
-  CrucibleBranchTarget blocks args {- ^ Target of branch -} ->
-  MuxFn (Pred sym) (SimFrame sym ext (CrucibleLang blocks ret) args)
+  CrucibleBranchTarget f args {- ^ Target of branch -} ->
+  MuxFn (Pred sym) (SimFrame sym ext f args)
 mergeCrucibleFrame sym muxFns tgt p x0 y0 =
   case tgt of
     BlockTarget _b_id -> do
@@ -142,15 +154,15 @@ mergeCrucibleFrame sym muxFns tgt p x0 y0 =
     ReturnTarget -> do
       let x = fromReturnFrame x0
       let y = fromReturnFrame y0
-      RF <$> muxRegEntry sym muxFns p x y
+      RF (x0^.frameFunctionName) <$> muxRegEntry sym muxFns p x y
 
 
 mergePartialResult ::
   IsSymInterface sym =>
-  SimState p sym ext f root args ->
-  CrucibleBranchTarget blocks args ->
+  SimState p sym ext root f args ->
+  CrucibleBranchTarget f args ->
   MuxFn (Pred sym)
-     (PartialResult sym ext (SimFrame sym ext (CrucibleLang blocks ret) args))
+     (PartialResult sym ext (SimFrame sym ext f args))
 mergePartialResult s tgt pp x y =
   let sym       = s^.stateSymInterface
       iteFns    = s^.stateIntrinsicTypes
@@ -201,76 +213,75 @@ mergeAssumptions sym p thens elses =
      -- Filter out all the trivally true assumptions
      return (Seq.filter ((/= Just True) . asConstantPred . view labeledPred) xs)
 
-pushCrucibleFrame ::
+pushPausedFrame ::
+  IsSymInterface sym =>
+  PausedFrame p sym ext rtp g ->
+  ReaderT (SimState p sym ext rtp f ma) IO (PausedFrame p sym ext rtp g)
+pushPausedFrame (PausedFrame frm res loc) =
+  do sym <- view stateSymInterface
+     iTypes <- view stateIntrinsicTypes
+     frm' <- lift (frm & traverseOf (partialValue.gpGlobals) (globalPushBranch sym iTypes))
+     res' <- lift (pushControlResumption sym iTypes res)
+     return (PausedFrame frm' res' loc)
+
+pushControlResumption ::
   IsSymInterface sym =>
   sym ->
   IntrinsicTypes sym ->
-  SimFrame sym ext (CrucibleLang b r) a ->
-  IO (SimFrame sym ext (CrucibleLang b r) a)
-pushCrucibleFrame sym muxFns (MF x) = do
-  r' <- pushBranchRegs sym muxFns (x^.frameRegs)
-  return $! MF (x & frameRegs .~ r')
-pushCrucibleFrame sym muxFns (RF x) = do
-  x' <- pushBranchRegEntry sym muxFns x
-  return $! RF x'
+  ControlResumption p sym ext rtp g ->
+  IO (ControlResumption p sym ext rtp g)
+pushControlResumption sym iTypes res =
+  case res of
+    ContinueResumption jmp ->
+      ContinueResumption <$> pushResolvedJump sym iTypes jmp
+    CheckMergeResumption jmp ->
+      CheckMergeResumption <$> pushResolvedJump sym iTypes jmp
+    SwitchResumption ps ->
+      SwitchResumption <$> (traverse._2) (pushResolvedJump sym iTypes) ps
+    OverrideResumption k args ->
+      OverrideResumption k <$> pushBranchRegs sym iTypes args
 
-
-pushPausedFrame ::
+pushResolvedJump ::
   IsSymInterface sym =>
-  PausedFrame p sym ext root b a args ->
-  ReaderT (SimState p sym ext root (CrucibleLang b a) ma) IO (PausedFrame p sym ext root b a args)
-pushPausedFrame pf =
-  do sym <- view stateSymInterface
-     iTypes <- view stateIntrinsicTypes
-     lift $ traverseOf (pausedFrame.partialValue)
-        (\(GlobalPair v gs) ->
-           GlobalPair <$> pushCrucibleFrame sym iTypes v <*>
-                          globalPushBranch sym iTypes gs)
-        pf
-
+  sym ->
+  IntrinsicTypes sym ->
+  ResolvedJump sym branches ->
+  IO (ResolvedJump sym branches)
+pushResolvedJump sym iTypes (ResolvedJump block_id args) =
+  ResolvedJump block_id <$> pushBranchRegs sym iTypes args
 
 
 abortCrucibleFrame ::
   IsSymInterface sym =>
   sym ->
   IntrinsicTypes sym ->
-  SimFrame sym ext (CrucibleLang b r') a' ->
-  IO (SimFrame sym ext (CrucibleLang b r') a')
-abortCrucibleFrame sym intrinsicFns (MF x') =
+  CrucibleBranchTarget f a' ->
+  SimFrame sym ext f a' ->
+  IO (SimFrame sym ext f a')
+abortCrucibleFrame sym intrinsicFns (BlockTarget _) (MF x') =
   do r' <- abortBranchRegs sym intrinsicFns (x'^.frameRegs)
      return $! MF (x' & frameRegs .~ r')
 
-abortCrucibleFrame sym intrinsicFns (RF x') =
-  RF <$> abortBranchRegEntry sym intrinsicFns x'
+abortCrucibleFrame sym intrinsicFns ReturnTarget (RF nm x') =
+  RF nm <$> abortBranchRegEntry sym intrinsicFns x'
+
 
 abortPartialResult ::
   IsSymInterface sym =>
   SimState p sym ext r f args ->
-  PartialResult sym ext (SimFrame sym ext (CrucibleLang b r') a') ->
-  IO (PartialResult sym ext (SimFrame sym ext (CrucibleLang b r') a'))
-abortPartialResult s pr =
+  CrucibleBranchTarget f a' ->
+  PartialResult sym ext (SimFrame sym ext f a') ->
+  IO (PartialResult sym ext (SimFrame sym ext f a'))
+abortPartialResult s tgt pr =
   let sym                    = s^.stateSymInterface
       muxFns                 = s^.stateIntrinsicTypes
-      abtGp (GlobalPair v g) = GlobalPair <$> abortCrucibleFrame sym muxFns v
+      abtGp (GlobalPair v g) = GlobalPair <$> abortCrucibleFrame sym muxFns tgt v
                                           <*> globalAbortBranch sym muxFns g
   in partialValue abtGp pr
 
 
 ------------------------------------------------------------------------
--- resolveCallFrame
-
--- | The result of resolving a function call.
-data ResolvedCall p sym ext ret where
-  -- | A resolved function call to an override.
-  OverrideCall ::
-    !(Override p sym ext args ret) ->
-    !(OverrideFrame sym ret args) ->
-    ResolvedCall p sym ext ret
-
-  -- | A resolved function call to a Crucible function.
-  CrucibleCall ::
-    !(CallFrame sym ext blocks ret args) ->
-    ResolvedCall p sym ext ret
+-- resolveCall
 
 -- | This exception is thrown if a 'FnHandle' cannot be resolved to
 --   a callable function.  This usually indicates a programming error,
@@ -282,7 +293,14 @@ data UnresolvableFunction where
 
 instance Ex.Exception UnresolvableFunction
 instance Show UnresolvableFunction where
-  show (UnresolvableFunction h) = "Could not resolve function: " ++ show (handleName h)
+  show (UnresolvableFunction h) =
+    let name = show $ handleName h
+    in if "llvm" `isPrefixOf` name
+       then unlines [ "Encountered unresolved LLVM intrinsic '" ++ name ++ "'"
+                    , "Please report this on the following issue:"
+                    , "https://github.com/GaloisInc/crucible/issues/73"
+                    ]
+       else "Could not resolve function: " ++ name
 
 -- | Given a set of function bindings, a function-
 --   value (which is possibly a closure) and a
@@ -306,13 +324,17 @@ resolveCall bindings c0 args =
       case lookupHandleMap h bindings of
         Nothing -> Ex.throw (UnresolvableFunction h)
         Just (UseOverride o) -> do
-          let f = OverrideFrame { override = overrideName o
-                                , overrideRegMap = args
+          let f = OverrideFrame { _override = overrideName o
+                                , _overrideRegMap = args
                                 }
            in OverrideCall o f
         Just (UseCFG g pdInfo) -> do
-          CrucibleCall (mkCallFrame g pdInfo args)
+          CrucibleCall (cfgEntryBlockID g) (mkCallFrame g pdInfo args)
 
+
+resolvedCallName :: ResolvedCall p sym ext ret -> FunctionName
+resolvedCallName (OverrideCall _ f) = f^.override
+resolvedCallName (CrucibleCall _ f) = case frameHandle f of SomeHandle h -> handleName h
 
 ---------------------------------------------------------------------
 -- Control-flow operations
@@ -327,8 +349,8 @@ runOverride o = ReaderT (return . OverrideState o)
 -- | Immediately transition to a 'RunningState'.  On the next
 --   execution step, the simulator will interpret the next basic
 --   block.
-continue :: ExecCont p sym ext rtp (CrucibleLang blocks r) ('Just a)
-continue = ReaderT (return . RunningState)
+continue :: RunningStateInfo blocks a -> ExecCont p sym ext rtp (CrucibleLang blocks r) ('Just a)
+continue rtgt = ReaderT (return . RunningState rtgt)
 
 -- | Immediately transition to an 'AbortState'.  On the next
 --   execution step, the simulator will unwind the 'SimState'
@@ -375,12 +397,29 @@ jumpToBlock ::
   IsSymInterface sym =>
   ResolvedJump sym blocks {- ^ Jump target and arguments -} ->
   ExecCont p sym ext rtp (CrucibleLang blocks r) ('Just a)
-jumpToBlock (ResolvedJump block_id args) =
-  withReaderT
-    (stateCrucibleFrame %~ setFrameBlock block_id args)
-    (checkForIntraFrameMerge (BlockTarget block_id))
+jumpToBlock jmp = ReaderT $ return . ControlTransferState (CheckMergeResumption jmp)
 {-# INLINE jumpToBlock #-}
 
+performControlTransfer ::
+  IsSymInterface sym =>
+  ControlResumption p sym ext rtp f ->
+  ExecCont p sym ext rtp f ('Just a)
+performControlTransfer res =
+  case res of
+    ContinueResumption (ResolvedJump block_id args) ->
+      withReaderT
+        (stateCrucibleFrame %~ setFrameBlock block_id args)
+        (continue (RunBlockStart block_id))
+    CheckMergeResumption (ResolvedJump block_id args) ->
+      withReaderT
+        (stateCrucibleFrame %~ setFrameBlock block_id args)
+        (checkForIntraFrameMerge (BlockTarget block_id))
+    SwitchResumption cs ->
+      variantCases cs
+    OverrideResumption k args ->
+      withReaderT
+        (stateOverrideFrame.overrideRegMap .~ args)
+        k
 
 -- | Perform a conditional branch on the given predicate.
 --   If the predicate is symbolic, this will record a symbolic
@@ -391,19 +430,14 @@ conditionalBranch ::
   ResolvedJump sym blocks {- ^ True branch -} ->
   ResolvedJump sym blocks {- ^ False branch -} ->
   ExecCont p sym ext rtp (CrucibleLang blocks ret) ('Just ctx)
-conditionalBranch p (ResolvedJump x_id x_args) (ResolvedJump y_id y_args) = do
+conditionalBranch p xjmp yjmp = do
   top_frame <- view (stateTree.actFrame)
   Some pd <- return (top_frame^.crucibleTopFrame.framePostdom)
 
-  let x_frame = cruciblePausedFrame x_id x_args top_frame pd
-  let y_frame = cruciblePausedFrame y_id y_args top_frame pd
+  x_frame <- cruciblePausedFrame xjmp top_frame pd
+  y_frame <- cruciblePausedFrame yjmp top_frame pd
 
-  x_loc <- getTgtLoc x_id
-  y_loc <- getTgtLoc y_id
-
-  intra_branch p (SomePausedFrame x_frame (Just x_loc))
-                 (SomePausedFrame y_frame (Just y_loc))
-                 pd
+  intra_branch p x_frame y_frame pd
 
 -- | Execute the next branch of a sequence of branch cases.
 --   These arise from the implementation of the 'VariantElim'
@@ -424,58 +458,64 @@ variantCases ::
 variantCases [] =
   do fm <- view stateCrucibleFrame
      let loc = frameProgramLoc fm
-     let rsn = VariantOptionsExhaused loc
+     let rsn = VariantOptionsExhausted loc
      abortExec rsn
 
-variantCases ((p,ResolvedJump x_id x_args) : cs) =
+variantCases ((p,jmp) : cs) =
   do top_frame <- view (stateTree.actFrame)
      Some pd <- return (top_frame^.crucibleTopFrame.framePostdom)
 
-     let x_frame = cruciblePausedFrame x_id x_args top_frame pd
-         y_frame = PausedFrame (TotalRes top_frame) (SwitchResumption cs)
+     x_frame <- cruciblePausedFrame jmp top_frame pd
+     let y_frame = PausedFrame (TotalRes top_frame) (SwitchResumption cs) Nothing
 
-     x_loc <- getTgtLoc x_id
-     intra_branch p
-                  (SomePausedFrame x_frame (Just x_loc))
-                  (SomePausedFrame y_frame Nothing)
-                  pd
+     intra_branch p x_frame y_frame pd
 
 -- | Return a value from current Crucible execution.
-returnAndMerge :: forall p sym ext rtp blocks ret args.
-  IsSymInterface sym =>
-  RegEntry sym ret {- ^ return value -} ->
-  ExecCont p sym ext rtp (CrucibleLang blocks ret) args
-returnAndMerge arg =
-  withReaderT
-    (stateTree.actFrame.gpValue .~ RF arg)
-    (checkForIntraFrameMerge ReturnTarget)
+returnValue :: forall p sym ext rtp f args.
+  RegEntry sym (FrameRetType f) {- ^ return value -} ->
+  ExecCont p sym ext rtp f args
+returnValue arg =
+  do nm <- view (stateTree.actFrame.gpValue.frameFunctionName)
+     withReaderT
+       (stateTree.actFrame.gpValue .~ RF nm arg)
+       (checkForIntraFrameMerge ReturnTarget)
 
 
--- | Return a value from current override execution.
-returnValue ::
-  IsSymInterface sym =>
-  RegEntry sym ret {- ^ return value -} ->
-  ExecCont p sym ext rtp (OverrideLang ret) a
-returnValue v =
-  do ActiveTree ctx er <- view stateTree
-     handleSimReturn
-       (returnContext ctx)
-       (er & partialValue.gpValue .~ v)
+callFunction ::
+  FnVal sym args ret {- ^ Function handle and any closure variables -} ->
+  RegMap sym args {- ^ Arguments to the function -} ->
+  ReturnHandler ret p sym ext rtp f a {- ^ How to modify the caller's scope with the return value -} ->
+  ExecCont p sym ext rtp f a
+callFunction fn args retHandler =
+  do bindings <- view (stateContext.functionBindings)
+     let rcall = resolveCall bindings fn args
+     ReaderT $ return . CallState retHandler rcall
+
+tailCallFunction ::
+  FrameRetType f ~ ret =>
+  FnVal sym args ret {- ^ Function handle and any closure variables -} ->
+  RegMap sym args {- ^ Arguments to the function -} ->
+  ValueFromValue p sym ext rtp ret ->
+  ExecCont p sym ext rtp f a
+tailCallFunction fn args vfv =
+  do bindings <- view (stateContext.functionBindings)
+     let rcall = resolveCall bindings fn args
+     ReaderT $ return . TailCallState vfv rcall
 
 
--- | Immediately transition to the 'ControlTransferState'.
+-- | Immediately transition to the 'BranchMergeState'.
 --   On the next simulator step, this will checks for the
 --   opportunity to merge within a frame.
 --
 --   This should be called everytime the current control flow location
 --   changes to a potential merge point.
 checkForIntraFrameMerge ::
-  CrucibleBranchTarget b args
+  CrucibleBranchTarget f args
     {- ^ The location of the block we are transferring to -} ->
-  ExecCont p sym ext root (CrucibleLang b r) args
+  ExecCont p sym ext root f args
 
 checkForIntraFrameMerge tgt =
-  ReaderT $ return . ControlTransferState tgt
+  ReaderT $ return . BranchMergeState tgt
 
 
 -- | Perform a single instance of path merging at a join point.
@@ -485,9 +525,9 @@ checkForIntraFrameMerge tgt =
 --   continue executing by transfering control to the given target.
 performIntraFrameMerge ::
   IsSymInterface sym =>
-  CrucibleBranchTarget b args
+  CrucibleBranchTarget f args
     {- ^ The location of the block we are transferring to -} ->
-  ExecCont p sym ext root (CrucibleLang b r) args
+  ExecCont p sym ext root f args
 
 performIntraFrameMerge tgt = do
   ActiveTree ctx0 er <- view stateTree
@@ -501,11 +541,11 @@ performIntraFrameMerge tgt = do
         case other_branch of
 
           -- We still have some more work to do, reactivate the other, postponed branch
-          VFFActivePath toTgt next ->
+          VFFActivePath next ->
             do pathAssumes      <- liftIO $ popAssumptionFrame sym assume_frame
                new_assume_frame <- liftIO $ pushAssumptionFrame sym
                pnot             <- liftIO $ notPred sym p
-               liftIO $ addAssumption sym (LabeledPred pnot (ExploringAPath loc toTgt))
+               liftIO $ addAssumption sym (LabeledPred pnot (ExploringAPath loc (pausedLoc next)))
 
                -- The current branch is done
                let new_other = VFFCompletePath pathAssumes er
@@ -532,7 +572,7 @@ performIntraFrameMerge tgt = do
     VFFPartial ctx p ar needsAborting ->
       do er'  <- case needsAborting of
                    NoNeedToAbort    -> return er
-                   NeedsToBeAborted -> ReaderT $ \s -> abortPartialResult s er
+                   NeedsToBeAborted -> ReaderT $ \s -> abortPartialResult s tgt er
          er'' <- liftIO $ mergePartialAndAbortedResult sym p er' ar
          withReaderT
            (stateTree .~ ActiveTree ctx er'')
@@ -542,10 +582,11 @@ performIntraFrameMerge tgt = do
     -- the transfer of control by either transitioning into an ordinary
     -- running state, or by returning a value to the calling context.
     _ -> case tgt of
-           BlockTarget _ ->
-             continue
+           BlockTarget bid ->
+             continue (RunBlockStart bid)
            ReturnTarget ->
              handleSimReturn
+               (er^.partialValue.gpValue.frameFunctionName)
                (returnContext ctx0)
                (er & over (partialValue.gpValue) fromReturnFrame)
 
@@ -557,7 +598,7 @@ defaultAbortHandler :: IsSymInterface sym => AbortHandler p sym ext rtp
 defaultAbortHandler = AH abortExecAndLog
 
 -- | Abort the current execution and roll back to the nearest
---   symbolic branch point.  When verbosity is non-0 a message
+--   symbolic branch point.  When verbosity is 3 or more, a message
 --   will be logged indicating the reason for the abort.
 --
 --   The default abort handler calls this function.
@@ -570,7 +611,7 @@ abortExecAndLog rsn = do
   cfg <- view stateConfiguration
   ctx <- view stateContext
   v <- liftIO (getOpt =<< getOptionSetting verbosity cfg)
-  when (v > 0) $ do
+  when (v >= 3) $ do
     let frames = activeFrames t
     let msg = ppAbortExecReason rsn PP.<$$>
               PP.indent 2 (ppExceptionContext frames)
@@ -620,8 +661,8 @@ resumeValueFromFrameAbort ctx0 ar0 = do
          case other_branch of
 
            -- We have some more work to do.
-           VFFActivePath toLoc n ->
-             do liftIO $ addAssumption sym (LabeledPred pnot (ExploringAPath loc toLoc))
+           VFFActivePath n ->
+             do liftIO $ addAssumption sym (LabeledPred pnot (ExploringAPath loc (pausedLoc n)))
                 resumeFrame n nextCtx
 
            -- The other branch had finished successfully;
@@ -642,7 +683,7 @@ resumeValueFromFrameAbort ctx0 ar0 = do
       resumeValueFromFrameAbort ctx (AbortedBranch p ar0 ay)
 
     VFFEnd ctx ->
-      resumeValueFromValueAbort ctx ar0
+      ReaderT $ return . UnwindCallState ctx ar0
 
 -- | Run rest of execution given a value from value context and an aborted
 -- result.
@@ -653,9 +694,11 @@ resumeValueFromValueAbort ::
   ExecCont p sym ext r f a
 resumeValueFromValueAbort ctx0 ar0 =
   case ctx0 of
-    VFVCall ctx _ _ -> do
-      -- Pop out of call context.
-      resumeValueFromFrameAbort ctx ar0
+    VFVCall ctx frm _rh ->
+      do ActiveTree _oldFrm er <- view stateTree
+         withReaderT
+           (stateTree .~ ActiveTree ctx (er & partialValue.gpValue .~ frm))
+           (resumeValueFromFrameAbort ctx ar0)
     VFVPartial ctx p ay -> do
       resumeValueFromValueAbort ctx (AbortedBranch p ar0 ay)
     VFVEnd ->
@@ -665,38 +708,55 @@ resumeValueFromValueAbort ctx0 ar0 =
 -- | Resume a paused frame.
 resumeFrame ::
   IsSymInterface sym =>
-  PausedFrame p sym ext rtp blocks r a ->
-  ValueFromFrame p sym ext rtp (CrucibleLang blocks r) ->
+  PausedFrame p sym ext rtp f ->
+  ValueFromFrame p sym ext rtp f ->
   ExecCont p sym ext rtp g ba
-resumeFrame (PausedFrame frm cont) ctx =
+resumeFrame (PausedFrame frm cont toLoc) ctx =
+ do case toLoc of
+      Nothing -> return ()
+      Just l  ->
+        do sym <- view stateSymInterface
+           liftIO $ setCurrentProgramLoc sym l
     withReaderT
-       (stateTree .~ ActiveTree ctx frm)
-       (case cont of
-         ContinueResumption     -> continue
-         SwitchResumption cs    -> variantCases cs
-         CheckMergeResumption i -> checkForIntraFrameMerge (BlockTarget i))
+      (stateTree .~ ActiveTree ctx frm)
+      (ReaderT $ return . ControlTransferState cont)
 {-# INLINABLE resumeFrame #-}
 
 
+-- | Transition immediately to a @ReturnState@.  We are done with all
+--   intercall merges, and are ready to resmue execution in the caller's
+--   context.
 handleSimReturn ::
   IsSymInterface sym =>
+  FunctionName {- ^ Name of the function we are returning from -} ->
   ValueFromValue p sym ext r ret {- ^ Context to return to. -} ->
-  PartialResult sym ext ret {- ^ Value that is being returned. -} ->
+  PartialResult sym ext (RegEntry sym ret) {- ^ Value that is being returned. -} ->
   ExecCont p sym ext r f a
-handleSimReturn ctx0 return_value = do
+handleSimReturn fnName vfv return_value =
+  ReaderT $ return . ReturnState fnName vfv return_value
+
+
+-- | Resolve the return value, and begin executing in the caller's context again.
+performReturn ::
+  IsSymInterface sym =>
+  FunctionName {- ^ Name of the function we are returning from -} ->
+  ValueFromValue p sym ext r ret {- ^ Context to return to. -} ->
+  PartialResult sym ext (RegEntry sym ret) {- ^ Value that is being returned. -} ->
+  ExecCont p sym ext r f a
+performReturn fnName ctx0 return_value = do
   case ctx0 of
     VFVCall ctx (MF f) (ReturnToCrucible tpr rest) ->
       do let v  = return_value^.partialValue.gpValue
              f' = extendFrame tpr (regValue v) rest f
          withReaderT
            (stateTree .~ ActiveTree ctx (return_value & partialValue . gpValue .~ MF f'))
-           continue
+           (continue (RunReturnFrom fnName))
 
     VFVCall ctx _ TailReturnToCrucible ->
-      do let v  = return_value^.partialValue.gpValue
+      do let v = return_value^.partialValue.gpValue
          withReaderT
-           (stateTree .~ ActiveTree ctx (return_value & partialValue . gpValue .~ RF v))
-           (returnAndMerge v)
+           (stateTree .~ ActiveTree ctx (return_value & partialValue . gpValue .~ RF fnName v))
+           (returnValue v)
 
     VFVCall ctx (OF f) (ReturnToOverride k) ->
       do let v = return_value^.partialValue.gpValue
@@ -707,7 +767,7 @@ handleSimReturn ctx0 return_value = do
     VFVPartial ctx p r ->
       do sym <- view stateSymInterface
          new_ret_val <- liftIO (mergePartialAndAbortedResult sym p return_value r)
-         handleSimReturn ctx new_ret_val
+         performReturn fnName ctx new_ret_val
 
     VFVEnd ->
       do res <- view stateContext
@@ -715,17 +775,39 @@ handleSimReturn ctx0 return_value = do
 
 
 cruciblePausedFrame ::
-  BlockID b new_args ->
-  RegMap sym new_args ->
+  ResolvedJump sym b ->
   GlobalPair sym (SimFrame sym ext (CrucibleLang b r) ('Just a)) ->
-  CrucibleBranchTarget b pd_args {- ^ postdominator target -} ->
-  PausedFrame p sym ext rtp b r new_args
-cruciblePausedFrame x_id x_args top_frame pd =
-  let cf = top_frame & crucibleTopFrame %~ setFrameBlock x_id x_args
-      res = case testEquality pd (BlockTarget x_id) of
-                Just Refl -> CheckMergeResumption x_id
-                Nothing   -> ContinueResumption
-   in PausedFrame (TotalRes cf) res
+  CrucibleBranchTarget (CrucibleLang b r) pd_args {- ^ postdominator target -} ->
+  ReaderT (SimState p sym ext rtp (CrucibleLang b z) ('Just dc_args)) IO
+          (PausedFrame p sym ext rtp' (CrucibleLang b r))
+cruciblePausedFrame jmp@(ResolvedJump x_id _) top_frame pd =
+  do let res = case testEquality pd (BlockTarget x_id) of
+                 Just Refl -> CheckMergeResumption jmp
+                 Nothing   -> ContinueResumption jmp
+     loc <- getTgtLoc x_id
+     return $ PausedFrame (TotalRes top_frame) res (Just loc)
+
+overrideSymbolicBranch ::
+  IsSymInterface sym =>
+  Pred sym ->
+  
+  RegMap sym then_args -> 
+  ExecCont p sym ext rtp (OverrideLang r) ('Just then_args) {- ^ if branch -} ->
+  Maybe Position {- ^ optional if branch location -} ->
+
+  RegMap sym else_args -> 
+  ExecCont p sym ext rtp (OverrideLang r) ('Just else_args) {- ^ else branch -} ->
+  Maybe Position {- ^ optional else branch location -} ->
+
+  ExecCont p sym ext rtp (OverrideLang r) ('Just args)
+overrideSymbolicBranch p thn_args thn thn_pos els_args els els_pos =
+  do top_frm <- view (stateTree.actFrame)
+     let fnm     = top_frm^.gpValue.overrideSimFrame.override
+     let thn_loc = mkProgramLoc fnm <$> thn_pos
+     let els_loc = mkProgramLoc fnm <$> els_pos
+     let thn_frm = PausedFrame (TotalRes top_frm) (OverrideResumption thn thn_args) thn_loc
+     let els_frm = PausedFrame (TotalRes top_frm) (OverrideResumption els els_args) els_loc
+     intra_branch p thn_frm els_frm ReturnTarget
 
 getTgtLoc ::
   BlockID b y ->
@@ -736,7 +818,6 @@ getTgtLoc (BlockID i) =
 
 -- | Return the context of the current top frame.
 asContFrame ::
-  (f ~ CrucibleLang b a) =>
   ActiveTree     p sym ext ret f args ->
   ValueFromFrame p sym ext ret f
 asContFrame (ActiveTree ctx active_res) =
@@ -745,25 +826,10 @@ asContFrame (ActiveTree ctx active_res) =
     PartialRes p _ex ar -> VFFPartial ctx p ar NoNeedToAbort
 
 
--- | @swap_unless b (x,y)@ returns @(x,y)@ when @b@ is @True@ and
--- @(y,x)@ when @b@ if @False@.
-swap_unless :: Bool -> (a, a) -> (a,a)
-swap_unless True p = p
-swap_unless False (x,y) = (y,x)
-{-# INLINE swap_unless #-}
-
 -- | Return assertion where predicate equals a constant
 predEqConst :: IsExprBuilder sym => sym -> Pred sym -> Bool -> IO (Pred sym)
 predEqConst _   p True  = return p
 predEqConst sym p False = notPred sym p
-
--- | 'Some' frame, together with a location (if any) associated with
---   that frame
-data SomePausedFrame p sym ext r b a =
-  forall args.
-  SomePausedFrame
-     !(PausedFrame p sym ext r b a args)
-     !(Maybe ProgramLoc)
 
 -- | Branch with a merge point inside this frame.
 intra_branch ::
@@ -771,54 +837,109 @@ intra_branch ::
   Pred sym
   {- ^ Branch condition branch -} ->
 
-  SomePausedFrame p sym ext r b a
+  PausedFrame p sym ext rtp f
   {- ^ true branch. -} ->
 
-  SomePausedFrame p sym ext r b a
+  PausedFrame p sym ext rtp f
   {- ^ false branch. -} ->
 
-  CrucibleBranchTarget b (args :: Maybe (Ctx CrucibleType))
+  CrucibleBranchTarget f (args :: Maybe (Ctx CrucibleType))
   {- ^ Postdominator merge point, where both branches meet again. -} ->
 
-  ExecCont p sym ext r (CrucibleLang b a) ('Just dc_args)
+  ExecCont p sym ext rtp f ('Just dc_args)
 
 intra_branch p t_label f_label tgt = do
   ctx <- asContFrame <$> view stateTree
   sym <- view stateSymInterface
-  r <- liftIO $ evalBranch sym p
-  loc <- liftIO $ getCurrentProgramLoc sym
 
-  case r of
-    SymbolicBranch chosen_branch -> do
-      -- Get correct predicate
-      p' <- liftIO $ predEqConst sym p chosen_branch
+  case asConstantPred p of
+    Nothing ->
+      ReaderT $ return . SymbolicBranchState p t_label f_label tgt
 
-      (SomePausedFrame a_frame a_loc, SomePausedFrame o_frame o_loc) <-
-                      return (swap_unless chosen_branch (t_label, f_label))
-
-      a_frame' <- pushPausedFrame a_frame
-      o_frame' <- pushPausedFrame o_frame
-
-      assume_frame <- liftIO $ pushAssumptionFrame sym
-      liftIO $ addAssumption sym (LabeledPred p' (ExploringAPath loc a_loc))
-
-      -- Create context for paused frame.
-      let todo = VFFActivePath o_loc o_frame'
-          ctx' = VFFBranch ctx assume_frame loc p' todo tgt
-
-      -- Start a_state (where branch pred is p')
-      resumeFrame a_frame' ctx'
-
-    NoBranch chosen_branch ->
-      do SomePausedFrame a_frame a_loc <-
-                      return (if chosen_branch then t_label else f_label)
-
-         liftIO $ addAssumption sym (LabeledPred (truePred sym) (ExploringAPath loc a_loc))
-
+    Just chosen_branch ->
+      do p' <- liftIO $ predEqConst sym p chosen_branch
+         let a_frame = if chosen_branch then t_label else f_label
+         loc <- liftIO $ getCurrentProgramLoc sym
+         liftIO $ addAssumption sym (LabeledPred p' (ExploringAPath loc (pausedLoc a_frame)))
          resumeFrame a_frame ctx
-
 {-# INLINABLE intra_branch #-}
 
+-- | Branch with a merge point inside this frame.
+performIntraFrameSplit ::
+  IsSymInterface sym =>
+  Pred sym
+  {- ^ Branch condition -} ->
+
+  PausedFrame p sym ext rtp f
+  {- ^ active branch. -} ->
+
+  PausedFrame p sym ext rtp f
+  {- ^ other branch. -} ->
+
+  CrucibleBranchTarget f (args :: Maybe (Ctx CrucibleType))
+  {- ^ Postdominator merge point, where both branches meet again. -} ->
+
+  ExecCont p sym ext rtp f ('Just dc_args)
+performIntraFrameSplit p a_frame o_frame tgt =
+  do ctx <- asContFrame <$> view stateTree
+     sym <- view stateSymInterface
+     loc <- liftIO $ getCurrentProgramLoc sym
+
+     a_frame' <- pushPausedFrame a_frame
+     o_frame' <- pushPausedFrame o_frame
+
+     assume_frame <- liftIO $ pushAssumptionFrame sym
+     liftIO $ addAssumption sym (LabeledPred p (ExploringAPath loc (pausedLoc a_frame')))
+
+     -- Create context for paused frame.
+     let todo = VFFActivePath o_frame'
+         ctx' = VFFBranch ctx assume_frame loc p todo tgt
+
+     -- Start a_state (where branch pred is p)
+     resumeFrame a_frame' ctx'
+
+
+performFunctionCall ::
+  IsSymInterface sym =>
+  ReturnHandler ret p sym ext rtp outer_frame outer_args ->
+  ResolvedCall p sym ext ret ->
+  ExecCont p sym ext rtp outer_frame outer_args
+performFunctionCall retHandler frm =
+  do sym <- view stateSymInterface
+     case frm of
+       OverrideCall o f ->
+         -- Eventually, locations should be nested. However, for now,
+         -- while they're not, it's useful for the location of an
+         -- override to be the location of its call site, so we don't
+         -- change it here.
+         withReaderT
+           (stateTree %~ pushCallFrame retHandler (OF f))
+           (runOverride o)
+       CrucibleCall entryID f -> do
+         let loc = mkProgramLoc (resolvedCallName frm) (OtherPos "<function entry>")
+         liftIO $ setCurrentProgramLoc sym loc
+         withReaderT
+           (stateTree %~ pushCallFrame retHandler (MF f))
+           (continue (RunBlockStart entryID))
+
+performTailCall ::
+  IsSymInterface sym =>
+  ValueFromValue p sym ext rtp ret ->
+  ResolvedCall p sym ext ret ->
+  ExecCont p sym ext rtp f a
+performTailCall vfv frm =
+  do sym <- view stateSymInterface
+     let loc = mkProgramLoc (resolvedCallName frm) (OtherPos "<function entry>")
+     liftIO $ setCurrentProgramLoc sym loc
+     case frm of
+       OverrideCall o f ->
+         withReaderT
+           (stateTree %~ swapCallFrame vfv (OF f))
+           (runOverride o)
+       CrucibleCall entryID f ->
+         withReaderT
+           (stateTree %~ swapCallFrame vfv (MF f))
+           (continue (RunBlockStart entryID))
 
 ------------------------------------------------------------------------
 -- Context tree manipulations
@@ -843,7 +964,7 @@ isSingleVFV c0 = do
 --   merges.
 unwindContext ::
   ValueFromFrame p sym ext root f ->
-  Maybe (ValueFromValue p sym ext root (RegEntry sym (FrameRetType f)))
+  Maybe (ValueFromValue p sym ext root (FrameRetType f))
 unwindContext c0 =
     case c0 of
       VFFBranch{} -> Nothing
@@ -856,7 +977,7 @@ unwindContext c0 =
 -- intra-procedural merges are possible).
 returnContext ::
   ValueFromFrame ctx sym ext root f ->
-  ValueFromValue ctx sym ext root (RegEntry sym (FrameRetType f))
+  ValueFromValue ctx sym ext root (FrameRetType f)
 returnContext c0 =
     case unwindContext c0 of
       Just vfv -> vfv
@@ -874,13 +995,21 @@ replaceTailFrame :: forall p sym ext a b c args args'.
   ActiveTree p sym ext b a args ->
   SimFrame sym ext c args' ->
   Maybe (ActiveTree p sym ext b c args')
-replaceTailFrame (ActiveTree c er) f = do
+replaceTailFrame t@(ActiveTree c _) f = do
     vfv <- unwindContext c
-    return $ ActiveTree (VFFEnd vfv) (er & partialValue . gpValue .~ f)
+    return $ swapCallFrame vfv f t
+
+swapCallFrame ::
+  ValueFromValue p sym ext rtp (FrameRetType f') ->
+  SimFrame sym ext f' args' ->
+  ActiveTree p sym ext rtp f args ->
+  ActiveTree p sym ext rtp f' args'
+swapCallFrame vfv frm (ActiveTree _ er) =
+  ActiveTree (VFFEnd vfv) (er & partialValue . gpValue .~ frm)
 
 
-callFn ::
-  ReturnHandler (RegEntry sym (FrameRetType a)) p sym ext r f old_args new_args
+pushCallFrame ::
+  ReturnHandler (FrameRetType a) p sym ext r f old_args
     {- ^ What to do with the result of the function -} ->
 
   SimFrame sym ext a args
@@ -888,7 +1017,7 @@ callFn ::
 
   ActiveTree p sym ext r f old_args ->
   ActiveTree p sym ext r a args
-callFn rh f' (ActiveTree ctx er) =
+pushCallFrame rh f' (ActiveTree ctx er) =
     ActiveTree (VFFEnd (VFVCall ctx old_frame rh)) er'
   where
   old_frame = er ^. partialValue ^. gpValue

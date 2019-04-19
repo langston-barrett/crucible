@@ -12,7 +12,8 @@ module Lang.Crucible.LLVM.Arch.X86 where
 
 import Data.Word(Word8)
 import Data.Bits
-import GHC.TypeLits (type (<=))
+import Data.Kind
+import GHC.TypeNats (type (<=))
 
 import Data.Parameterized.NatRepr(knownNat)
 import Data.Parameterized.Classes(testEquality,compareF)
@@ -36,7 +37,7 @@ data AVXOp1 = VShiftL Word8     -- ^ Shift left by this many bytes
               deriving (Eq,Ord)
 
 
-data ExtX86 :: (CrucibleType -> *) -> CrucibleType -> * where
+data ExtX86 :: (CrucibleType -> Type) -> CrucibleType -> Type where
 
   {- | Unary operation on a vector.  Should have no side effects. -}
   VOp1 :: (1 <= n) =>

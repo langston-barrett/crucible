@@ -27,19 +27,17 @@ module Lang.Crucible.Syntax.SExpr
   ) where
 
 import Data.Char (isDigit, isLetter)
-import Data.Monoid hiding ((<>))
 import Data.Semigroup (Semigroup(..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Void
 import What4.ProgramLoc as C
 
-
-
 import Text.Megaparsec as MP
 import Text.Megaparsec.Char
 import qualified Text.Megaparsec.Char.Lexer as L
 import qualified Text.PrettyPrint.ANSI.Leijen as PP
+
 
 -- | Syntax objects, in which each layer is annotated with a source position.
 newtype Syntax a = Syntax { unSyntax :: Posd (Layer Syntax a) }
@@ -108,7 +106,7 @@ lexeme = L.lexeme skipWhitespace
 -- | Parse something with its location.
 withPos :: Parser a -> Parser (Posd a)
 withPos p =
-  do MP.SourcePos file line col <- getPosition
+  do MP.SourcePos file line col <- getSourcePos
      let loc = C.SourcePos (T.pack file) (unPos line) (unPos col)
      res <- p
      return $ Posd loc res
@@ -134,8 +132,8 @@ sexp atom =
 -- | Parse an identifier.
 identifier :: Parser Text
 identifier = T.pack <$> identString
-  where letterLike x = isLetter x || (elem x ("<>=+-*/!_\\?" :: [Char]))
-        nameChar x = letterLike x || isDigit x
+  where letterLike x = isLetter x || elem x ("<>=+-*/!_\\?" :: [Char])
+        nameChar x = letterLike x || isDigit x || elem x ("$" :: [Char])
         identString = (:) <$> satisfy letterLike <*> many (satisfy nameChar)
 
 -- | Styles of printing

@@ -50,11 +50,13 @@ The canonical implementation of these interface classes is found in "What4.Expr.
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LiberalTypeSynonyms #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 module What4.Interface
@@ -66,11 +68,24 @@ module What4.Interface
     -- ** Expression recognizers
   , IsExpr(..)
   , IsSymFn(..)
+
     -- ** IsExprBuilder
   , IsExprBuilder(..)
   , IsSymExprBuilder(..)
+  , SolverEvent(..)
+
+    -- ** Bitvector operations
+  , bvJoinVector
+  , bvSplitVector
+  , bvSwap
+  , bvBitreverse
+
     -- ** Floating-point rounding modes
   , RoundingMode(..)
+
+    -- ** Run-time statistics
+  , Statistics(..)
+  , zeroStatistics
 
     -- * Type Aliases
   , Pred
@@ -125,22 +140,30 @@ module What4.Interface
 
     -- * Reexports
   , module Data.Parameterized.NatRepr
+  , module What4.BaseTypes
   , What4.Symbol.SolverSymbol
+  , What4.Symbol.emptySymbol
   , What4.Symbol.userSymbol
+  , NatValueRange(..)
+  , ValueRange(..)
   ) where
 
 import           Control.Exception (assert)
 import           Control.Lens
 import           Control.Monad
 import           Control.Monad.IO.Class
+import           Data.Coerce (coerce)
 import           Data.Foldable
 import           Data.Hashable
+import           Data.Kind ( Type )
 import qualified Data.Map as Map
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Ctx
+import           Data.Parameterized.Utils.Endian (Endian(..))
 import           Data.Parameterized.NatRepr
 import           Data.Parameterized.TraversableFC
+import qualified Data.Parameterized.Vector as Vector
 import           Data.Ratio
 import           Data.Scientific (Scientific)
 import           Data.Text (Text)
@@ -152,10 +175,13 @@ import           What4.BaseTypes
 import           What4.Config
 import           What4.ProgramLoc
 import           What4.Concrete
+import           What4.SatResult
 import           What4.Symbol
+import           What4.Utils.AbstractDomains
 import           What4.Utils.Arithmetic
 import           What4.Utils.Complex
 import qualified What4.Utils.Hashable as Hash
+
 
 ------------------------------------------------------------------------
 -- SymExpr names
@@ -193,13 +219,13 @@ type SymString sym = SymExpr sym BaseStringType
 -- Type families for the interface.
 
 -- | The class for expressions.
-type family SymExpr (sym :: *) :: BaseType -> *
+type family SymExpr (sym :: Type) :: BaseType -> Type
 
 ------------------------------------------------------------------------
 -- | Type of bound variable associated with symbolic state.
 --
 -- This type is used by some methods in class 'IsSymExprBuilder'.
-type family BoundVar (sym :: *) :: BaseType -> *
+type family BoundVar (sym :: Type) :: BaseType -> Type
 
 ------------------------------------------------------------------------
 -- IsBoolSolver
@@ -235,13 +261,22 @@ class IsExpr e where
   asNat :: e BaseNatType -> Maybe Natural
   asNat _ = Nothing
 
+  -- | Return any bounding information we have about the term
+  natBounds :: e BaseNatType -> NatValueRange
+
   -- | Return integer if this is a constant integer.
   asInteger :: e BaseIntegerType -> Maybe Integer
   asInteger _ = Nothing
 
+  -- | Return any bounding information we have about the term
+  integerBounds :: e BaseIntegerType -> ValueRange Integer
+
   -- | Return rational if this is a constant value.
   asRational :: e BaseRealType -> Maybe Rational
   asRational _ = Nothing
+
+  -- | Return any bounding information we have about the term
+  rationalBounds :: e BaseRealType -> ValueRange Rational
 
   -- | Return complex if this is a constant value.
   asComplex :: e BaseComplexType -> Maybe (Complex Rational)
@@ -254,6 +289,12 @@ class IsExpr e where
   -- | Return the signed value if this is a constant bitvector.
   asSignedBV   :: (1 <= w) => e (BaseBVType w) -> Maybe Integer
   asSignedBV _ = Nothing
+
+  -- | If we have bounds information about the term, return unsigned upper and lower bounds
+  unsignedBVBounds :: (1 <= w) => e (BaseBVType w) -> Maybe (Integer, Integer)
+
+  -- | If we have bounds information about the term, return signed upper and lower bounds
+  signedBVBounds :: (1 <= w) => e (BaseBVType w) -> Maybe (Integer, Integer)
 
   -- | Return the string value if this is a constant string
   asString :: e BaseStringType -> Maybe Text
@@ -349,6 +390,21 @@ instance HashableF e => HashableF (ArrayResultWrapper e idx) where
   hashWithSaltF s (ArrayResultWrapper v) = hashWithSaltF s v
 
 
+-- | This datatype describes events that involve interacting with
+--   solvers.  A @SolverEvent@ will be provided to the action
+--   installed via @setSolverLogListener@ whenever an interesting
+--   event occurs.
+data SolverEvent
+  = SolverStartSATQuery
+    { satQuerySolverName :: !String
+    , satQueryReason     :: !String
+    }
+  | SolverEndSATQuery
+    { satQueryResult     :: !(SatResult () ())
+    , satQueryError      :: !(Maybe String)
+    }
+ deriving (Show, Generic)
+
 ------------------------------------------------------------------------
 -- IsExprBuilder
 
@@ -370,6 +426,26 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
 
   -- | Retrieve the configuration object corresponding to this solver interface.
   getConfiguration :: sym -> Config
+
+
+  -- | Install an action that will be invoked before and after calls to
+  --   backend solvers.  This action is primarily intended to be used for
+  --   logging/profiling/debugging purposes.  Passing `Nothing` to this
+  --   function disables logging.
+  setSolverLogListener :: sym -> Maybe (SolverEvent -> IO ()) -> IO ()
+
+  -- | Get the currently-installed solver log listener, if one has been installed.
+  getSolverLogListener :: sym -> IO (Maybe (SolverEvent -> IO ()))
+
+  -- | Provide the given even to the currently installed
+  --   solver log listener, if any.
+  logSolverEvent :: sym -> SolverEvent -> IO ()
+
+  -- | Get statistics on execution from the initialization of the
+  -- symbolic interface to this point.  May return zeros if gathering
+  -- statistics isn't supported.
+  getStatistics :: sym -> IO Statistics
+  getStatistics _ = return zeroStatistics
 
   ----------------------------------------------------------------------
   -- Program location operations
@@ -594,7 +670,7 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
            -> IO (SymBV sym (u+v))
 
   -- | Select a subsequence from a bitvector.
-  bvSelect :: (1 <= n, idx + n <= w)
+  bvSelect :: forall idx n w. (1 <= n, idx + n <= w)
            => sym
            -> NatRepr idx  -- ^ Starting index, from 0 as least significant bit
            -> NatRepr n    -- ^ Number of bits to take
@@ -677,7 +753,7 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
   -- | Returns true if the corresponding bit in the bitvector is set.
   testBitBV :: (1 <= w)
             => sym
-            -> Integer -- ^ Index of bit (0 is the least significant bit)
+            -> Natural -- ^ Index of bit (0 is the least significant bit)
             -> SymBV sym w
             -> IO (Pred sym)
 
@@ -783,6 +859,11 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
           -> NatRepr r
           -> SymBV sym w
           -> IO (SymBV sym r)
+  bvTrunc sym w x
+    | LeqProof <- leqTrans
+        (addIsLeq w (knownNat @1))
+        (leqProof (incNat w) (bvWidth x))
+    = bvSelect sym (knownNat @0) w x
 
   -- | Bitwise logical and.
   bvAndBits :: (1 <= w)
@@ -814,10 +895,10 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
          . (1 <= w)
         => sym         -- ^ Symbolic interface
         -> SymBV sym w -- ^ Bitvector to updaate
-        -> Integer     -- ^ 0-based index to set
+        -> Natural     -- ^ 0-based index to set
         -> Pred sym    -- ^ Predicate to set.
         -> IO (SymBV sym w)
-  bvSet sym v i p = assert (0 <= i && i < natValue (bvWidth v)) $ do
+  bvSet sym v i p = assert (i < natValue (bvWidth v)) $ do
     let setCase :: IO (SymBV sym w)
         setCase = do
           bvOrBits sym v =<< bvLit sym (bvWidth v) (2^i)
@@ -848,6 +929,19 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
   minSignedBV :: (1 <= w) => sym -> NatRepr w -> IO (SymBV sym w)
   minSignedBV sym w = bvLit sym w (minSigned w)
 
+  -- | Return the number of 1 bits in the input.
+  bvPopcount :: (1 <= w) => sym -> SymBV sym w -> IO (SymBV sym w)
+
+  -- | Return the number of consecutive 0 bits in the input, starting from
+  --   the most significant bit position.  If the input is zero, all bits are counted
+  --   as leading.
+  bvCountLeadingZeros :: (1 <= w) => sym -> SymBV sym w -> IO (SymBV sym w)
+
+  -- | Return the number of consecutive 0 bits in the input, starting from
+  --   the least significant bit position.  If the input is zero, all bits are counted
+  --   as leading.
+  bvCountTrailingZeros :: (1 <= w) => sym -> SymBV sym w -> IO (SymBV sym w)
+
   -- | Unsigned add with overflow bit.
   addUnsignedOF :: (1 <= w)
                 => sym
@@ -857,8 +951,11 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
   addUnsignedOF sym x y = do
     -- Compute result
     r   <- bvAdd sym x y
-    -- Return that this overflows if x input value is greater than result.
-    (,) <$> bvUgt sym x r <*> pure r
+    -- Return that this overflows if r is less than either x or y
+    ovx  <- bvUlt sym r x
+    ovy  <- bvUlt sym r y
+    ov   <- orPred sym ovx ovy
+    return (ov, r)
 
   -- | Signed add with overflow bit. Overflow is true if positive +
   -- positive = negative, or if negative + negative = positive.
@@ -885,6 +982,18 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
     ov  <- orPred sym ov1 ov2
     return (ov, xy)
 
+  -- | Unsigned subtract with overflow bit. Overflow is true if x < y.
+  subUnsignedOF ::
+    (1 <= w) =>
+    sym ->
+    SymBV sym w ->
+    SymBV sym w ->
+    IO (Pred sym, SymBV sym w)
+  subUnsignedOF sym x y = do
+    xy <- bvSub sym x y
+    ov <- bvUlt sym x y
+    return (ov, xy)
+
   -- | Signed subtract with overflow bit. Overflow is true if positive
   -- - negative = negative, or if negative - positive = positive.
   subSignedOF :: (1 <= w)
@@ -899,6 +1008,41 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
        sxy <- bvIsNeg sym xy
        ov  <- join (pure (andPred sym) <*> xorPred sym sx sxy <*> xorPred sym sx sy)
        return (ov, xy)
+
+
+  -- | Compute the carryless multiply of the two input bitvectors.
+  --   This operation is essentially the same as a standard multiply, except that
+  --   the partial addends are simply XOR'd together instead of using a standard
+  --   adder.  This operation is useful for computing on GF(2^n) polynomials.
+  carrylessMultiply ::
+    (1 <= w) =>
+    sym ->
+    SymBV sym w ->
+    SymBV sym w ->
+    IO (SymBV sym (w+w))
+  carrylessMultiply sym x0 y0
+    | Just _  <- asUnsignedBV x0
+    , Nothing <- asUnsignedBV y0
+    = go y0 x0
+    | otherwise
+    = go x0 y0
+   where
+   go :: (1 <= w) => SymBV sym w -> SymBV sym w -> IO (SymBV sym (w+w))
+   go x y =
+    do let w = bvWidth x
+       let w2 = addNat w w
+       Just LeqProof <- return (testLeq (knownNat @1) w2)
+       Just LeqProof <- return (testLeq (addNat w (knownNat @1)) w2)
+       z  <- bvLit sym w2 0
+       x' <- bvZext sym w2 x
+       xs <- sequence [ do p <- testBitBV sym i y
+                           iteM bvIte sym
+                             p
+                             (bvShl sym x' =<< bvLit sym w2 (toInteger i))
+                             (return z)
+                      | i <- [ 0 .. natValue w - 1 ]
+                      ]
+       foldM (bvXorBits sym) z xs
 
   -- | @unsignedWideMultiplyBV sym x y@ multiplies two unsigned 'w' bit numbers 'x' and 'y'.
   --
@@ -921,9 +1065,34 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
        y'  <- bvZext sym dbl_w y
        s   <- bvMul sym x' y'
        lo  <- bvTrunc sym w s
-       n   <- bvLit sym dbl_w (natValue w)
+       n   <- bvLit sym dbl_w (intValue w)
        hi  <- bvTrunc sym w =<< bvLshr sym s n
        return (hi, lo)
+
+  -- | Compute the unsigned multiply of two values with overflow bit.
+  mulUnsignedOF ::
+    (1 <= w) =>
+    sym ->
+    SymBV sym w ->
+    SymBV sym w ->
+    IO (Pred sym, SymBV sym w)
+  mulUnsignedOF sym x y =
+    do let w = bvWidth x
+       let dbl_w = addNat w w
+       -- Add dynamic check to assert w' is positive to work around
+       -- Haskell typechecker limitation.
+       Just LeqProof <- return (isPosNat dbl_w)
+       -- Add dynamic check to assert w+1 <= 2*w.
+       Just LeqProof <- return (testLeq (incNat w) dbl_w)
+       x'  <- bvZext sym dbl_w x
+       y'  <- bvZext sym dbl_w y
+       s   <- bvMul sym x' y'
+       lo  <- bvTrunc sym w s
+
+       -- overflow if the result is greater than the max representable value in w bits
+       ov  <- bvUgt sym s =<< bvLit sym dbl_w (maxUnsigned w)
+
+       return (ov, lo)
 
   -- | @signedWideMultiplyBV sym x y@ multiplies two signed 'w' bit numbers 'x' and 'y'.
   --
@@ -949,6 +1118,32 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
        n   <- bvLit sym dbl_w (fromIntegral (widthVal w))
        hi  <- bvTrunc sym w =<< bvLshr sym s n
        return (hi, lo)
+
+  -- | Compute the signed multiply of two values with overflow bit.
+  mulSignedOF ::
+    (1 <= w) =>
+    sym ->
+    SymBV sym w ->
+    SymBV sym w ->
+    IO (Pred sym, SymBV sym w)
+  mulSignedOF sym x y =
+    do let w = bvWidth x
+       let dbl_w = addNat w w
+       -- Add dynamic check to assert dbl_w is positive to work around
+       -- Haskell typechecker limitation.
+       Just LeqProof <- return (isPosNat dbl_w)
+       -- Add dynamic check to assert w+1 <= 2*w.
+       Just LeqProof <- return (testLeq (incNat w) dbl_w)
+       x'  <- bvSext sym dbl_w x
+       y'  <- bvSext sym dbl_w y
+       s   <- bvMul sym x' y'
+       lo  <- bvTrunc sym w s
+
+       -- overflow if greater or less than max representable values
+       ov1 <- bvSlt sym s =<< bvLit sym dbl_w (minSigned w)
+       ov2 <- bvSgt sym s =<< bvLit sym dbl_w (maxSigned w)
+       ov  <- orPred sym ov1 ov2
+       return (ov, lo)
 
   ----------------------------------------------------------------------
   -- Struct operations
@@ -1615,11 +1810,11 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
 
   -- | Check IEEE non-equality of two floating point numbers.
   --
-  --   NOTE! This test returns true if either value is @NaN@; in particular
-  --   @NaN@ is not equal to itself!  Moreover, positive and negative 0 will
-  --   compare equal, despite having different bit patterns.
-  --   This test is most appropriate for interpreting the non-equalty tests of
-  --   typical languages using floating point.
+  --   NOTE! This test returns false if either value is @NaN@; in particular
+  --   @NaN@ is not distinct from any other value!  Moreover, positive and
+  --   negative 0 will not compare distinct, despite having different
+  --   bit patterns.  This test is most appropriate for interpreting
+  --   the non-equalty tests of typical languages using floating point.
   floatFpNe
     :: sym
     -> SymFloat sym fpp
@@ -1677,14 +1872,33 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
     -> RoundingMode
     -> SymFloat sym fpp'
     -> IO (SymFloat sym fpp)
+  -- | Round a floating point number to an integral value.
+  floatRound
+    :: sym
+    -> RoundingMode
+    -> SymFloat sym fpp
+    -> IO (SymFloat sym fpp)
   -- | Convert from binary representation in IEEE 754-2008 format to
   --   floating point.
   floatFromBinary
-    :: (1 <= eb, 1 <= sb)
+    :: (2 <= eb, 2 <= sb)
     => sym
-    -> FloatPrecisionRepr (FloatingPointPrecision sb eb)
-    -> SymBV sym (sb + eb)
-    -> IO (SymFloat sym (FloatingPointPrecision sb eb))
+    -> FloatPrecisionRepr (FloatingPointPrecision eb sb)
+    -> SymBV sym (eb + sb)
+    -> IO (SymFloat sym (FloatingPointPrecision eb sb))
+  -- | Convert from floating point from to the binary representation in
+  --   IEEE 754-2008 format.
+  --
+  --   NOTE! @NaN@ has multiple representations, i.e. all bit patterns where
+  --   the exponent is @0b1..1@ and the significant is not @0b0..0@.
+  --   This functions returns the representation of positive "quiet" @NaN@,
+  --   i.e. the bit pattern where the sign is @0b0@, the exponent is @0b1..1@,
+  --   and the significant is @0b10..0@.
+  floatToBinary
+    :: (2 <= eb, 2 <= sb)
+    => sym
+    -> SymFloat sym (FloatingPointPrecision eb sb)
+    -> IO (SymBV sym (eb + sb))
   -- | Convert a unsigned bitvector to a floating point number.
   bvToFloat
     :: (1 <= w)
@@ -1708,7 +1922,7 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
     -> RoundingMode
     -> SymReal sym
     -> IO (SymFloat sym fpp)
-  -- | Convert a unsigned bitvector to a floating point number.
+  -- | Convert a floating point number to a unsigned bitvector.
   floatToBV
     :: (1 <= w)
     => sym
@@ -1716,7 +1930,7 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
     -> RoundingMode
     -> SymFloat sym fpp
     -> IO (SymBV sym w)
-  -- | Convert a signed bitvector to a floating point number.
+  -- | Convert a floating point number to a signed bitvector.
   floatToSBV
     :: (1 <= w)
     => sym
@@ -1971,6 +2185,74 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
     pj <- realNe sym xi yi
     orPred sym pr pj
 
+-- | This newtype is necessary for @bvJoinVector@ and @bvSplitVector@.
+-- These both use functions from Data.Parameterized.Vector that
+-- that expect a wrapper of kind (Type -> Type), and we can't partially
+-- apply the type synonym (e.g. SymBv sym), whereas we can partially
+-- apply this newtype.
+newtype SymBV' sym w = MkSymBV' (SymBV sym w)
+
+-- | Join a @Vector@ of smaller bitvectors
+bvJoinVector :: forall sym n w. (1 <= w, IsExprBuilder sym)
+             => sym
+             -> NatRepr w
+             -> Vector.Vector n (SymBV sym w)
+             -> IO (SymBV sym (n * w))
+bvJoinVector sym w =
+  coerce $ Vector.joinWithM @IO @(SymBV' sym) @n bvConcat' w
+  where bvConcat' :: forall l. (1 <= l)
+                  => NatRepr l
+                  -> SymBV' sym w
+                  -> SymBV' sym l
+                  -> IO (SymBV' sym (w + l))
+        bvConcat' _ (MkSymBV' x) (MkSymBV' y) = MkSymBV' <$> bvConcat sym x y
+
+-- | Split a bitvector to a @Vector@ of smaller bitvectors
+bvSplitVector :: forall sym n w. (IsExprBuilder sym, 1 <= w, 1 <= n)
+              => sym
+              -> NatRepr n
+              -> NatRepr w
+              -> SymBV sym (n * w)
+              -> IO (Vector.Vector n (SymBV sym w))
+bvSplitVector sym n w x =
+  coerce $ Vector.splitWithA @IO LittleEndian bvSelect' n w (MkSymBV' @sym x)
+  where
+    bvSelect' :: forall i. (i + w <= n * w)
+              => NatRepr (n * w)
+              -> NatRepr i
+              -> SymBV' sym (n * w)
+              -> IO (SymBV' sym w)
+    bvSelect' _ i (MkSymBV' y) =
+      fmap MkSymBV' $ bvSelect @_ @i @w sym i w y
+
+-- | Implement LLVM's "bswap" intrinsic
+--
+-- See <https://llvm.org/docs/LangRef.html#llvm-bswap-intrinsics
+--       the LLVM @bswap@ documentation.>
+--
+-- This is the implementation in SawCore:
+--
+-- > llvmBSwap :: (n :: Nat) -> bitvector (mulNat n 8) -> bitvector (mulNat n 8);
+-- > llvmBSwap n x = join n 8 Bool (reverse n (bitvector 8) (split n 8 Bool x));
+bvSwap :: forall sym n. (1 <= n, IsExprBuilder sym)
+       => sym               -- ^ Symbolic interface
+       -> NatRepr n
+       -> SymBV sym (n*8)   -- ^ Bitvector to swap around
+       -> IO (SymBV sym (n*8))
+bvSwap sym n v = do
+  bvJoinVector sym (knownNat @8) . Vector.reverse
+    =<< bvSplitVector sym n (knownNat @8) v
+
+-- | Swap the order of the bits in a bitvector.
+bvBitreverse :: forall sym w.
+  (1 <= w, IsExprBuilder sym) =>
+  sym ->
+  SymBV sym w ->
+  IO (SymBV sym w)
+bvBitreverse sym v = do
+  bvJoinVector sym (knownNat @1) . Vector.reverse
+    =<< bvSplitVector sym (bvWidth v) (knownNat @1) v
+
 -- | Rounding modes for IEEE-754 floating point operations.
 data RoundingMode
   = RNE -- ^ Round to nearest even.
@@ -1978,7 +2260,7 @@ data RoundingMode
   | RTP -- ^ Round toward plus Infinity.
   | RTN -- ^ Round toward minus Infinity.
   | RTZ -- ^ Round toward zero.
-  deriving (Eq, Generic, Ord, Show)
+  deriving (Eq, Generic, Ord, Show, Enum)
 
 instance Hashable RoundingMode
 
@@ -2002,7 +2284,7 @@ iteM ite sym p mx my = do
 --
 -- This type is used by some methods in classes 'IsExprBuilder' and
 -- 'IsSymExprBuilder'.
-type family SymFn sym :: Ctx BaseType -> BaseType -> *
+type family SymFn sym :: Ctx BaseType -> BaseType -> Type
 
 -- | A class for extracting type representatives from symbolic functions
 class IsSymFn fn where
@@ -2027,6 +2309,27 @@ class ( IsExprBuilder sym
 
   -- | Create a fresh latch variable.
   freshLatch    :: sym -> SolverSymbol -> BaseTypeRepr tp -> IO (SymExpr sym tp)
+
+  -- | Create a fresh bitvector value with optional upper and lower bounds (which bound the
+  --   unsigned value of the bitvector).
+  freshBoundedBV :: (1 <= w) => sym -> SolverSymbol -> NatRepr w -> Maybe Natural -> Maybe Natural -> IO (SymBV sym w)
+
+  -- | Create a fresh bitvector value with optional upper and lower bounds (which bound the
+  --   signed value of the bitvector)
+  freshBoundedSBV :: (1 <= w) => sym -> SolverSymbol -> NatRepr w -> Maybe Integer -> Maybe Integer -> IO (SymBV sym w)
+
+  -- | Create a fresh natural number constant with optional upper and lower bounds.
+  --   If provided, the bounds are inclusive.
+  freshBoundedNat :: sym -> SolverSymbol -> Maybe Natural -> Maybe Natural -> IO (SymNat sym)
+
+  -- | Create a fresh integer constant with optional upper and lower bounds.
+  --   If provided, the bounds are inclusive.
+  freshBoundedInt :: sym -> SolverSymbol -> Maybe Integer -> Maybe Integer -> IO (SymInteger sym)
+
+  -- | Create a fresh real constant with optional upper and lower bounds.
+  --   If provided, the bounds are inclusive.
+  freshBoundedReal :: sym -> SolverSymbol -> Maybe Rational -> Maybe Rational -> IO (SymReal sym)
+
 
   ----------------------------------------------------------------------
   -- Functions needs to support quantifiers.
@@ -2363,10 +2666,10 @@ concreteToSym sym = \case
 {- | This function is used for selecting a value from among potential
 values in a range.
 
-'muxIntegerRange p ite f l h' returns an expression denoting the value obtained
-from the value 'f i' where 'i' is the smallest value in the range '[l..h]'
-such that 'p i' is true.  If 'p i' is true for no such value then,
-this returns the value 'f h'. -}
+@muxIntegerRange p ite f l h@ returns an expression denoting the value obtained
+from the value @f i@ where @i@ is the smallest value in the range @[l..h]@
+such that @p i@ is true.  If @p i@ is true for no such value, then
+this returns the value @f h@. -}
 muxIntegerRange :: Monad m
                 => (Integer -> m (e BaseBoolType))
                    -- ^ Returns predicate that holds if we have found the value we are looking
@@ -2394,3 +2697,22 @@ data SymEncoder sym v tp
                 , symFromExpr :: !(sym -> SymExpr sym tp -> IO v)
                 , symToExpr   :: !(sym -> v -> IO (SymExpr sym tp))
                 }
+
+----------------------------------------------------------------------
+-- Statistics
+
+-- | Statistics gathered on a running expression builder.  See
+-- 'getStatistics'.
+data Statistics
+  = Statistics { statAllocs :: !Integer
+                 -- ^ The number of times an expression node has been
+                 -- allocated.
+               , statNonLinearOps :: !Integer
+                 -- ^ The number of non-linear operations, such as
+                 -- multiplications, that have occurred.
+               }
+  deriving ( Show )
+
+zeroStatistics :: Statistics
+zeroStatistics = Statistics { statAllocs = 0
+                            , statNonLinearOps = 0 }

@@ -1,28 +1,34 @@
 ------------------------------------------------------------------------
 -- |
 -- Module           : What4.Protocol.SMTLib2
--- Description      : Inteface for solvers that consume SMTLib2
+-- Description      : Interface for solvers that consume SMTLib2
 -- Copyright        : (c) Galois, Inc 2014-2016
 -- License          : BSD3
 -- Maintainer       : Rob Dockins <rdockins@galois.com>
 -- Stability        : provisional
 --
--- This module defines operations for producing SMTLib2-compatible queries
--- useful for interfacing with solvers that accecpt SMTLib2 as an input language.
+-- This module defines operations for producing SMTLib2-compatible
+-- queries useful for interfacing with solvers that accecpt SMTLib2 as
+-- an input language.
 ------------------------------------------------------------------------
-
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 module What4.Protocol.SMTLib2
   ( -- SMTLib special purpose exports
     Writer
@@ -30,26 +36,34 @@ module What4.Protocol.SMTLib2
   , newWriter
   , writeCheckSat
   , writeExit
-  , Expr
   , writeGetValue
   , runCheckSat
-  , unType
-  , arraySelect1
-  , arrayUpdate1
-  , arrayType1
+  , asSMT2Type
+  , setOption
+  , setProduceModels
     -- * Logic
-  , Logic(..)
-  , qf_bv
+  , SMT2.Logic(..)
+  , SMT2.qf_bv
+  , SMT2.allSupported
   , all_supported
   , setLogic
-    -- * Option
-  , Option(..)
-  , produceModels
-  , ppDecimal
-  , setOption
+    -- * Type
+  , SMT2.Sort(..)
+  , SMT2.arraySort
+  , structSort
+    -- * Term
+  , Term(..)
+  , arrayConst
+  , What4.Protocol.SMTLib2.arraySelect
+  , arrayStore
     -- * Solvers and External interface
   , Session(..)
+  , SMTLib2GenericSolver(..)
   , writeDefaultSMT2
+  , startSolver
+  , shutdownSolver
+  , smtAckResult
+  , SMTLib2Exception(..)
     -- * Re-exports
   , SMTWriter.WriterConn
   , SMTWriter.assume
@@ -59,13 +73,16 @@ import           Control.Applicative
 import           Control.Exception
 import           Control.Monad.State.Strict
 import           Data.Bits (bit, setBit, shiftL)
-import           Data.Char(digitToInt)
+import           Data.Char (digitToInt)
 import           Data.IORef
-import qualified Data.ByteString.UTF8 as UTF8
+import qualified Data.Text as Text
+import qualified Data.Text.Lazy as Lazy
 import qualified Data.Map.Strict as Map
 import           Data.Monoid
-import           Data.Parameterized.NatRepr
 import qualified Data.Parameterized.Context as Ctx
+import           Data.Parameterized.NatRepr
+import           Data.Parameterized.Some
+import           Data.Parameterized.TraversableFC
 import           Data.Ratio
 import           Data.Set (Set)
 import qualified Data.Set as Set
@@ -73,60 +90,56 @@ import           Data.String
 import           Data.Text (Text)
 import           Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
-import           Data.Text.Lazy.Builder.Int (decimal)
+import qualified Data.Text.Lazy.Builder.Int as Builder
 import           Numeric (readDec, readHex, readInt)
+import           Numeric.Natural
+import qualified System.Exit as Exit
 import qualified System.IO as IO
 import qualified System.IO.Streams as Streams
-import qualified System.IO.Streams.Attoparsec as Streams
+import qualified System.IO.Streams.Attoparsec.Text as Streams
+import qualified System.Process as Process
 
 import           Prelude hiding (writeFile)
 
 import           What4.BaseTypes
-import           What4.SatResult
 import qualified What4.Expr.Builder as B
 import           What4.Expr.GroundEval
+import qualified What4.Interface as I
 import           What4.ProblemFeatures
+import           What4.Protocol.Online
 import           What4.Protocol.ReadDecimal
 import           What4.Protocol.SExp
+import           What4.Protocol.SMTLib2.Syntax (Term, term_app, un_app, bin_app)
+
+import qualified What4.Protocol.SMTLib2.Syntax as SMT2 hiding (Term)
 import qualified What4.Protocol.SMTWriter as SMTWriter
-import           What4.Protocol.SMTWriter hiding (assume)
-
-
-------------------------------------------------------------------------
-readBin :: Num a => ReadS a
-readBin = readInt 2 (`elem` ("01" :: String)) digitToInt
-
-------------------------------------------------------------------------
--- Logic
-
-newtype Logic = Logic Builder
-
-qf_bv :: Logic
-qf_bv = Logic "QF_BV"
+import           What4.Protocol.SMTWriter hiding (assume, Term)
+import           What4.SatResult
+import           What4.Utils.HandleReader
+import           What4.Utils.Process
+import           What4.Solver.Adapter
 
 -- | Set the logic to all supported logics.
-all_supported :: Logic
-all_supported = Logic "ALL_SUPPORTED"
+all_supported :: SMT2.Logic
+all_supported = SMT2.allSupported
+{-# DEPRECATED all_supported "Use allSupported" #-}
 
 ------------------------------------------------------------------------
--- Type
+-- Floating point
 
-arrayType1 :: SMTLib2Tweaks a => a -> SMT_Type -> Builder -> Builder
-arrayType1 tweaks i v = "(Array " <> unType tweaks i <> " " <> v <> ")"
+data SMTFloatPrecision =
+  SMTFloatPrecision { smtFloatExponentBits :: !Natural
+                      -- ^ Number of bits in exponent
+                    , smtFloatSignificandBits :: !Natural
+                      -- ^ Number of bits in the significand.
+                    }
+  deriving (Eq, Ord)
 
-unType :: SMTLib2Tweaks a => a -> SMT_Type -> Builder
-unType _ SMT_BoolType    = "Bool"
-unType _ (SMT_BVType w)  =  "(_ BitVec " <> fromString (show w) <> ")"
-unType _ SMT_IntegerType = "Int"
-unType _ SMT_RealType    = "Real"
-unType _ (SMT_FloatType fpp) = mkFloatSymbol "FloatingPoint" fpp
-unType a (SMT_ArrayType i e) = smtlib2arrayType a i e
-unType a (SMT_StructType flds) = "(Struct" <> decimal n <> foldMap f flds <> ")"
-  where f :: SMT_Type -> Builder
-        f tp = " " <> unType a tp
-        n = length flds
-unType _ SMT_FnType{} =
-  error "SMTLIB backend does not support function types as first class."
+asSMTFloatPrecision :: FloatPrecisionRepr fpp -> SMTFloatPrecision
+asSMTFloatPrecision (FloatingPointPrecisionRepr eb sb) =
+  SMTFloatPrecision { smtFloatExponentBits = natValue eb
+                    , smtFloatSignificandBits = natValue sb
+                    }
 
 mkFloatSymbol :: Builder -> SMTFloatPrecision -> Builder
 mkFloatSymbol nm (SMTFloatPrecision eb sb) =
@@ -137,44 +150,27 @@ mkFloatSymbol nm (SMTFloatPrecision eb sb) =
     <> " "
     <> fromString (show sb)
     <> ")"
-mkRoundingOp :: Builder -> RoundingMode -> Builder
-mkRoundingOp op r = op <> " " <> fromString (show r)
 
 ------------------------------------------------------------------------
--- Expr
+-- SMTLib2Tweaks
 
-newtype Writer a = Writer { declaredTuples :: IORef (Set Int) }
+-- | Select a valued from a nested array
+nestedArrayUpdate :: Term
+                  -> (Term, [Term])
+                  -> Term
+                  -> Term
+nestedArrayUpdate a (h,[]) v  = SMT2.store a h v
+nestedArrayUpdate a (h,i:l) v = SMT2.store a h sub_a'
+  where sub_a' = nestedArrayUpdate (SMT2.select a h) (i,l) v
 
-type Expr a = Term (Writer a)
+arrayConst :: SMT2.Sort -> SMT2.Sort -> Term -> Term
+arrayConst = SMT2.arrayConst
 
-instance IsString (Term (Writer a)) where
-  fromString = T . fromString
+arraySelect :: Term -> Term -> Term
+arraySelect = SMT2.select
 
-instance SMTLib2Tweaks a => Num (Expr a) where
-  (+) = bin_app "+"
-  (-) = bin_app "-"
-  (*) = bin_app "*"
-  negate x = term_app "-" [x]
-  abs x    = ite (x .>= 0) x (negate x)
-  signum x = ite (x .== 0) 0 (ite (x .> 0) 1 (negate 1))
-  fromInteger i | i >= 0 = T $ decimal i
-                | otherwise = negate (T (decimal (negate i)))
-
-varBinding :: SMTLib2Tweaks a => a -> Text -> SMT_Type -> Builder
-varBinding a nm tp = app_list (Builder.fromText nm) [unType a tp]
-
-letBinding :: Text -> Term h -> Builder
-letBinding nm t = app_list (Builder.fromText nm) [renderTerm t]
-
-binder_app :: Builder -> [Builder] -> Term h -> Term h
-binder_app _  []    t = t
-binder_app nm (h:r) t = T (app nm [app_list h r, renderTerm t])
-
-arraySelect1 :: Expr a -> Expr a -> Expr a
-arraySelect1 = bin_app "select"
-
-arrayUpdate1 :: Expr a -> Expr a -> Expr a -> Expr a
-arrayUpdate1 a i v = term_app "store" [a,i,v]
+arrayStore :: Term -> Term -> Term -> Term
+arrayStore = SMT2.store
 
 -- | This class exists so that solvers supporting the SMTLib2 format can support
 --   features that go slightly beyond the standard.
@@ -194,42 +190,84 @@ class SMTLib2Tweaks a where
   --
   -- By default, we encode symbolic arrays using a nested representation.  If the solver,
   -- supports tuples/structs it may wish to change this.
-  smtlib2arrayType :: a -> [SMT_Type] -> SMT_Type -> Builder
-  smtlib2arrayType a i r = foldr (arrayType1 a) (unType a r) i
+  smtlib2arrayType :: [SMT2.Sort] -> SMT2.Sort -> SMT2.Sort
+  smtlib2arrayType l r = foldr (\i v -> SMT2.arraySort i v) r l
 
-  smtlib2arrayConstant :: Maybe ([SMT_Type] -> SMT_Type -> Expr a -> Expr a)
+  smtlib2arrayConstant :: Maybe ([SMT2.Sort] -> SMT2.Sort -> Term -> Term)
   smtlib2arrayConstant = Nothing
 
-  smtlib2arraySelect :: Term (Writer a) -> [Term (Writer a)] -> Term (Writer a)
+  smtlib2arraySelect :: Term -> [Term] -> Term
   smtlib2arraySelect a [] = a
-  smtlib2arraySelect a (h:l) = smtlib2arraySelect (arraySelect1 a h) l
+  smtlib2arraySelect a (h:l) = smtlib2arraySelect @a (What4.Protocol.SMTLib2.arraySelect a h) l
 
-  smtlib2arrayUpdate :: Term (Writer a) -> [Term (Writer a)] -> Expr a -> Term (Writer a)
+  smtlib2arrayUpdate :: Term -> [Term] -> Term -> Term
   smtlib2arrayUpdate a i v =
     case i of
       [] -> error "arrayUpdate given empty list"
-      i1:ir -> nestedArrayUpdate  a (i1,ir) v
+      i1:ir -> nestedArrayUpdate a (i1, ir) v
+
+-- | A struct with the given fields.
+--
+-- This uses SMTLIB2 datatypes and are not primitive to the language.
+structSort :: [SMT2.Sort] -> SMT2.Sort
+structSort flds = SMT2.Sort $ "(Struct" <> Builder.decimal n <> foldMap f flds <> ")"
+  where f :: SMT2.Sort -> Builder
+        f (SMT2.Sort s) = " " <> s
+        n = length flds
+
+asSMT2Type :: forall a tp . SMTLib2Tweaks a => TypeMap tp -> SMT2.Sort
+asSMT2Type BoolTypeMap    = SMT2.boolSort
+asSMT2Type NatTypeMap     = SMT2.intSort
+asSMT2Type IntegerTypeMap = SMT2.intSort
+asSMT2Type RealTypeMap    = SMT2.realSort
+asSMT2Type (BVTypeMap w)  = SMT2.bvSort (natValue w)
+asSMT2Type (FloatTypeMap fpp) = SMT2.Sort $ mkFloatSymbol "FloatingPoint" (asSMTFloatPrecision fpp)
+asSMT2Type ComplexToStructTypeMap =
+  structSort [ SMT2.realSort, SMT2.realSort ]
+asSMT2Type ComplexToArrayTypeMap =
+  smtlib2arrayType @a [SMT2.boolSort] SMT2.realSort
+asSMT2Type (PrimArrayTypeMap i r) =
+  smtlib2arrayType @a (toListFC (asSMT2Type @a) i) (asSMT2Type @a r)
+asSMT2Type (FnArrayTypeMap _ _) =
+  error "SMTLIB backend does not support function types as first class."
+asSMT2Type (StructTypeMap f) =
+  structSort (toListFC (asSMT2Type @a) f)
 
 -- Default instance.
 instance SMTLib2Tweaks () where
   smtlib2tweaks = ()
 
-toIntegerTerm :: SMTLib2Tweaks a => Integer -> Expr a
-toIntegerTerm x | x >= 0    = T $ decimal x
-                | otherwise = negate (T (decimal (negate x)))
+------------------------------------------------------------------------
+readBin :: Num a => ReadS a
+readBin = readInt 2 (`elem` ("01" :: String)) digitToInt
 
-toRealTerm :: SMTLib2Tweaks a => Integer -> Expr a
-toRealTerm x | x >= 0    = T $ decimal x <> ".0"
-             | otherwise = negate (T (decimal (negate x) <> ".0"))
+------------------------------------------------------------------------
+-- Type
 
--- | Select a valued from a nested array
-nestedArrayUpdate :: Expr a -> (Expr a, [Expr a]) -> Expr a -> Expr a
-nestedArrayUpdate a (h,[]) v = arrayUpdate1 a h v
-nestedArrayUpdate a (h,i:l) v = arrayUpdate1 a h sub_a'
-  where sub_a' = nestedArrayUpdate (arraySelect1 a h) (i,l) v
+mkRoundingOp :: Builder -> RoundingMode -> Builder
+mkRoundingOp op r = op <> " " <> fromString (show r)
 
-exprTweaks :: SMTLib2Tweaks a => f (Writer a) -> a
-exprTweaks _ = smtlib2tweaks
+------------------------------------------------------------------------
+-- Writer
+
+newtype Writer a = Writer { declaredTuples :: IORef (Set Int) }
+
+type instance SMTWriter.Term (Writer a) = Term
+
+instance Num Term where
+  x + y = SMT2.add [x, y]
+  x - y = SMT2.sub x [y]
+  x * y = SMT2.mul [x, y]
+  negate x = SMT2.negate x
+  abs x    = SMT2.ite (SMT2.ge [x, SMT2.numeral 0]) x (SMT2.negate x)
+  signum x =
+    SMT2.ite (SMT2.ge [x, SMT2.numeral 0])
+             (SMT2.ite (SMT2.eq [x, SMT2.numeral 0]) (SMT2.numeral 0) (SMT2.numeral 1))
+             (SMT2.negate (SMT2.numeral 1))
+  fromInteger = SMT2.numeral
+
+varBinding :: forall a . SMTLib2Tweaks a => (Text, Some TypeMap) -> (Text, SMT2.Sort)
+varBinding (nm, Some tp) = (nm, asSMT2Type @a tp)
 
 -- The SMTLIB2 exporter uses the datatypes theory for representing structures.
 --
@@ -239,103 +277,80 @@ exprTweaks _ = smtlib2tweaks
 -- formula, the SMTLIB2 backend defines a datatype "StructXX" with the
 -- constructor "mk-structXX", and projection operations "structXX-projII"
 -- for II an natural number less than XX.
-instance SMTLib2Tweaks a => SupportTermOps (Expr a) where
-  boolExpr b = T $ if b then "true" else "false"
-  notExpr x = term_app "not" [x]
+instance SupportTermOps Term where
+  boolExpr b = if b then SMT2.true else SMT2.false
+  notExpr = SMT2.not
 
-  andAll [] = T "true"
-  andAll [x] = x
-  andAll xs = term_app "and" xs
+  andAll = SMT2.and
+  orAll  = SMT2.or
 
-  orAll [] = T "false"
-  orAll [x] = x
-  orAll xs = term_app "or" xs
+  x .== y = SMT2.eq [x,y]
+  x ./= y = SMT2.distinct [x,y]
 
-  (.==) = bin_app "="
-  (./=) = bin_app "distinct"
+  letExpr = SMT2.letBinder
 
-  forallExpr vars t  =
-    binder_app "forall" (uncurry (varBinding (exprTweaks t)) <$> vars) t
-  existsExpr vars t  =
-    binder_app "exists" (uncurry (varBinding (exprTweaks t)) <$> vars) t
-  letExpr [] r = r
-  letExpr ((nm,t):vars) r =
-    T (app "let" [app_list (letBinding nm t) [], renderTerm (letExpr vars r)])
+  ite = SMT2.ite
 
-  ite c x y = term_app "ite" [c, x, y]
+  sumExpr = SMT2.add
 
-  sumExpr [] = 0
-  sumExpr [e] = e
-  sumExpr l = term_app "+" l
+  termIntegerToReal = SMT2.toReal
+  termRealToInteger = SMT2.toInt
 
-  termIntegerToReal x = term_app "to_real" [x]
-  termRealToInteger x = term_app "to_int"  [x]
-
-  integerTerm i = toIntegerTerm i
-
-  intDiv x y = term_app "div" [x,y]
-  intMod x y = term_app "mod" [x,y]
-  intAbs x   = term_app "abs" [x]
+  integerTerm = SMT2.numeral
+  intDiv x y = SMT2.div x [y]
+  intMod = SMT2.mod
+  intAbs     = SMT2.abs
 
   intDivisible x 0 = x .== integerTerm 0
   intDivisible x k = intMod x (integerTerm (toInteger k)) .== 0
 
-  rationalTerm r | d == 1 = toRealTerm n
-                 | otherwise = term_app "/" [toRealTerm n, toRealTerm d]
+  rationalTerm r | d == 1    = SMT2.decimal n
+                 | otherwise = (SMT2.decimal n) SMT2../ [SMT2.decimal d]
     where n = numerator r
           d = denominator r
 
-  (.<)  = bin_app "<"
-  (.<=) = bin_app "<="
-  (.>)  = bin_app ">"
-  (.>=) = bin_app ">="
+  x .<  y = SMT2.lt [x,y]
+  x .<= y = SMT2.le [x,y]
+  x .>  y = SMT2.gt [x,y]
+  x .>= y = SMT2.ge [x,y]
 
-  bvTerm w u = bin_app "_" (fromString ("bv" ++ show d)) (fromString (show w))
-    where d | u >= 0 = u
-            | otherwise = 2^(widthVal w) + u
+  bvTerm w u = SMT2.bvdecimal u (natValue w)
 
-  bvNeg x = term_app "bvneg" [x]
-  bvAdd = bin_app "bvadd"
-  bvSub = bin_app "bvsub"
-  bvMul = bin_app "bvmul"
+  bvNeg = SMT2.bvneg
+  bvAdd x y = SMT2.bvadd x [y]
+  bvSub = SMT2.bvsub
+  bvMul x y = SMT2.bvmul x [y]
 
-  bvSLe = bin_app "bvsle"
-  bvULe = bin_app "bvule"
+  bvSLe = SMT2.bvsle
+  bvULe = SMT2.bvule
 
-  bvSLt = bin_app "bvslt"
-  bvULt = bin_app "bvult"
+  bvSLt = SMT2.bvslt
+  bvULt = SMT2.bvult
 
-  bvUDiv = bin_app "bvudiv"
-  bvURem = bin_app "bvurem"
-  bvSDiv = bin_app "bvsdiv"
-  bvSRem = bin_app "bvsrem"
+  bvUDiv = SMT2.bvudiv
+  bvURem = SMT2.bvurem
+  bvSDiv = SMT2.bvsdiv
+  bvSRem = SMT2.bvsrem
 
-  bvAnd  = bin_app "bvand"
-  bvOr   = bin_app "bvor"
-  bvXor  = bin_app "bvxor"
+  bvNot = SMT2.bvnot
+  bvAnd x y = SMT2.bvand x [y]
+  bvOr  x y = SMT2.bvor  x [y]
+  bvXor x y = SMT2.bvxor x [y]
 
-  bvNot x = term_app "bvnot" [x]
+  bvShl  = SMT2.bvshl
+  bvLshr = SMT2.bvlshr
+  bvAshr = SMT2.bvashr
 
-  bvShl  = bin_app "bvshl"
-  bvLshr = bin_app "bvlshr"
-  bvAshr = bin_app "bvashr"
+  bvConcat = SMT2.concat
 
-  bvConcat = bin_app "concat"
+  bvExtract _ b n x | n > 0 = SMT2.extract (b+n-1) b x
+                    | otherwise = error $ "bvExtract given non-positive width " ++ show n
 
-  bvExtract _ b n x = assert (n > 0) $
-    let -- Get index of bit to end at (least-significant bit has index 0)
-        end =  b+n-1
-        -- Get index of bit to start at (least-significant bit has index 0)
-        begin = b
-        e = "(_ extract " <> decimal end <> " " <> decimal begin <> ")"
-     in  term_app e [x]
-
-
-  floatPZero fpp = term_app (mkFloatSymbol "+zero" fpp) []
-  floatNZero fpp = term_app (mkFloatSymbol "-zero" fpp) []
-  floatNaN fpp   = term_app (mkFloatSymbol "NaN" fpp) []
-  floatPInf fpp  = term_app (mkFloatSymbol "+oo" fpp) []
-  floatNInf fpp  = term_app (mkFloatSymbol "-oo" fpp) []
+  floatPZero fpp = term_app (mkFloatSymbol "+zero" (asSMTFloatPrecision fpp)) []
+  floatNZero fpp = term_app (mkFloatSymbol "-zero" (asSMTFloatPrecision fpp)) []
+  floatNaN fpp   = term_app (mkFloatSymbol "NaN"   (asSMTFloatPrecision fpp)) []
+  floatPInf fpp  = term_app (mkFloatSymbol "+oo"   (asSMTFloatPrecision fpp)) []
+  floatNInf fpp  = term_app (mkFloatSymbol "-oo"   (asSMTFloatPrecision fpp)) []
 
   floatNeg  = un_app "fp.neg"
   floatAbs  = un_app "fp.abs"
@@ -351,7 +366,7 @@ instance SMTLib2Tweaks a => SupportTermOps (Expr a) where
 
   floatFMA r x y z = term_app (mkRoundingOp "fp.fma" r) [x, y, z]
 
-  floatEq   = bin_app "="
+  floatEq x y  = SMT2.eq [x,y]
   floatFpEq = bin_app "fp.eq"
   floatLe   = bin_app "fp.leq"
   floatLt   = bin_app "fp.lt"
@@ -364,80 +379,48 @@ instance SMTLib2Tweaks a => SupportTermOps (Expr a) where
   floatIsSubnorm  = un_app "fp.isSubnormal"
   floatIsNorm     = un_app "fp.isNormal"
 
-  floatCast fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" fpp) r
-  floatFromBinary fpp = un_app $ mkFloatSymbol "to_fp" fpp
+  floatCast fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" (asSMTFloatPrecision fpp)) r
+  floatRound r = un_app $ mkRoundingOp "fp.roundToIntegral" r
+  floatFromBinary fpp = un_app $ mkFloatSymbol "to_fp" (asSMTFloatPrecision fpp)
   bvToFloat fpp r =
-    un_app $ mkRoundingOp (mkFloatSymbol "to_fp_unsigned" fpp) r
-  sbvToFloat fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" fpp) r
-  realToFloat fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" fpp) r
+    un_app $ mkRoundingOp (mkFloatSymbol "to_fp_unsigned" (asSMTFloatPrecision fpp)) r
+  sbvToFloat fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" (asSMTFloatPrecision fpp)) r
+  realToFloat fpp r = un_app $ mkRoundingOp (mkFloatSymbol "to_fp" (asSMTFloatPrecision fpp)) r
 
   floatToBV w r =
-    un_app $ mkRoundingOp ("(fp.to_ubv " <> fromString (show w) <> ")") r
+    un_app $ mkRoundingOp ("(_ fp.to_ubv " <> fromString (show w) <> ")") r
   floatToSBV w r =
-    un_app $ mkRoundingOp ("(fp.to_sbv " <> fromString (show w) <> ")") r
+    un_app $ mkRoundingOp ("(_ fp.to_sbv " <> fromString (show w) <> ")") r
 
   floatToReal = un_app "fp.to_real"
 
+  realIsInteger = SMT2.isInt
 
-  arrayConstant = smtlib2arrayConstant
-  arraySelect   = smtlib2arraySelect
-  arrayUpdate   = smtlib2arrayUpdate
-
+  realSin = un_app "sin"
+  realCos = un_app "cos"
+  realATan2 = bin_app "atan2"
+  realSinh = un_app "sinh"
+  realCosh = un_app "cosh"
+  realExp = un_app "exp"
+  realLog = un_app "log"
 
   structCtor args = term_app nm args
-    where nm = "mk-struct" <> decimal (length args)
+    where nm = "mk-struct" <> Builder.decimal (length args)
 
   structFieldSelect n a i = term_app nm [a]
-    where nm = "struct" <> decimal n <> "-proj" <> decimal i
+    where nm = "struct" <> Builder.decimal n <> "-proj" <> Builder.decimal i
 
-  realIsInteger x = term_app "is_int" [x]
+  smtFnApp nm args = term_app (SMT2.renderTerm nm) args
 
-  realSin x = term_app "sin" [x]
-  realCos x = term_app "cos" [x]
-  realATan2 = bin_app "atan2"
-  realSinh x = term_app "sinh" [x]
-  realCosh x = term_app "cosh" [x]
-  realExp x = term_app "exp" [x]
-  realLog x = term_app "log" [x]
-
-  smtFnApp nm args = term_app (renderTerm nm) args
-
-------------------------------------------------------------------------
--- Option
-
-newtype Option = Option Builder
-
--- | Option to produce models.
-produceModels :: Bool -> Option
-produceModels b = Option (":produce-models " <> ppBool b)
-
-ppDecimal :: Bool -> Option
-ppDecimal b = Option (":pp.decimal " <> ppBool b)
-
-ppBool :: Bool -> Builder
-ppBool True  = "true"
-ppBool False = "false"
-
-------------------------------------------------------------------------
--- Command
-
-set_logic :: Logic -> Command (Writer a)
-set_logic (Logic nm) = Cmd $ app "set-logic" [nm]
-
-setOptionCommand :: Option -> Command (Writer a)
-setOptionCommand (Option nm) = Cmd $ app "set-option" [nm]
-
-checkSatCommand :: Command (Writer a)
-checkSatCommand = Cmd "(check-sat)"
-
-getValueCommand :: [Expr a] -> Command (Writer a)
-getValueCommand values = Cmd $ app "get-value" [builder_list (renderTerm <$> values)]
+  fromText t = SMT2.T (Builder.fromText t)
 
 ------------------------------------------------------------------------
 -- Writer
 
 newWriter :: a
-          -> IO.Handle
+          -> Streams.OutputStream Text
+          -> AcknowledgementAction t (Writer a)
+             -- ^ Action to run for consuming acknowledgement messages
           -> String
              -- ^ Name of solver for reporting purposes.
           -> Bool
@@ -450,40 +433,54 @@ newWriter :: a
           -> B.SymbolVarBimap t
              -- ^ Variable bindings for names.
           -> IO (WriterConn t (Writer a))
-newWriter _ h solver_name permitDefineFun arithOption quantSupport bindings = do
+newWriter _ h ack solver_name permitDefineFun arithOption quantSupport bindings = do
   r <- newIORef Set.empty
-  let initWriter = Writer r
-  conn <- newWriterConn h solver_name arithOption bindings initWriter
+  let initWriter =
+        Writer
+        { declaredTuples = r
+        }
+  conn <- newWriterConn h ack solver_name arithOption bindings initWriter
   return $! conn { supportFunctionDefs = permitDefineFun
                  , supportQuantifiers = quantSupport
                  }
 
+type instance Command (Writer a) = SMT2.Command
+
 instance SMTLib2Tweaks a => SMTWriter (Writer a) where
-  commentCommand _ b = Cmd ("; " <> b)
+  forallExpr vars t = SMT2.forall (varBinding @a <$> vars) t
+  existsExpr vars t = SMT2.exists (varBinding @a <$> vars) t
 
-  assertCommand _ e = Cmd $ app "assert" [renderTerm e]
+  arrayConstant =
+    case smtlib2arrayConstant @a of
+      Just f -> Just $ \idxTypes (Some retType) c ->
+        f ((\(Some itp) -> asSMT2Type @a itp) <$> idxTypes) (asSMT2Type @a retType) c
+      Nothing -> Nothing
+  arraySelect = smtlib2arraySelect @a
+  arrayUpdate = smtlib2arrayUpdate @a
 
-  pushCommand _  = Cmd "(push 1)"
-  popCommand _   = Cmd "(pop 1)"
-  resetCommand _ = Cmd "(reset-assertions)"
+  commentCommand _ b = SMT2.Cmd ("; " <> b)
 
-  checkCommand _ = checkSatCommand
-  setOptCommand _ x y = setOptionCommand (Option opt)
-    where opt = Builder.fromText x <> Builder.fromText " " <> y
+  assertCommand _ e = SMT2.assert e
 
-  declareCommand proxy v argTypes retType = Cmd $
-    app "declare-fun" [ Builder.fromText v
-                      , builder_list (unType (exprTweaks proxy) <$> argTypes)
-                      , unType (exprTweaks proxy) retType
-                      ]
+  assertNamedCommand _ e nm = SMT2.assertNamed e nm
 
-  defineCommand f args return_type e =
-    let resolveArg (var, tp) = app (Builder.fromText var) [unType (exprTweaks e) tp]
-     in Cmd $ app "define-fun" [ Builder.fromText f
-                               , builder_list (resolveArg <$> args)
-                               , unType (exprTweaks e) return_type
-                               , renderTerm e
-                               ]
+  pushCommand _  = SMT2.push 1
+  popCommand _   = SMT2.pop 1
+  resetCommand _ = SMT2.resetAssertions
+
+  checkCommand _ = SMT2.checkSat
+  checkWithAssumptionsCommand _ = SMT2.checkSatWithAssumptions
+
+  getUnsatAssumptionsCommand _ = SMT2.getUnsatAssumptions
+  getUnsatCoreCommand _ = SMT2.getUnsatCore
+  setOptCommand _ = SMT2.setOption
+
+  declareCommand _proxy v argTypes retType =
+    SMT2.declareFun v (toListFC (asSMT2Type @a) argTypes) (asSMT2Type @a retType)
+
+  defineCommand _proxy f args return_type e =
+    let resolveArg (var, Some tp) = (var, asSMT2Type @a tp)
+     in SMT2.defineFun f (resolveArg <$> args) (asSMT2Type @a return_type) e
 
   declareStructDatatype conn n = do
     let r = declaredTuples (connState conn)
@@ -499,26 +496,36 @@ instance SMTLib2Tweaks a => SMTWriter (Writer a) where
       let fields = field_def <$> [1..n]
       let decl = app tp [app ctor fields]
       let decls = "(" <> decl <> ")"
-      let cmd = Cmd $ app "declare-datatypes" [ params, decls ]
+      let cmd = SMT2.Cmd $ app "declare-datatypes" [ params, decls ]
       addCommand conn cmd
 
       writeIORef r $! Set.insert n s
 
+  writeCommand conn (SMT2.Cmd cmd) =
+    do let cmdout = Lazy.toStrict (Builder.toLazyText cmd)
+       Streams.write (Just (cmdout <> "\n")) (connHandle conn)
+       -- force a flush
+       Streams.write (Just "") (connHandle conn)
+
 -- | Write check sat command
 writeCheckSat :: SMTLib2Tweaks a => WriterConn t (Writer a) -> IO ()
-writeCheckSat w = addCommand w checkSatCommand
+writeCheckSat w = addCommandNoAck w SMT2.checkSat
 
-writeExit :: SMTLib2Tweaks a => WriterConn t (Writer a) -> IO ()
-writeExit w = addCommand w (Cmd "(exit)")
+writeExit :: forall a t. SMTLib2Tweaks a => WriterConn t (Writer a) -> IO ()
+writeExit w = addCommand w SMT2.exit
 
-setLogic :: SMTLib2Tweaks a => WriterConn t (Writer a) -> Logic -> IO ()
-setLogic w l = addCommand w (set_logic l)
+setLogic :: SMTLib2Tweaks a => WriterConn t (Writer a) -> SMT2.Logic -> IO ()
+setLogic w l = addCommand w $ SMT2.setLogic l
 
-setOption :: SMTLib2Tweaks a => WriterConn t (Writer a) -> Option -> IO ()
-setOption w o = addCommand w (setOptionCommand o)
+setOption :: SMTLib2Tweaks a => WriterConn t (Writer a) -> Text -> Text -> IO ()
+setOption w nm val = addCommand w $ SMT2.setOption nm val
 
-writeGetValue :: SMTLib2Tweaks a => WriterConn t (Writer a) -> [Expr a] -> IO ()
-writeGetValue w l = addCommand w (getValueCommand l)
+-- | Set the produce models option (We typically want this)
+setProduceModels :: SMTLib2Tweaks a => WriterConn t (Writer a) -> Bool -> IO ()
+setProduceModels w b = addCommand w $ SMT2.setProduceModels b
+
+writeGetValue :: SMTLib2Tweaks a => WriterConn t (Writer a) -> [Term] -> IO ()
+writeGetValue w l = addCommandNoAck w $ SMT2.getValue l
 
 parseBoolSolverValue :: Monad m => SExp -> m Bool
 parseBoolSolverValue (SAtom "true")  = return True
@@ -526,7 +533,7 @@ parseBoolSolverValue (SAtom "false") = return False
 parseBoolSolverValue s = fail $ "Could not parse solver value: " ++ show s
 
 parseRealSolverValue :: (Applicative m, Monad m) => SExp -> m Rational
-parseRealSolverValue (SAtom v) | Just (r,"") <- readDecimal v =
+parseRealSolverValue (SAtom v) | Just (r,"") <- readDecimal (Text.unpack v) =
   return r
 parseRealSolverValue (SApp ["-", x]) = do
   negate <$> parseRealSolverValue x
@@ -541,11 +548,11 @@ parseBvSolverValue _ s
   | otherwise = fail $ "Could not parse solver value: " ++ show s
 
 parseBVLitHelper :: SExp -> (Integer, Int)
-parseBVLitHelper (SAtom ('#' : 'b' : n_str)) | [(n, "")] <- readBin n_str =
+parseBVLitHelper (SAtom (Text.unpack -> ('#' : 'b' : n_str))) | [(n, "")] <- readBin n_str =
   (n, length n_str)
-parseBVLitHelper (SAtom ('#' : 'x' : n_str)) | [(n, "")] <- readHex n_str =
+parseBVLitHelper (SAtom (Text.unpack -> ('#' : 'x' : n_str))) | [(n, "")] <- readHex n_str =
   (n, length n_str * 4)
-parseBVLitHelper (SApp ["_", SAtom ('b' : 'v' : n_str), SAtom w_str])
+parseBVLitHelper (SApp ["_", SAtom (Text.unpack -> ('b' : 'v' : n_str)), SAtom (Text.unpack -> w_str)])
   | [(n, "")] <- readDec n_str, [(w, "")] <- readDec w_str = (n, w)
 parseBVLitHelper _ = (0, 0)
 
@@ -557,7 +564,9 @@ parseFloatSolverValue (SApp ["fp", sign_s, exponent_s, significant_s])
   , (significant_n, sb) <- parseBVLitHelper significant_s
   , 1 <= sb
   = return $ (((sign_n `shiftL` eb) + exponent_n) `shiftL` sb) + significant_n
-parseFloatSolverValue s@(SApp ["_", SAtom nm, SAtom eb_s, SAtom sb_s])
+parseFloatSolverValue
+  s@(SApp ["_", SAtom (Text.unpack -> nm), SAtom (Text.unpack -> eb_s), SAtom (Text.unpack -> sb_s)])
+
   | [(eb, "")] <- readDec eb_s, [(sb, "")] <- readDec sb_s = case nm of
     "+oo"   -> return $ ones eb `shiftL` (sb - 1)
     "-oo"   -> return $ setBit (ones eb `shiftL` (sb - 1)) (eb + sb - 1)
@@ -597,13 +606,13 @@ parseBvArraySolverValue _ _ _ = return Nothing
 -- | This is an interactive session with an SMT solver
 data Session t a = Session
   { sessionWriter   :: !(WriterConn t (Writer a))
-  , sessionResponse :: !(Streams.InputStream UTF8.ByteString)
+  , sessionResponse :: !(Streams.InputStream Text)
   }
 
 -- | Get a value from a solver (must be called after checkSat)
 runGetValue :: SMTLib2Tweaks a
             => Session t a
-            -> Expr a
+            -> Term
             -> IO SExp
 runGetValue s e = do
   writeGetValue (sessionWriter s) [ e ]
@@ -611,23 +620,23 @@ runGetValue s e = do
   case msexp of
     Left Streams.ParseException{} -> fail $ "Could not parse solver value."
     Right (SApp [SApp [_, b]]) -> return b
-    Right sexp -> fail $ "Could not parse solver value: " ++ show sexp
+    Right sexp -> fail $ "Could not parse solver value:\n  " ++ show sexp
 
 -- | This function runs a check sat command
 runCheckSat :: forall b t a.
                SMTLib2Tweaks b
             => Session t b
-            -> (SatResult (GroundEvalFn t, Maybe (ExprRangeBindings t)) -> IO a)
+            -> (SatResult (GroundEvalFn t, Maybe (ExprRangeBindings t)) () -> IO a)
                -- ^ Function for evaluating model.
                -- The evaluation should be complete before
             -> IO a
 runCheckSat s doEval =
   do let w = sessionWriter s
          r = sessionResponse s
-     addCommand w (checkCommand w)
+     addCommandNoAck w (checkCommand w)
      res <- smtSatResult w r
      case res of
-       Unsat -> doEval Unsat
+       Unsat x -> doEval (Unsat x)
        Unknown -> doEval Unknown
        Sat _ ->
          do evalFn <- smtExprGroundEvalFn w (smtEvalFuns w r)
@@ -637,20 +646,82 @@ instance SMTLib2Tweaks a => SMTReadWriter (Writer a) where
   smtEvalFuns w s = smtLibEvalFuns Session { sessionWriter = w
                                            , sessionResponse = s }
 
-
-  smtSatResult _ s =
+  smtSatResult p s =
     do mb <- try (Streams.parseFromStream parseNextWord s)
        case mb of
          Left (SomeException e) ->
             fail $ unlines [ "Could not parse check_sat result."
                            , "*** Exception: " ++ displayException e
                            ]
-         Right "unsat" -> return Unsat
+         Right "unsat" -> return (Unsat ())
          Right "sat" -> return (Sat ())
          Right "unknown" -> return Unknown
-         Right res -> fail ("Could not interpret result from solver: " ++ res)
+         Right res -> throw $ SMTLib2ParseError (checkCommand p) (Text.pack (show res))
 
+  smtUnsatAssumptionsResult p s =
+    do mb <- try (Streams.parseFromStream parseSExp s)
+       let cmd = getUnsatAssumptionsCommand p
+       case mb of
+         Right (asNegAtomList -> Just as) -> return as
+         Right (SApp [SAtom "error", SString msg]) -> throw (SMTLib2Error cmd msg)
+         Right res -> throw (SMTLib2ParseError cmd (Text.pack (show res)))
+         Left (SomeException e) -> throw $ SMTLib2ParseError cmd $ Text.pack $
+                 unlines [ "Could not parse unsat assumptions result."
+                         , "*** Exception: " ++ displayException e
+                         ]
 
+  smtUnsatCoreResult p s =
+    do mb <- try (Streams.parseFromStream parseSExp s)
+       let cmd = getUnsatCoreCommand p
+       case mb of
+         Right (asAtomList -> Just nms) -> return nms
+         Right (SApp [SAtom "error", SString msg]) -> throw (SMTLib2Error cmd msg)
+         Right res -> throw (SMTLib2ParseError cmd (Text.pack (show res)))
+         Left (SomeException e) -> throw $ SMTLib2ParseError cmd $ Text.pack $
+                 unlines [ "Could not parse unsat core result."
+                         , "*** Exception: " ++ displayException e
+                         ]
+
+data SMTLib2Exception
+  = SMTLib2Unsupported SMT2.Command
+  | SMTLib2Error SMT2.Command Text
+  | SMTLib2ParseError SMT2.Command Text
+
+instance Show SMTLib2Exception where
+  show (SMTLib2Unsupported (SMT2.Cmd cmd)) =
+     unlines
+       [ "unsupported command:"
+       , "  " ++ Lazy.unpack (Builder.toLazyText cmd)
+       ]
+  show (SMTLib2Error (SMT2.Cmd cmd) msg) =
+     unlines
+       [ "Solver reported an error:"
+       , "  " ++ Text.unpack msg
+       , "in response to command:"
+       , "  " ++ Lazy.unpack (Builder.toLazyText cmd)
+       ]
+  show (SMTLib2ParseError (SMT2.Cmd cmd) msg) =
+     unlines
+       [ "Could not parse solver response:"
+       , "  " ++ Text.unpack msg
+       , "in response to command:"
+       , "  " ++ Lazy.unpack (Builder.toLazyText cmd)
+       ]
+
+instance Exception SMTLib2Exception
+
+smtAckResult :: Streams.InputStream Text -> AcknowledgementAction t (Writer a)
+smtAckResult resp = AckAction $ \_conn cmd ->
+  do mb <- try (Streams.parseFromStream parseSExp resp)
+     case mb of
+       Right (SAtom "success") -> return ()
+       Right (SAtom "unsupported") -> throw (SMTLib2Unsupported cmd)
+       Right (SApp [SAtom "error", SString msg]) -> throw (SMTLib2Error cmd msg)
+       Right res -> throw (SMTLib2ParseError cmd (Text.pack (show res)))
+       Left (SomeException e) -> throw $ SMTLib2ParseError cmd $ Text.pack $
+               unlines [ "Could not parse acknowledgement result."
+                       , "*** Exception: " ++ displayException e
+                       ]
 
 smtLibEvalFuns ::
   forall t a. SMTLib2Tweaks a => Session t a -> SMTEvalFunctions (Writer a)
@@ -671,23 +742,173 @@ smtLibEvalFuns s = SMTEvalFunctions
   evalBvArray w v tm = parseBvArraySolverValue w v =<< runGetValue s tm
 
 
+class (SMTLib2Tweaks a, Show a) => SMTLib2GenericSolver a where
+  defaultSolverPath :: a -> B.ExprBuilder t st fs -> IO FilePath
+
+  defaultSolverArgs :: a -> B.ExprBuilder t st fs -> IO [String]
+
+  defaultFeatures :: a -> ProblemFeatures
+
+  setDefaultLogicAndOptions :: WriterConn t (Writer a) -> IO()
+
+  newDefaultWriter
+    :: a ->
+       AcknowledgementAction t (Writer a) ->
+       ProblemFeatures ->
+       B.ExprBuilder t st fs ->
+       Streams.OutputStream Text ->
+       IO (WriterConn t (Writer a))
+  newDefaultWriter solver ack feats sym h =
+    newWriter solver h ack (show solver) True feats True
+      =<< B.getSymbolVarBimap sym
+
+  -- | Run the solver in a session.
+  withSolver
+    :: a
+    -> AcknowledgementAction t (Writer a)
+    -> ProblemFeatures
+    -> B.ExprBuilder t st fs
+    -> FilePath
+      -- ^ Path to solver executable
+    -> LogData
+    -> (Session t a -> IO b)
+      -- ^ Action to run
+    -> IO b
+  withSolver solver ack feats sym path logData action = do
+    args <- defaultSolverArgs solver sym
+    withProcessHandles path args Nothing $
+      \(in_h, out_h, err_h, ph) -> do
+
+        (in_stream, out_stream, err_reader) <-
+          demuxProcessHandles in_h out_h err_h
+            (fmap (\x -> ("; ", x)) $ logHandle logData)
+
+        writer <- newDefaultWriter solver ack feats sym in_stream
+        let s = Session
+              { sessionWriter   = writer
+              , sessionResponse = out_stream
+              }
+
+        -- Set solver logic and solver-specific options
+        setDefaultLogicAndOptions writer
+
+        -- Run action with session.
+        r <- action s
+        -- Tell solver to exit
+        writeExit writer
+
+        ec <- Process.waitForProcess ph
+        stopHandleReader err_reader
+        case ec of
+          Exit.ExitSuccess -> return r
+          Exit.ExitFailure exit_code -> fail $
+            show solver ++ " exited with unexpected code: " ++ show exit_code
+
+  runSolverInOverride
+    :: a
+    -> AcknowledgementAction t (Writer a)
+    -> ProblemFeatures
+    -> B.ExprBuilder t st fs
+    -> LogData
+    -> [B.BoolExpr t]
+    -> (SatResult (GroundEvalFn t, Maybe (ExprRangeBindings t)) () -> IO b)
+    -> IO b
+  runSolverInOverride solver ack feats sym logData predicates cont = do
+    I.logSolverEvent sym
+      I.SolverStartSATQuery
+        { I.satQuerySolverName = show solver
+        , I.satQueryReason     = logReason logData
+        }
+    path <- defaultSolverPath solver sym
+    withSolver solver ack feats sym path (logData{logVerbosity=2}) $ \session -> do
+      -- Assume the predicates hold.
+      forM_ predicates (SMTWriter.assume (sessionWriter session))
+      -- Run check SAT and get the model back.
+      runCheckSat session $ \result -> do
+        I.logSolverEvent sym
+          I.SolverEndSATQuery
+            { I.satQueryResult = forgetModelAndCore result
+            , I.satQueryError  = Nothing
+            }
+        cont result
 
 -- | A default method for writing SMTLib2 problems without any
 --   solver-specific tweaks.
 writeDefaultSMT2 :: SMTLib2Tweaks a
                  => a
+                 -> AcknowledgementAction t (Writer a)
                  -> String
                     -- ^ Name of solver for reporting.
                  -> ProblemFeatures
                     -- ^ Features supported by solver
                  -> B.ExprBuilder t st fs
                  -> IO.Handle
-                 -> B.BoolExpr t
+                 -> [B.BoolExpr t]
                  -> IO ()
-writeDefaultSMT2 a nm feat sym h p = do
+writeDefaultSMT2 a ack nm feat sym h ps = do
   bindings <- B.getSymbolVarBimap sym
-  c <- newWriter a h nm True feat True bindings
-  setOption c (produceModels True)
-  SMTWriter.assume c p
+  str <- Streams.encodeUtf8 =<< Streams.handleToOutputStream h
+  c <- newWriter a str ack nm True feat True bindings
+  setProduceModels c True
+  forM_ ps (SMTWriter.assume c)
   writeCheckSat c
   writeExit c
+
+startSolver
+  :: SMTLib2GenericSolver a
+  => a
+  -> (Streams.InputStream Text -> AcknowledgementAction t (Writer a))
+        -- ^ Action for acknowledging command responses
+  -> (WriterConn t (Writer a) -> IO ()) -- ^ Action for setting start-up-time options and logic
+  -> ProblemFeatures
+  -> Maybe IO.Handle
+  -> B.ExprBuilder t st fs
+  -> IO (SolverProcess t (Writer a))
+startSolver solver ack setup feats auxOutput sym = do
+  path <- defaultSolverPath solver sym
+  args <- defaultSolverArgs solver sym
+  solver_process <- Process.createProcess $
+    (Process.proc path args)
+      { Process.std_in       = Process.CreatePipe
+      , Process.std_out      = Process.CreatePipe
+      , Process.std_err      = Process.CreatePipe
+      , Process.create_group = True
+      , Process.cwd          = Nothing
+      }
+  (in_h, out_h, err_h, ph) <- case solver_process of
+    (Just in_h, Just out_h, Just err_h, ph) -> return (in_h, out_h, err_h, ph)
+    _ -> fail "Internal error in startSolver: Failed to create handle."
+
+  (in_stream, out_stream, err_reader) <-
+     demuxProcessHandles in_h out_h err_h
+       (fmap (\x -> ("; ", x)) auxOutput)
+
+  -- Create writer
+  writer <- newDefaultWriter solver (ack out_stream) feats sym in_stream
+
+  -- Set solver logic and solver-specific options
+  setup writer
+
+  earlyUnsatRef <- newIORef Nothing
+
+  return $! SolverProcess
+    { solverConn     = writer
+    , solverStdin    = in_stream
+    , solverStderr   = err_reader
+    , solverHandle   = ph
+    , solverResponse = out_stream
+    , solverEvalFuns = smtEvalFuns writer out_stream
+    , solverLogFn    = I.logSolverEvent sym
+    , solverName     = show solver
+    , solverEarlyUnsat = earlyUnsatRef
+    }
+
+shutdownSolver
+  :: SMTLib2GenericSolver a => a -> SolverProcess t (Writer a) -> IO (Exit.ExitCode, Lazy.Text)
+shutdownSolver _solver p = do
+  -- Tell solver to exit
+  writeExit (solverConn p)
+  txt <- readAllLines (solverStderr p)
+  ec <- Process.waitForProcess (solverHandle p)
+  stopHandleReader (solverStderr p)
+  return (ec,txt)

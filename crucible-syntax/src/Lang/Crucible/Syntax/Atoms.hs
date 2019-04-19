@@ -18,8 +18,8 @@ import Control.Applicative
 
 import Data.Char
 import Data.Functor
-import Data.Monoid
 import Data.Ratio
+import Data.Semigroup ( (<>) )
 import Data.Text (Text)
 import qualified Data.Text as T
 
@@ -46,16 +46,15 @@ data Keyword = Defun | DefBlock | DefGlobal
              | Start
              | SetGlobal
              | SetRef | DropRef_
-             | Unpack
              | Plus | Minus | Times | Div | Negate | Abs
              | Just_ | Nothing_ | FromJust
-             | Inj
+             | Inj | Proj
              | AnyT | UnitT | BoolT | NatT | IntegerT | RealT | ComplexRealT | CharT | StringT
-             | BitVectorT | VectorT | FunT | MaybeT | VariantT | RefT
+             | BitvectorT | VectorT | FPT | FunT | MaybeT | VariantT | RefT
+             | Half_ | Float_ | Double_ | Quad_ | X86_80_ | DoubleDouble_
              | The
              | Equalp | Integerp
              | If
-             | Pack
              | Not_ | And_ | Or_ | Xor_
              | Mod
              | Lt | Le
@@ -66,71 +65,35 @@ data Keyword = Defun | DefBlock | DefGlobal
              | VectorGetEntry_ | VectorSetEntry_ | VectorCons_
              | Deref | Ref | EmptyRef
              | Jump_ | Return_ | Branch_ | MaybeBranch_ | TailCall_ | Error_ | Output_ | Case
-             | Print_
+             | Print_ | PrintLn_
              | Let | Fresh
              | Assert_ | Assume_
              | SetRegister
              | Funcall
+             | BV | BVConcat_ | BVSelect_ | BVTrunc_
+             | BVZext_ | BVSext_ | BVNonzero_ | BoolToBV_
+             | BVCarry_ | BVSCarry_ | BVSBorrow_
+             | BVNot_ | BVAnd_ | BVOr_ | BVXor_ | BVShl_ | BVLshr_ | BVAshr_
+             | Sle | Slt | Sdiv | Smod | ZeroExt | SignExt
+             | RNE_ | RNA_ | RTP_ | RTN_ | RTZ_
+             | FPToUBV_ | FPToSBV_ | UBVToFP_ | SBVToFP_ | BinaryToFP_ | FPToBinary_
+             | FPToReal_ | RealToFP_
   deriving (Eq, Ord)
 
 keywords :: [(Text, Keyword)]
 keywords =
+    -- function/block defintion
   [ ("defun" , Defun)
+  , ("start" , Start)
   , ("defblock", DefBlock)
   , ("defglobal", DefGlobal)
   , ("registers", Registers)
+
+    -- statements
   , ("let", Let)
   , ("set-global!", SetGlobal)
   , ("set-ref!", SetRef)
   , ("drop-ref!", DropRef_)
-  , ("start" , Start)
-  , ("unpack" , Unpack)
-  , ("+" , Plus)
-  , ("-" , Minus)
-  , ("*" , Times)
-  , ("/" , Div)
-  , ("<" , Lt)
-  , ("<=" , Le)
-  , ("negate", Negate)
-  , ("abs", Abs)
-  , ("show", Show)
-  , ("inj", Inj)
-  , ("just" , Just_)
-  , ("nothing" , Nothing_)
-  , ("from-just" , FromJust)
-  , ("to-any", ToAny)
-  , ("from-any", FromAny)
-  , ("the" , The)
-  , ("equal?" , Equalp)
-  , ("integer?" , Integerp)
-  , ("Any" , AnyT)
-  , ("Unit" , UnitT)
-  , ("Bool" , BoolT)
-  , ("Nat" , NatT)
-  , ("Integer" , IntegerT)
-  , ("Real" , RealT)
-  , ("ComplexReal" , ComplexRealT)
-  , ("Char" , CharT)
-  , ("String" , StringT)
-  , ("BitVector" , BitVectorT)
-  , ("Vector", VectorT)
-  , ("->", FunT)
-  , ("Maybe", MaybeT)
-  , ("Variant", VariantT)
-  , ("vector", VectorLit_)
-  , ("vector-replicate", VectorReplicate_)
-  , ("vector-empty?", VectorIsEmpty_)
-  , ("vector-size", VectorSize_)
-  , ("vector-get", VectorGetEntry_)
-  , ("vector-set", VectorSetEntry_)
-  , ("vector-cons", VectorCons_)
-  , ("if" , If)
-  , ("pack" , Pack)
-  , ("not" , Not_)
-  , ("and" , And_)
-  , ("or" , Or_)
-  , ("xor" , Xor_)
-  , ("mod" , Mod)
   , ("fresh", Fresh)
   , ("jump" , Jump_)
   , ("case", Case)
@@ -141,7 +104,7 @@ keywords =
   , ("error", Error_)
   , ("output", Output_)
   , ("print" , Print_)
-  , ("string-append", StringAppend)
+  , ("println" , PrintLn_)
   , ("Ref", RefT)
   , ("deref", Deref)
   , ("ref", Ref)
@@ -150,8 +113,120 @@ keywords =
   , ("assert!", Assert_)
   , ("assume!", Assume_)
   , ("funcall", Funcall)
-  ]
 
+    -- types
+  , ("Any" , AnyT)
+  , ("Unit" , UnitT)
+  , ("Bool" , BoolT)
+  , ("Nat" , NatT)
+  , ("Integer" , IntegerT)
+  , ("FP", FPT)
+  , ("Real" , RealT)
+  , ("ComplexReal" , ComplexRealT)
+  , ("Char" , CharT)
+  , ("String" , StringT)
+  , ("Bitvector" , BitvectorT)
+  , ("Vector", VectorT)
+  , ("->", FunT)
+  , ("Maybe", MaybeT)
+  , ("Variant", VariantT)
+
+    -- floating-point variants
+  , ("Half", Half_)
+  , ("Float", Float_)
+  , ("Double", Double_)
+  , ("Quad", Quad_)
+  , ("X86_80", X86_80_)
+  , ("DoubleDouble", DoubleDouble_)
+
+    -- misc
+  , ("the" , The)
+  , ("equal?" , Equalp)
+  , ("if" , If)
+
+    -- ANY types
+  , ("to-any", ToAny)
+  , ("from-any", FromAny)
+
+    -- booleans
+  , ("not" , Not_)
+  , ("and" , And_)
+  , ("or" , Or_)
+  , ("xor" , Xor_)
+
+    -- arithmetic
+  , ("+" , Plus)
+  , ("-" , Minus)
+  , ("*" , Times)
+  , ("/" , Div)
+  , ("<" , Lt)
+  , ("<=" , Le)
+  , ("<=$" , Sle)
+  , ("<$" , Slt)
+  , ("/$" , Sdiv)
+  , ("smod", Smod)
+  , ("negate", Negate)
+  , ("abs", Abs)
+  , ("mod" , Mod)
+  , ("integer?" , Integerp)
+
+    -- Variants
+  , ("inj", Inj)
+  , ("proj", Proj)
+
+    -- Maybe
+  , ("just" , Just_)
+  , ("nothing" , Nothing_)
+  , ("from-just" , FromJust)
+
+    -- Vectors
+  , ("vector", VectorLit_)
+  , ("vector-replicate", VectorReplicate_)
+  , ("vector-empty?", VectorIsEmpty_)
+  , ("vector-size", VectorSize_)
+  , ("vector-get", VectorGetEntry_)
+  , ("vector-set", VectorSetEntry_)
+  , ("vector-cons", VectorCons_)
+
+    -- strings
+  , ("show", Show)
+  , ("string-append", StringAppend)
+
+    -- bitvector
+  , ("bv", BV)
+  , ("bv-concat", BVConcat_)
+  , ("bv-select", BVSelect_)
+  , ("bv-trunc", BVTrunc_)
+  , ("zero-extend", BVZext_)
+  , ("sign-extend", BVSext_)
+  , ("bv-nonzero", BVNonzero_)
+  , ("bool-to-bv", BoolToBV_)
+  , ("bv-carry", BVCarry_)
+  , ("bv-scarry", BVSCarry_)
+  , ("bv-sborrow", BVSBorrow_)
+  , ("bv-not", BVNot_)
+  , ("bv-and", BVAnd_)
+  , ("bv-or", BVOr_)
+  , ("bv-xor", BVXor_)
+  , ("shl", BVShl_)
+  , ("lshr", BVLshr_)
+  , ("ashr", BVAshr_)
+
+    -- floating-point
+  , ("fp-to-ubv", FPToUBV_)
+  , ("fp-to-sbv", FPToSBV_)
+  , ("ubv-to-fp", UBVToFP_)
+  , ("sbv-to-fp", SBVToFP_)
+  , ("fp-to-binary", FPToBinary_)
+  , ("binary-to-fp", BinaryToFP_)
+  , ("real-to-fp", RealToFP_)
+  , ("fp-to-real", FPToReal_)
+  , ("rne" , RNE_)
+  , ("rna" , RNA_)
+  , ("rtp" , RTP_)
+  , ("rtn" , RTN_)
+  , ("rtz" , RTZ_)
+  ]
 
 instance Show Keyword where
   show k = case [str | (str, k') <- keywords, k == k'] of

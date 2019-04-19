@@ -22,10 +22,10 @@ import           System.IO
 import           Data.HPB
 
 import           Data.Parameterized.Nonce
-import qualified Data.ABC.GIA as GIA
 
 import           Lang.Crucible.Backend.Simple
 import qualified Lang.Crucible.Backend.SAWCore as SAW
+import           Lang.Crucible.Simulator.PathSatisfiability
 
 import           What4.Expr.Builder(Flags,FloatReal)
 
@@ -38,6 +38,7 @@ import           Lang.Crucible.Server.SimpleOverrides
 
 import qualified Verifier.SAW.SharedTerm as SAW
 import qualified Verifier.SAW.Prelude as SAW
+import qualified Verifier.SAW.Cryptol.Prelude as CryptolSAW
 
 main :: IO ()
 main = do
@@ -87,9 +88,11 @@ runSAWSimulator hin hout =
      withIONonceGenerator $ \gen -> do
        sc <- SAW.mkSharedContext
        SAW.scLoadPreludeModule sc
-       (sym :: SAWBack n) <- SAW.newSAWCoreBackend GIA.proxy sc gen
+       CryptolSAW.scLoadCryptolModule sc
+       (sym :: SAWBack n) <- SAW.newSAWCoreBackend sc gen
        sawState <- initSAWServerPersonality sym
-       s <- newSimulator sym sawServerOptions sawState sawServerOverrides hin hout
+       pathSatFeat <- pathSatisfiabilityFeature sym (SAW.considerSatisfiability sym)
+       s <- newSimulator sym sawServerOptions sawState [pathSatFeat] sawServerOverrides hin hout
        putDelimited hout ok_resp
        -- Enter loop to start reading commands.
        fulfillRequests s sawBackendRequests
@@ -100,7 +103,7 @@ runSimpleSimulator hin hout = do
     let ok_resp = mempty
                   & P.handShakeResponse_code .~ P.HandShakeOK
     (sym :: SimpleBackend t (Flags FloatReal)) <- newSimpleBackend gen
-    s <- newSimulator sym simpleServerOptions CrucibleServerPersonality simpleServerOverrides hin hout
+    s <- newSimulator sym simpleServerOptions CrucibleServerPersonality [] simpleServerOverrides hin hout
     -- Enter loop to start reading commands.
     putDelimited hout ok_resp
     fulfillRequests s simpleBackendRequests

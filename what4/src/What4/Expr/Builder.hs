@@ -106,6 +106,7 @@ module What4.Expr.Builder
   , bvarName
   , bvarType
   , bvarKind
+  , bvarAbstractValue
   , VarKind(..)
   , boundVars
   , ppBoundVar
@@ -121,6 +122,8 @@ module What4.Expr.Builder
   , SymbolVarBimap
   , SymbolBinding(..)
   , emptySymbolVarBimap
+  , lookupBindingOfSymbol
+  , lookupSymbolOfBinding
 
     -- * IdxCache
   , IdxCache
@@ -163,6 +166,7 @@ import qualified Data.HashTable.Class as H (toList)
 import qualified Data.HashTable.ST.Cuckoo as H
 import           Data.Hashable
 import           Data.IORef
+import           Data.Kind
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
@@ -244,22 +248,29 @@ data VarKind
 -- | Information about bound variables.
 -- Parameter @t@ is a phantom type brand used to track nonces.
 --
--- Type @'SimpleBoundVar' t@ instantiates the type family
+-- Type @'ExprBoundVar' t@ instantiates the type family
 -- @'BoundVar' ('ExprBuilder' t st)@.
 --
--- Selector functions are provided to destruct 'SimpleBoundVar'
+-- Selector functions are provided to destruct 'ExprBoundVar'
 -- values, but the constructor is kept hidden. The preferred way to
--- construct a 'SimpleBoundVar' is to use 'freshBoundVar'.
+-- construct a 'ExprBoundVar' is to use 'freshBoundVar'.
 data ExprBoundVar t (tp :: BaseType) =
   BVar { bvarId  :: {-# UNPACK #-} !(Nonce t tp)
        , bvarLoc :: !ProgramLoc
        , bvarName :: !SolverSymbol
        , bvarType :: !(BaseTypeRepr tp)
        , bvarKind :: !VarKind
+       , bvarAbstractValue :: !(Maybe (AbstractValue tp))
        }
+
+instance Eq (ExprBoundVar t tp) where
+  x == y = bvarId x == bvarId y
 
 instance TestEquality (ExprBoundVar t) where
   testEquality x y = testEquality (bvarId x) (bvarId y)
+
+instance Ord (ExprBoundVar t tp) where
+  compare x y = compare (bvarId x) (bvarId y)
 
 instance OrdF (ExprBoundVar t) where
   compareF x y = compareF (bvarId x) (bvarId y)
@@ -281,7 +292,7 @@ instance HashableF (ExprBoundVar t) where
 -- Parameter @e@ is used everywhere a recursive sub-expression would
 -- go. Uses of the 'NonceApp' type will tie the knot through this
 -- parameter. Parameter @tp@ indicates the type of the expression.
-data NonceApp t (e :: BaseType -> *) (tp :: BaseType) where
+data NonceApp t (e :: BaseType -> Type) (tp :: BaseType) where
   Forall :: !(ExprBoundVar t tp)
          -> !(e BaseBoolType)
          -> NonceApp t e BaseBoolType
@@ -320,7 +331,7 @@ data NonceApp t (e :: BaseType -> *) (tp :: BaseType) where
 -- Parameter @e@ is used everywhere a recursive sub-expression would
 -- go. Uses of the 'App' type will tie the knot through this
 -- parameter. Parameter @tp@ indicates the type of the expression.
-data App (e :: BaseType -> *) (tp :: BaseType) where
+data App (e :: BaseType -> Type) (tp :: BaseType) where
 
   ------------------------------------------------------------------------
   -- Boolean operations
@@ -427,7 +438,7 @@ data App (e :: BaseType -> *) (tp :: BaseType) where
 
   -- Return value of bit at given index.
   BVTestBit :: (1 <= w)
-            => !Integer -- Index of bit to test
+            => !Natural -- Index of bit to test
                         -- (least-significant bit has index 0)
             -> !(e (BaseBVType w))
             -> App e BaseBoolType
@@ -542,15 +553,29 @@ data App (e :: BaseType -> *) (tp :: BaseType) where
          -> !(e (BaseBVType w))
          -> App e (BaseBVType r)
 
-  BVTrunc :: (1 <= r, r+1 <= w)
-          => !(NatRepr r)
-          -> !(e (BaseBVType w))
-          -> App e (BaseBVType r)
+  BVPopcount ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(e (BaseBVType w)) ->
+    App e (BaseBVType w)
+
+  BVCountTrailingZeros ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(e (BaseBVType w)) ->
+    App e (BaseBVType w)
+
+  BVCountLeadingZeros ::
+    (1 <= w) =>
+    !(NatRepr w) ->
+    !(e (BaseBVType w)) ->
+    App e (BaseBVType w)
 
   BVBitNot :: (1 <= w)
            => !(NatRepr w)
            -> !(e (BaseBVType w))
            -> App e (BaseBVType w)
+
   BVBitAnd :: (1 <= w)
            => !(NatRepr w)
            -> !(e (BaseBVType w))
@@ -672,11 +697,21 @@ data App (e :: BaseType -> *) (tp :: BaseType) where
     -> !RoundingMode
     -> !(e (BaseFloatType fpp'))
     -> App e (BaseFloatType fpp)
+  FloatRound
+    :: !(FloatPrecisionRepr fpp)
+    -> !RoundingMode
+    -> !(e (BaseFloatType fpp))
+    -> App e (BaseFloatType fpp)
   FloatFromBinary
-    :: (1 <= eb, 1 <= sb)
-    => !(FloatPrecisionRepr (FloatingPointPrecision sb eb))
-    -> !(e (BaseBVType (sb + ebto_fp)))
-    -> App e (BaseFloatType (FloatingPointPrecision sb eb))
+    :: (2 <= eb, 2 <= sb)
+    => !(FloatPrecisionRepr (FloatingPointPrecision eb sb))
+    -> !(e (BaseBVType (eb + sb)))
+    -> App e (BaseFloatType (FloatingPointPrecision eb sb))
+  FloatToBinary
+    :: (2 <= eb, 2 <= sb, 1 <= eb + sb)
+    => !(FloatPrecisionRepr (FloatingPointPrecision eb sb))
+    -> !(e (BaseFloatType (FloatingPointPrecision eb sb)))
+    -> App e (BaseBVType (eb + sb))
   BVToFloat
     :: (1 <= w)
     => !(FloatPrecisionRepr fpp)
@@ -917,11 +952,17 @@ instance IsExpr (Expr t) where
   asNat (SemiRingLiteral SemiRingNat n _) = Just n
   asNat _ = Nothing
 
+  natBounds x = exprAbsValue x
+
   asInteger (SemiRingLiteral SemiRingInt n _) = Just n
   asInteger _ = Nothing
 
+  integerBounds x = exprAbsValue x
+
   asRational (SemiRingLiteral SemiRingReal r _) = Just r
   asRational _ = Nothing
+
+  rationalBounds x = ravRange $ exprAbsValue x
 
   asComplex e
     | Just (Cplx c) <- asApp e = traverse asRational c
@@ -938,6 +979,9 @@ instance IsExpr (Expr t) where
   asUnsignedBV _ = Nothing
 
   asSignedBV x = toSigned (bvWidth x) <$> asUnsignedBV x
+
+  unsignedBVBounds x = BVD.ubounds (bvWidth x) $ exprAbsValue x
+  signedBVBounds x = BVD.sbounds (bvWidth x) $ exprAbsValue x
 
   asString (StringExpr x _) = Just x
   asString _ = Nothing
@@ -1134,9 +1178,11 @@ appType a =
     BVShl  w _ _  -> BaseBVRepr w
     BVLshr w _ _ -> BaseBVRepr w
     BVAshr w _ _ -> BaseBVRepr w
+    BVPopcount w _ -> BaseBVRepr w
+    BVCountLeadingZeros w _ -> BaseBVRepr w
+    BVCountTrailingZeros w _ -> BaseBVRepr w
     BVZext  w _ -> BaseBVRepr w
     BVSext  w _ -> BaseBVRepr w
-    BVTrunc w _ -> BaseBVRepr w
     BVBitNot w _ -> BaseBVRepr w
     BVBitAnd w _ _ -> BaseBVRepr w
     BVBitOr  w _ _ -> BaseBVRepr w
@@ -1172,7 +1218,9 @@ appType a =
     FloatIsNorm{} -> knownRepr
     FloatIte fpp _ _ _ -> BaseFloatRepr fpp
     FloatCast fpp _ _ -> BaseFloatRepr fpp
+    FloatRound fpp _ _ -> BaseFloatRepr fpp
     FloatFromBinary fpp _ -> BaseFloatRepr fpp
+    FloatToBinary fpp _ -> floatPrecisionToBVType fpp
     BVToFloat fpp _ _ -> BaseFloatRepr fpp
     SBVToFloat fpp _ _ -> BaseFloatRepr fpp
     RealToFloat fpp _ _ -> BaseFloatRepr fpp
@@ -1231,7 +1279,7 @@ data ExprAllocator t
 -- | A bijective map between vars and their canonical name for printing
 -- purposes.
 -- Parameter @t@ is a phantom type brand used to track nonces.
-type SymbolVarBimap t = Bimap SolverSymbol (SymbolBinding t)
+newtype SymbolVarBimap t = SymbolVarBimap (Bimap SolverSymbol (SymbolBinding t))
 
 -- | This describes what a given SolverSymbol is associated with.
 -- Parameter @t@ is a phantom type brand used to track nonces.
@@ -1255,7 +1303,13 @@ instance Ord (SymbolBinding t) where
 
 -- | Empty symbol var bimap
 emptySymbolVarBimap :: SymbolVarBimap t
-emptySymbolVarBimap = Bimap.empty
+emptySymbolVarBimap = SymbolVarBimap Bimap.empty
+
+lookupBindingOfSymbol :: SolverSymbol -> SymbolVarBimap t -> Maybe (SymbolBinding t)
+lookupBindingOfSymbol s (SymbolVarBimap m) = Bimap.lookup s m
+
+lookupSymbolOfBinding :: SymbolBinding t -> SymbolVarBimap t -> Maybe SolverSymbol
+lookupSymbolOfBinding b (SymbolVarBimap m) = Bimap.lookupR b m
 
 ------------------------------------------------------------------------
 -- MatlabSolverFn
@@ -1293,7 +1347,7 @@ data Flags (fi :: FloatInterpretation)
 
 -- | Cache for storing dag terms.
 -- Parameter @t@ is a phantom type brand used to track nonces.
-data ExprBuilder t (st :: * -> *) (fs :: *)
+data ExprBuilder t (st :: Type -> Type) (fs :: Type)
    = SB { sbTrue  :: !(BoolExpr t)
         , sbFalse :: !(BoolExpr t)
           -- | Constant zero.
@@ -1315,6 +1369,9 @@ data ExprBuilder t (st :: * -> *) (fs :: *)
         , exprCounter :: !(NonceGenerator IO t)
           -- | Reference to current allocator for expressions.
         , curAllocator :: !(IORef (ExprAllocator t))
+          -- | Number of times an 'Expr' for a non-linear operation has been
+          -- created.
+        , sbNonLinearOps :: !(IORef Integer)
           -- | The current program location
         , sbProgramLoc :: !(IORef ProgramLoc)
           -- | Additional state maintained by the state manager
@@ -1325,6 +1382,8 @@ data ExprBuilder t (st :: * -> *) (fs :: *)
           -- | Cache for Matlab functions
         , sbMatlabFnCache
           :: !(PH.HashTable RealWorld (MatlabFnWrapper t) (ExprSymFnWrapper t))
+        , sbSolverLogger
+          :: !(IORef (Maybe (SolverEvent -> IO ())))
         }
 
 type instance SymFn (ExprBuilder t st fs) = ExprSymFn t
@@ -1336,6 +1395,240 @@ sbBVDomainParams sym =
   do rl <- CFG.getOpt (sbBVDomainRangeLimit sym)
      return BVD.DP { BVD.rangeLimit = fromInteger rl }
 
+
+------------------------------------------------------------------------
+-- abstractEval
+
+-- | Return abstract domain associated with a nonce app
+quantAbsEval :: ExprBuilder t st fs
+             -> (forall u . Expr t u -> AbstractValue u)
+             -> NonceApp t (Expr t) tp
+             -> AbstractValue tp
+quantAbsEval _ f q =
+  case q of
+    Forall _ v -> f v
+    Exists _ v -> f v
+    ArrayFromFn _       -> unconstrainedAbsValue (nonceAppType q)
+    MapOverArrays g _ _ -> unconstrainedAbsValue tp
+      where tp = symFnReturnType g
+    ArrayTrueOnEntries _ a -> f a
+    FnApp g _           -> unconstrainedAbsValue (symFnReturnType g)
+
+abstractEval :: BVD.BVDomainParams
+             -> (forall u . Expr t u -> AbstractValue u)
+             -> App (Expr t) tp
+             -> AbstractValue tp
+abstractEval bvParams f a0 = do
+  case a0 of
+
+    ------------------------------------------------------------------------
+    -- Boolean operations
+    TrueBool -> Just True
+    FalseBool -> Just False
+    NotBool x -> not <$> f x
+    AndBool x y -> absAnd (f x) (f y)
+    XorBool x y -> Bits.xor <$> f x <*> f y
+    IteBool c x y | Just True  <- f c -> f x
+                  | Just False <- f c -> f y
+                  | Just True  <- f x -> absOr  (f c) (f y)
+                  | Just False <- f x -> absAnd (not <$> f c) (f y)
+                  | Just True  <- f y -> absOr  (not <$> f c) (f x)
+                  | Just False <- f y -> absAnd (f c) (f x)
+                  | otherwise -> Nothing
+
+    SemiRingEq{} -> Nothing
+    SemiRingLe{} -> Nothing
+    RealIsInteger{} -> Nothing
+    BVTestBit{} -> Nothing
+    BVEq{} -> Nothing
+    BVSlt{} -> Nothing
+    BVUlt{} -> Nothing
+    ArrayEq{} -> Nothing
+
+    ------------------------------------------------------------------------
+    -- Arithmetic operations
+
+    NatDiv x y -> natRangeDiv (f x) (f y)
+    NatMod x y -> natRangeMod (f x) (f y)
+
+    IntAbs x -> intAbsRange (f x)
+    IntDiv x y -> intDivRange (f x) (f y)
+    IntMod x y -> intModRange (f x) (f y)
+    IntDivisible x 0 -> rangeCheckEq (SingleRange 0) (f x)
+    IntDivisible x n -> rangeCheckEq (SingleRange 0) (intModRange (f x) (SingleRange (toInteger n)))
+
+    SemiRingMul SemiRingInt x y -> mulRange (f x) (f y)
+    SemiRingSum SemiRingInt s -> WSum.eval addRange smul SingleRange s
+      where smul sm e = rangeScalarMul sm (f e)
+    SemiRingIte SemiRingInt _ x y -> joinRange (f x) (f y)
+
+    SemiRingMul SemiRingNat x y -> natRangeMul (f x) (f y)
+    SemiRingSum SemiRingNat s -> WSum.eval natRangeAdd smul natSingleRange s
+      where smul sm e = natRangeScalarMul sm (f e)
+    SemiRingIte SemiRingNat _ x y -> natRangeJoin (f x) (f y)
+
+    SemiRingMul SemiRingReal x y -> ravMul (f x) (f y)
+    SemiRingSum SemiRingReal s -> WSum.eval ravAdd smul ravSingle s
+      where smul sm e = ravScalarMul sm (f e)
+    SemiRingIte SemiRingReal _ x y -> ravJoin (f x) (f y)
+
+    RealDiv _ _ -> ravUnbounded
+    RealSqrt _  -> ravUnbounded
+    Pi -> ravConcreteRange 3.14 3.15
+    RealSin _ -> ravConcreteRange (-1) 1
+    RealCos _ -> ravConcreteRange (-1) 1
+    RealATan2 _ _ -> ravUnbounded
+    RealSinh _ -> ravUnbounded
+    RealCosh _ -> ravUnbounded
+    RealExp _ -> ravUnbounded
+    RealLog _ -> ravUnbounded
+
+    BVUnaryTerm u -> UnaryBV.domain bvParams f u
+    BVConcat _ x y -> BVD.concat bvParams (bvWidth x) (f x) (bvWidth y) (f y)
+    BVSelect i n x -> BVD.select bvParams i n (f x)
+    BVNeg w x   -> BVD.negate bvParams w (f x)
+    BVAdd w x y -> BVD.add bvParams w (f x) (f y)
+    {-
+    BVSum w s ->   WSum.eval add smul single s
+      where add = BVD.add bvParams w
+            smul c x = BVD.mul bvParams w (BVD.singleton w c) (f x)
+            single = BVD.singleton w
+-}
+    BVMul w x y -> BVD.mul bvParams w (f x) (f y)
+    BVUdiv w x y -> BVD.udiv w (f x) (f y)
+    BVUrem w x y -> BVD.urem w (f x) (f y)
+    BVSdiv w x y -> BVD.sdiv w (f x) (f y)
+    BVSrem w x y -> BVD.srem w (f x) (f y)
+    BVIte w _ _ x y -> BVD.union bvParams w (f x) (f y)
+
+    BVShl  w x y -> BVD.shl w (f x) (f y)
+    BVLshr w x y -> BVD.lshr w (f x) (f y)
+    BVAshr w x y -> BVD.ashr w (f x) (f y)
+    BVZext w x   -> BVD.zext (f x) w
+    BVSext w x   -> BVD.sext bvParams (bvWidth x) (f x) w
+
+    BVPopcount w _ -> BVD.range w 0 (intValue w)
+    BVCountLeadingZeros w _ -> BVD.range w 0 (intValue w)
+    BVCountTrailingZeros w _ -> BVD.range w 0 (intValue w)
+
+    BVBitNot w x   -> BVD.not w (f x)
+    BVBitAnd w x y -> BVD.and w (f x) (f y)
+    BVBitOr  w x y -> BVD.or  w (f x) (f y)
+    BVBitXor w x y -> BVD.xor w (f x) (f y)
+
+    FloatPZero{} -> ()
+    FloatNZero{} -> ()
+    FloatNaN{} -> ()
+    FloatPInf{} -> ()
+    FloatNInf{} -> ()
+    FloatNeg{} -> ()
+    FloatAbs{} -> ()
+    FloatSqrt{} -> ()
+    FloatAdd{} -> ()
+    FloatSub{} -> ()
+    FloatMul{} -> ()
+    FloatDiv{} -> ()
+    FloatRem{} -> ()
+    FloatMin{} -> ()
+    FloatMax{} -> ()
+    FloatFMA{} -> ()
+    FloatEq{} -> Nothing
+    FloatFpEq{} -> Nothing
+    FloatFpNe{} -> Nothing
+    FloatLe{} -> Nothing
+    FloatLt{} -> Nothing
+    FloatIsNaN{} -> Nothing
+    FloatIsInf{} -> Nothing
+    FloatIsZero{} -> Nothing
+    FloatIsPos{} -> Nothing
+    FloatIsNeg{} -> Nothing
+    FloatIsSubnorm{} -> Nothing
+    FloatIsNorm{} -> Nothing
+    FloatIte{} -> ()
+    FloatCast{} -> ()
+    FloatRound{} -> ()
+    FloatFromBinary{} -> ()
+    FloatToBinary fpp _ -> case floatPrecisionToBVType fpp of
+      BaseBVRepr w -> BVD.range w (minUnsigned w) (maxUnsigned w)
+    BVToFloat{} -> ()
+    SBVToFloat{} -> ()
+    RealToFloat{} -> ()
+    FloatToBV w _ _ -> BVD.range w (minUnsigned w) (maxUnsigned w)
+    FloatToSBV w _ _ -> BVD.range w (minSigned w) (maxSigned w)
+    FloatToReal{} -> ravUnbounded
+
+    ArrayMap _ bRepr m d ->
+      withAbstractable bRepr $
+        Map.foldl' (\av e -> avJoin bRepr (f e) av) (f d) (Hash.hashedMap m)
+    ConstantArray _idxRepr _bRepr v -> f v
+    MuxArray _idxRepr bRepr _ x y ->
+       withAbstractable bRepr $ avJoin bRepr (f x) (f y)
+    SelectArray _bRepr a _i -> f a  -- FIXME?
+    UpdateArray bRepr _ a _i v -> withAbstractable bRepr $ avJoin bRepr (f a) (f v)
+
+    NatToInteger x -> natRangeToRange (f x)
+    IntegerToReal x -> RAV (mapRange toRational (f x)) (Just True)
+    BVToNat x -> natRange (fromInteger lx) (Inclusive (fromInteger ux))
+      where Just (lx, ux) = BVD.ubounds (bvWidth x) (f x)
+    BVToInteger x -> valueRange (Inclusive lx) (Inclusive ux)
+      where Just (lx, ux) = BVD.ubounds (bvWidth x) (f x)
+    SBVToInteger x -> valueRange (Inclusive lx) (Inclusive ux)
+      where Just (lx, ux) = BVD.sbounds (bvWidth x) (f x)
+    PredToBV p ->
+      case f p of
+        Nothing    -> BVD.range (knownNat @1) 0 1
+        Just True  -> BVD.singleton (knownNat @1) 1
+        Just False -> BVD.singleton (knownNat @1) 0
+    RoundReal x -> mapRange roundAway (ravRange (f x))
+    FloorReal x -> mapRange floor (ravRange (f x))
+    CeilReal x  -> mapRange ceiling (ravRange (f x))
+    IntegerToNat x ->
+       case f x of
+         SingleRange c              -> NatSingleRange (fromInteger (max 0 c))
+         MultiRange Unbounded u     -> natRange 0 (fromInteger . max 0 <$> u)
+         MultiRange (Inclusive l) u -> natRange (fromInteger (max 0 l)) (fromInteger . max 0 <$> u)
+    IntegerToBV x w -> BVD.range w l u
+      where rng = f x
+            l = case rangeLowBound rng of
+                  Unbounded -> minUnsigned w
+                  Inclusive v -> max (minUnsigned w) v
+            u = case rangeHiBound rng of
+                  Unbounded -> maxUnsigned w
+                  Inclusive v -> min (maxUnsigned w) v
+    RealToInteger x -> valueRange (ceiling <$> lx) (floor <$> ux)
+      where lx = rangeLowBound rng
+            ux = rangeHiBound rng
+            rng = ravRange (f x)
+
+    Cplx c -> f <$> c
+    RealPart x -> realPart (f x)
+    ImagPart x -> imagPart (f x)
+
+    StructCtor _ flds -> fmapFC (\v -> AbstractValueWrapper (f v)) flds
+    StructField s idx _ -> unwrapAV (f s Ctx.! idx)
+    StructIte flds _p x y ->
+      let tp = BaseStructRepr flds
+       in withAbstractable tp $ avJoin tp (f x) (f y)
+
+-- | Get abstract value associated with element.
+exprAbsValue :: Expr t tp -> AbstractValue tp
+exprAbsValue (SemiRingLiteral sr x _) =
+  case sr of
+    SemiRingNat  -> natSingleRange x
+    SemiRingInt  -> singleRange x
+    SemiRingReal -> ravSingle x
+exprAbsValue (StringExpr{})   = ()
+exprAbsValue (BVExpr w c _)   = BVD.singleton w c
+exprAbsValue (NonceAppExpr e) = nonceExprAbsValue e
+exprAbsValue (AppExpr e)      = appExprAbsValue e
+exprAbsValue (BoundVarExpr v) =
+  fromMaybe (unconstrainedAbsValue (bvarType v)) (bvarAbstractValue v)
+
+-- | Return an unconstrained abstract value.
+unconstrainedAbsValue :: BaseTypeRepr tp -> AbstractValue tp
+unconstrainedAbsValue tp = withAbstractable tp (avTop tp)
+
+------------------------------------------------------------------------
 
 -- Dummy declaration splice to bring App into template haskell scope.
 $(return [])
@@ -1359,7 +1652,7 @@ ppVarTypeCode tp =
     BaseStructRepr _ -> "struct"
 
 -- | Either a argument or text or text
-type PrettyArg (e :: BaseType -> *) = Either (Some e) Text
+type PrettyArg (e :: BaseType -> Type) = Either (Some e) Text
 
 exprPrettyArg :: e tp -> PrettyArg e
 exprPrettyArg e = Left $! Some e
@@ -1524,7 +1817,10 @@ ppApp' a0 = do
 
     BVZext w x -> prettyApp "bvZext"   [showPrettyArg w, exprPrettyArg x]
     BVSext w x -> prettyApp "bvSext"   [showPrettyArg w, exprPrettyArg x]
-    BVTrunc w x -> prettyApp "bvTrunc" [showPrettyArg w, exprPrettyArg x]
+
+    BVPopcount w x -> prettyApp "bvPopcount" [showPrettyArg w, exprPrettyArg x]
+    BVCountLeadingZeros w x -> prettyApp "bvCountLeadingZeros" [showPrettyArg w, exprPrettyArg x]
+    BVCountTrailingZeros w x -> prettyApp "bvCountTrailingZeros" [showPrettyArg w, exprPrettyArg x]
 
     BVBitNot _ x   -> ppSExpr "bvNot" [x]
     BVBitAnd _ x y -> ppSExpr "bvAnd" [x, y]
@@ -1563,7 +1859,9 @@ ppApp' a0 = do
     FloatIsNorm x -> ppSExpr "floatIsNorm" [x]
     FloatIte _ c x y -> ppITE "floatIte" c x y
     FloatCast _ r x -> ppSExpr (Text.pack $ "floatCast " <> show r) [x]
+    FloatRound _ r x -> ppSExpr (Text.pack $ "floatRound " <> show r) [x]
     FloatFromBinary _ x -> ppSExpr "floatFromBinary" [x]
+    FloatToBinary _ x -> ppSExpr "floatToBinary" [x]
     BVToFloat _ r x -> ppSExpr (Text.pack $ "bvToFloat " <> show r) [x]
     SBVToFloat _ r x -> ppSExpr (Text.pack $ "sbvToFloat " <> show r) [x]
     RealToFloat _ r x -> ppSExpr (Text.pack $ "realToFloat " <> show r) [x]
@@ -1620,8 +1918,7 @@ ppApp' a0 = do
       prettyApp "field" [exprPrettyArg s, showPrettyArg idx]
     StructIte _ c x y -> ppITE "ite" c x y
 
-------------------------------------------------------------------------
--- NonceApp operations
+
 
 instance Eq (NonceApp t (Expr t) tp) where
   x == y = isJust (testEquality x y)
@@ -1732,6 +2029,39 @@ traverseApp =
       )
     ]
    )
+
+-- | Return 'true' if an app represents a non-linear operation.
+-- Controls whether the non-linear counter ticks upward in the
+-- 'Statistics'.
+isNonLinearApp :: App e tp -> Bool
+isNonLinearApp app = case app of
+  -- FIXME: These are just guesses; someone who knows what's actually
+  -- slow in the solvers should correct them.
+  SemiRingMul {} -> True
+  NatDiv {} -> True
+  NatMod {} -> True
+  IntDiv {} -> True
+  IntMod {} -> True
+  IntDivisible {} -> True
+  RealDiv {} -> True
+  RealSqrt {} -> True
+  RealSin {} -> True
+  RealCos {} -> True
+  RealATan2 {} -> True
+  RealSinh {} -> True
+  RealCosh {} -> True
+  RealExp {} -> True
+  RealLog {} -> True
+  BVMul {} -> True
+  BVUdiv {} -> True
+  BVUrem {} -> True
+  BVSdiv {} -> True
+  BVSrem {} -> True
+  FloatSqrt {} -> True
+  FloatMul {} -> True
+  FloatDiv {} -> True
+  FloatRem {} -> True
+  _ -> False
 
 ------------------------------------------------------------------------
 -- Expr operations
@@ -2242,233 +2572,6 @@ newCachedStorage g sz = stToIO $ do
                         , nonceExpr = cachedNonceExpr g predCache
                         }
 
-------------------------------------------------------------------------
--- abstractEval
-
--- | Return abstract domain associated with a nonce app
-quantAbsEval :: ExprBuilder t st fs
-             -> (forall u . Expr t u -> AbstractValue u)
-             -> NonceApp t (Expr t) tp
-             -> AbstractValue tp
-quantAbsEval _ f q =
-  case q of
-    Forall _ v -> f v
-    Exists _ v -> f v
-    ArrayFromFn _       -> unconstrainedAbsValue (nonceAppType q)
-    MapOverArrays g _ _ -> unconstrainedAbsValue tp
-      where tp = symFnReturnType g
-    ArrayTrueOnEntries _ a -> f a
-    FnApp g _           -> unconstrainedAbsValue (symFnReturnType g)
-
-abstractEval :: BVD.BVDomainParams
-             -> (forall u . Expr t u -> AbstractValue u)
-             -> App (Expr t) tp
-             -> AbstractValue tp
-abstractEval bvParams f a0 = do
-  case a0 of
-
-    ------------------------------------------------------------------------
-    -- Boolean operations
-    TrueBool -> Just True
-    FalseBool -> Just False
-    NotBool x -> not <$> f x
-    AndBool x y -> absAnd (f x) (f y)
-    XorBool x y -> Bits.xor <$> f x <*> f y
-    IteBool c x y | Just True  <- f c -> f x
-                  | Just False <- f c -> f y
-                  | Just True  <- f x -> absOr  (f c) (f y)
-                  | Just False <- f x -> absAnd (not <$> f c) (f y)
-                  | Just True  <- f y -> absOr  (not <$> f c) (f x)
-                  | Just False <- f y -> absAnd (f c) (f x)
-                  | otherwise -> Nothing
-
-    SemiRingEq{} -> Nothing
-    SemiRingLe{} -> Nothing
-    RealIsInteger{} -> Nothing
-    BVTestBit{} -> Nothing
-    BVEq{} -> Nothing
-    BVSlt{} -> Nothing
-    BVUlt{} -> Nothing
-    ArrayEq{} -> Nothing
-
-    ------------------------------------------------------------------------
-    -- Arithmetic operations
-
-    NatDiv x y -> natRangeDiv (f x) (f y)
-    NatMod x y -> natRangeMod (f x) (f y)
-
-    IntAbs x -> intAbsRange (f x)
-    IntDiv x y -> intDivRange (f x) (f y)
-    IntMod x y -> intModRange (f x) (f y)
-    IntDivisible x 0 -> rangeCheckEq (SingleRange 0) (f x)
-    IntDivisible x n -> rangeCheckEq (SingleRange 0) (intModRange (f x) (SingleRange (toInteger n)))
-
-    SemiRingMul SemiRingInt x y -> mulRange (f x) (f y)
-    SemiRingSum SemiRingInt s -> WSum.eval addRange smul SingleRange s
-      where smul sm e = rangeScalarMul sm (f e)
-    SemiRingIte SemiRingInt _ x y -> joinRange (f x) (f y)
-
-    SemiRingMul SemiRingNat x y -> natRangeMul (f x) (f y)
-    SemiRingSum SemiRingNat s -> WSum.eval natRangeAdd smul natSingleRange s
-      where smul sm e = natRangeScalarMul sm (f e)
-    SemiRingIte SemiRingNat _ x y -> natRangeJoin (f x) (f y)
-
-    SemiRingMul SemiRingReal x y -> ravMul (f x) (f y)
-    SemiRingSum SemiRingReal s -> WSum.eval ravAdd smul ravSingle s
-      where smul sm e = ravScalarMul sm (f e)
-    SemiRingIte SemiRingReal _ x y -> ravJoin (f x) (f y)
-
-    RealDiv _ _ -> ravUnbounded
-    RealSqrt _  -> ravUnbounded
-    Pi -> ravConcreteRange 3.14 3.15
-    RealSin _ -> ravConcreteRange (-1) 1
-    RealCos _ -> ravConcreteRange (-1) 1
-    RealATan2 _ _ -> ravUnbounded
-    RealSinh _ -> ravUnbounded
-    RealCosh _ -> ravUnbounded
-    RealExp _ -> ravUnbounded
-    RealLog _ -> ravUnbounded
-
-    BVUnaryTerm u -> UnaryBV.domain bvParams f u
-    BVConcat _ x y -> BVD.concat bvParams (bvWidth x) (f x) (bvWidth y) (f y)
-    BVSelect i n d -> BVD.select (natValue i) n (f d)
-    BVNeg w x   -> BVD.negate bvParams w (f x)
-    BVAdd w x y -> BVD.add bvParams w (f x) (f y)
-    {-
-    BVSum w s ->   WSum.eval add smul single s
-      where add = BVD.add bvParams w
-            smul c x = BVD.mul bvParams w (BVD.singleton w c) (f x)
-            single = BVD.singleton w
--}
-    BVMul w x y -> BVD.mul bvParams w (f x) (f y)
-    BVUdiv w x y -> BVD.udiv w (f x) (f y)
-    BVUrem w x y -> BVD.urem w (f x) (f y)
-    BVSdiv w x y -> BVD.sdiv w (f x) (f y)
-    BVSrem w x y -> BVD.srem w (f x) (f y)
-    BVIte w _ _ x y -> BVD.union bvParams w (f x) (f y)
-
-    BVShl  w x y -> BVD.shl w (f x) (f y)
-    BVLshr w x y -> BVD.lshr w (f x) (f y)
-    BVAshr w x y -> BVD.ashr w (f x) (f y)
-    BVZext w x   -> BVD.zext (f x) w
-    BVSext w x   -> BVD.sext bvParams (bvWidth x) (f x) w
-    BVTrunc w x  -> BVD.trunc bvParams (f x) w
-
-    BVBitNot w x   -> BVD.not w (f x)
-    BVBitAnd w x y -> BVD.and w (f x) (f y)
-    BVBitOr  w x y -> BVD.or  w (f x) (f y)
-    BVBitXor w x y -> BVD.xor w (f x) (f y)
-
-    FloatPZero{} -> ()
-    FloatNZero{} -> ()
-    FloatNaN{} -> ()
-    FloatPInf{} -> ()
-    FloatNInf{} -> ()
-    FloatNeg{} -> ()
-    FloatAbs{} -> ()
-    FloatSqrt{} -> ()
-    FloatAdd{} -> ()
-    FloatSub{} -> ()
-    FloatMul{} -> ()
-    FloatDiv{} -> ()
-    FloatRem{} -> ()
-    FloatMin{} -> ()
-    FloatMax{} -> ()
-    FloatFMA{} -> ()
-    FloatEq{} -> Nothing
-    FloatFpEq{} -> Nothing
-    FloatFpNe{} -> Nothing
-    FloatLe{} -> Nothing
-    FloatLt{} -> Nothing
-    FloatIsNaN{} -> Nothing
-    FloatIsInf{} -> Nothing
-    FloatIsZero{} -> Nothing
-    FloatIsPos{} -> Nothing
-    FloatIsNeg{} -> Nothing
-    FloatIsSubnorm{} -> Nothing
-    FloatIsNorm{} -> Nothing
-    FloatIte{} -> ()
-    FloatCast{} -> ()
-    FloatFromBinary{} -> ()
-    BVToFloat{} -> ()
-    SBVToFloat{} -> ()
-    RealToFloat{} -> ()
-    FloatToBV w _ _ -> BVD.range w (minUnsigned w) (maxUnsigned w)
-    FloatToSBV w _ _ -> BVD.range w (minSigned w) (maxSigned w)
-    FloatToReal{} -> ravUnbounded
-
-    ArrayMap _ bRepr m d ->
-      withAbstractable bRepr $
-        Map.foldl' (\av e -> avJoin bRepr (f e) av) (f d) (Hash.hashedMap m)
-    ConstantArray _idxRepr _bRepr v -> f v
-    MuxArray _idxRepr bRepr _ x y ->
-       withAbstractable bRepr $ avJoin bRepr (f x) (f y)
-    SelectArray _bRepr a _i -> f a  -- FIXME?
-    UpdateArray bRepr _ a _i v -> withAbstractable bRepr $ avJoin bRepr (f a) (f v)
-
-    NatToInteger x -> natRangeToRange (f x)
-    IntegerToReal x -> RAV (mapRange toRational (f x)) (Just True)
-    BVToNat x -> natRange (fromInteger lx) (Inclusive (fromInteger ux))
-      where Just (lx, ux) = BVD.ubounds (bvWidth x) (f x)
-    BVToInteger x -> valueRange (Inclusive lx) (Inclusive ux)
-      where Just (lx, ux) = BVD.ubounds (bvWidth x) (f x)
-    SBVToInteger x -> valueRange (Inclusive lx) (Inclusive ux)
-      where Just (lx, ux) = BVD.sbounds (bvWidth x) (f x)
-    PredToBV p ->
-      case f p of
-        Nothing    -> BVD.range (knownNat @1) 0 1
-        Just True  -> BVD.singleton (knownNat @1) 1
-        Just False -> BVD.singleton (knownNat @1) 0
-    RoundReal x -> mapRange roundAway (ravRange (f x))
-    FloorReal x -> mapRange floor (ravRange (f x))
-    CeilReal x  -> mapRange ceiling (ravRange (f x))
-    IntegerToNat x ->
-       case f x of
-         SingleRange c              -> NatSingleRange (fromInteger (max 0 c))
-         MultiRange Unbounded u     -> natRange 0 (fromInteger . max 0 <$> u)
-         MultiRange (Inclusive l) u -> natRange (fromInteger (max 0 l)) (fromInteger . max 0 <$> u)
-    IntegerToBV x w -> BVD.range w l u
-      where rng = f x
-            l = case rangeLowBound rng of
-                  Unbounded -> minUnsigned w
-                  Inclusive v -> max (minUnsigned w) v
-            u = case rangeHiBound rng of
-                  Unbounded -> maxUnsigned w
-                  Inclusive v -> min (maxUnsigned w) v
-    RealToInteger x -> valueRange (ceiling <$> lx) (floor <$> ux)
-      where lx = rangeLowBound rng
-            ux = rangeHiBound rng
-            rng = ravRange (f x)
-
-    Cplx c -> f <$> c
-    RealPart x -> realPart (f x)
-    ImagPart x -> imagPart (f x)
-
-    StructCtor _ flds -> fmapFC (\v -> AbstractValueWrapper (f v)) flds
-    StructField s idx _ -> unwrapAV (f s Ctx.! idx)
-    StructIte flds _p x y ->
-      let tp = BaseStructRepr flds
-       in withAbstractable tp $ avJoin tp (f x) (f y)
-
--- | Get abstract value associated with element.
-exprAbsValue :: Expr t tp -> AbstractValue tp
-exprAbsValue (SemiRingLiteral sr x _) =
-  case sr of
-    SemiRingNat  -> natSingleRange x
-    SemiRingInt  -> singleRange x
-    SemiRingReal -> ravSingle x
-exprAbsValue (StringExpr{})   = ()
-exprAbsValue (BVExpr w c _)   = BVD.singleton w c
-exprAbsValue (NonceAppExpr e) = nonceExprAbsValue e
-exprAbsValue (AppExpr e)      = appExprAbsValue e
-exprAbsValue (BoundVarExpr v) = unconstrainedAbsValue (bvarType v)
-
--- | Return an unconstrained abstract value.
-unconstrainedAbsValue :: BaseTypeRepr tp -> AbstractValue tp
-unconstrainedAbsValue tp = withAbstractable tp (avTop tp)
-
-------------------------------------------------------------------------
-
 instance PolyEq (Expr t x) (Expr t y) where
   polyEqF x y = do
     Refl <- testEquality x y
@@ -2518,7 +2621,7 @@ instance HashableF (App (Expr t)) where
 -- values with a corresponding type @f tp@. It is a mutable map using
 -- an 'IO' hash table. Parameter @t@ is a phantom type brand used to
 -- track nonces.
-newtype IdxCache t (f :: BaseType -> *)
+newtype IdxCache t (f :: BaseType -> Type)
       = IdxCache { cMap :: PH.HashTable RealWorld (Nonce t) f }
 
 -- | Create a new IdxCache
@@ -2619,6 +2722,8 @@ sbMakeExpr sym a = do
   params <- sbBVDomainParams sym
   pc <- curProgramLoc sym
   let v = abstractEval params exprAbsValue a
+  when (isNonLinearApp a) $
+    modifyIORef' (sbNonLinearOps sym) (+1)
   case appType a of
     -- Check if abstract interpretation concludes this is a constant.
     BaseBoolRepr | Just b <- v -> return $ backendPred sym b
@@ -2640,15 +2745,17 @@ updateVarBinding :: ExprBuilder t st fs
 updateVarBinding sym nm v
   | nm == emptySymbol = return ()
   | otherwise =
-    modifyIORef' (sbVarBindings sym) $ (Bimap.insert nm $! v)
+    modifyIORef' (sbVarBindings sym) $ (ins nm $! v)
+  where ins n x (SymbolVarBimap m) = SymbolVarBimap (Bimap.insert n x m)
 
 -- | Creates a new bound var.
 sbMakeBoundVar :: ExprBuilder t st fs
                -> SolverSymbol
                -> BaseTypeRepr tp
                -> VarKind
+               -> Maybe (AbstractValue tp)
                -> IO (ExprBoundVar t tp)
-sbMakeBoundVar sym nm tp k = do
+sbMakeBoundVar sym nm tp k absVal = do
   n  <- sbFreshIndex sym
   pc <- curProgramLoc sym
   return $! BVar { bvarId   = n
@@ -2656,6 +2763,7 @@ sbMakeBoundVar sym nm tp k = do
                  , bvarName = nm
                  , bvarType = tp
                  , bvarKind = k
+                 , bvarAbstractValue = absVal
                  }
 
 -- | Create fresh index
@@ -2773,9 +2881,10 @@ newExprBuilder st gen = do
 
   loc_ref       <- newIORef initializationLoc
   storage_ref   <- newIORef es
-  bindings_ref  <- newIORef Bimap.empty
+  bindings_ref  <- newIORef emptySymbolVarBimap
   uninterp_fn_cache_ref <- newIORef Map.empty
   matlabFnCache <- stToIO $ PH.new
+  loggerRef     <- newIORef Nothing
 
   -- Set up configuration options
   cfg <- CFG.initialConfig 0
@@ -2787,6 +2896,7 @@ newExprBuilder st gen = do
   domainRangeSetting <- CFG.getOptionSetting bvdomainRangeLimitOption cfg
   cacheStartSetting  <- CFG.getOptionSetting cacheStartSizeOption cfg
   CFG.extendConfig [cacheOptDesc gen storage_ref cacheStartSetting] cfg
+  nonLinearOps <- newIORef 0
 
   return $! SB { sbTrue  = t
                , sbFalse = f
@@ -2799,10 +2909,12 @@ newExprBuilder st gen = do
                , sbProgramLoc = loc_ref
                , exprCounter = gen
                , curAllocator = storage_ref
+               , sbNonLinearOps = nonLinearOps
                , sbStateManager = st_ref
                , sbVarBindings = bindings_ref
                , sbUninterpFnCache = uninterp_fn_cache_ref
                , sbMatlabFnCache = matlabFnCache
+               , sbSolverLogger = loggerRef
                }
 
 -- | Get current variable bindings.
@@ -2977,49 +3089,54 @@ reduceApp sym a0 = do
     BVAshr _ x y -> bvAshr sym x y
     BVZext  w x  -> bvZext sym w x
     BVSext  w x  -> bvSext sym w x
-    BVTrunc w x  -> bvTrunc sym w x
+    BVPopcount _ x -> bvPopcount sym x
+    BVCountLeadingZeros _ x -> bvCountLeadingZeros sym x
+    BVCountTrailingZeros _ x -> bvCountTrailingZeros sym x
+
     BVBitNot _ x -> bvNotBits sym x
     BVBitAnd _ x y -> bvAndBits sym x y
     BVBitOr  _ x y -> bvOrBits  sym x y
     BVBitXor _ x y -> bvXorBits sym x y
 
-    FloatPZero{}      -> sbMakeExpr sym a0
-    FloatNZero{}      -> sbMakeExpr sym a0
-    FloatNaN{}        -> sbMakeExpr sym a0
-    FloatPInf{}       -> sbMakeExpr sym a0
-    FloatNInf{}       -> sbMakeExpr sym a0
-    FloatNeg{}        -> sbMakeExpr sym a0
-    FloatAbs{}        -> sbMakeExpr sym a0
-    FloatSqrt{}       -> sbMakeExpr sym a0
-    FloatAdd{}        -> sbMakeExpr sym a0
-    FloatSub{}        -> sbMakeExpr sym a0
-    FloatMul{}        -> sbMakeExpr sym a0
-    FloatDiv{}        -> sbMakeExpr sym a0
-    FloatRem{}        -> sbMakeExpr sym a0
-    FloatMin{}        -> sbMakeExpr sym a0
-    FloatMax{}        -> sbMakeExpr sym a0
-    FloatFMA{}        -> sbMakeExpr sym a0
-    FloatEq{}         -> sbMakeExpr sym a0
-    FloatFpEq{}       -> sbMakeExpr sym a0
-    FloatFpNe{}       -> sbMakeExpr sym a0
-    FloatLe{}         -> sbMakeExpr sym a0
-    FloatLt{}         -> sbMakeExpr sym a0
-    FloatIsNaN{}      -> sbMakeExpr sym a0
-    FloatIsInf{}      -> sbMakeExpr sym a0
-    FloatIsZero{}     -> sbMakeExpr sym a0
-    FloatIsPos{}      -> sbMakeExpr sym a0
-    FloatIsNeg{}      -> sbMakeExpr sym a0
-    FloatIsSubnorm{}  -> sbMakeExpr sym a0
-    FloatIsNorm{}     -> sbMakeExpr sym a0
-    FloatIte{}        -> sbMakeExpr sym a0
-    FloatCast{}       -> sbMakeExpr sym a0
-    FloatFromBinary{} -> sbMakeExpr sym a0
-    BVToFloat{}       -> sbMakeExpr sym a0
-    SBVToFloat{}      -> sbMakeExpr sym a0
-    RealToFloat{}     -> sbMakeExpr sym a0
-    FloatToBV{}       -> sbMakeExpr sym a0
-    FloatToSBV{}      -> sbMakeExpr sym a0
-    FloatToReal{}     -> sbMakeExpr sym a0
+    FloatPZero fpp -> floatPZero sym fpp
+    FloatNZero fpp -> floatNZero sym fpp
+    FloatNaN   fpp -> floatNaN sym fpp
+    FloatPInf  fpp -> floatPInf sym fpp
+    FloatNInf  fpp -> floatNInf sym fpp
+    FloatNeg _ x -> floatNeg sym x
+    FloatAbs _ x -> floatAbs sym x
+    FloatSqrt _ r x -> floatSqrt sym r x
+    FloatAdd _ r x y -> floatAdd sym r x y
+    FloatSub _ r x y -> floatSub sym r x y
+    FloatMul _ r x y -> floatMul sym r x y
+    FloatDiv _ r x y -> floatDiv sym r x y
+    FloatRem _ x y -> floatRem sym x y
+    FloatMin _ x y -> floatMin sym x y
+    FloatMax _ x y -> floatMax sym x y
+    FloatFMA _ r x y z -> floatFMA sym r x y z
+    FloatEq   x y -> floatEq sym x y
+    FloatFpEq x y -> floatFpEq sym x y
+    FloatFpNe x y -> floatFpNe sym x y
+    FloatLe   x y -> floatLe sym x y
+    FloatLt   x y -> floatLt sym x y
+    FloatIsNaN     x -> floatIsNaN sym x
+    FloatIsInf     x -> floatIsInf sym x
+    FloatIsZero    x -> floatIsZero sym x
+    FloatIsPos     x -> floatIsPos sym x
+    FloatIsNeg     x -> floatIsNeg sym x
+    FloatIsSubnorm x -> floatIsSubnorm sym x
+    FloatIsNorm    x -> floatIsNorm sym x
+    FloatIte _ c x y -> floatIte sym c x y
+    FloatCast fpp r x -> floatCast sym fpp r x
+    FloatRound  _ r x -> floatRound sym r x
+    FloatFromBinary fpp x -> floatFromBinary sym fpp x
+    FloatToBinary   _   x -> floatToBinary sym x
+    BVToFloat   fpp r x -> bvToFloat sym fpp r x
+    SBVToFloat  fpp r x -> sbvToFloat sym fpp r x
+    RealToFloat fpp r x -> realToFloat sym fpp r x
+    FloatToBV   w   r x -> floatToBV sym w r x
+    FloatToSBV  w   r x -> floatToSBV sym w r x
+    FloatToReal x -> floatToReal sym x
 
     ArrayEq x y -> arrayEq sym x y
     ArrayMap _ _ m def_map ->
@@ -3440,10 +3557,11 @@ semiRingLe
    :: WSum.SemiRingCoefficient tp
    => ExprBuilder t st fs
    -> SemiRingRepr tp
+   -> (Expr t tp -> Expr t tp -> IO (Expr t BaseBoolType)) {- ^ recursive call for simplifications -}
    -> Expr t tp
    -> Expr t tp
    -> IO (Expr t BaseBoolType)
-semiRingLe sym sr x y
+semiRingLe sym sr rec x y
       -- Check for syntactic equality.
     | x == y = return (truePred sym)
 
@@ -3453,6 +3571,16 @@ semiRingLe sym sr x y
       -- Another strength reduction
     | Just (SemiRingMul _ u v) <- asApp x, SemiRingLiteral _ 0 _ <- y = do
       leNonpos le y sym u v
+
+      -- Push some comparisons under if/then/else
+    | SemiRingLiteral _ _ _ <- x
+    , Just (SemiRingIte _ c a b) <- asApp y
+    = join (itePred sym c <$> rec x a <*> rec x b)
+
+      -- Push some comparisons under if/then/else
+    | Just (SemiRingIte _ c a b) <- asApp x
+    , SemiRingLiteral _ _ _ <- y
+    = join (itePred sym c <$> rec a y <*> rec b y)
 
       -- Simplify ite expressions when one of the values is ground.
       -- This appears to occur fairly often due to range checks.
@@ -3491,12 +3619,23 @@ semiRingLe sym sr x y
 semiRingEq :: WSum.SemiRingCoefficient tp
            => ExprBuilder t st fs
            -> SemiRingRepr tp
+           -> (Expr t tp -> Expr t tp -> IO (Expr t BaseBoolType)) {- ^ recursive call for simplifications -}
            -> Expr t tp
            -> Expr t tp
            -> IO (Expr t BaseBoolType)
-semiRingEq sym sr x y
+semiRingEq sym sr rec x y
   -- Check for syntactic equality.
   | x == y = return (truePred sym)
+
+    -- Push some equalities under if/then/else
+  | SemiRingLiteral _ _ _ <- x
+  , Just (SemiRingIte _ c a b) <- asApp y
+  = join (itePred sym c <$> rec x a <*> rec x b)
+
+    -- Push some equalities under if/then/else
+  | Just (SemiRingIte _ c a b) <- asApp x
+  , SemiRingLiteral _ _ _ <- y
+  = join (itePred sym c <$> rec a y <*> rec b y)
 
   | (z, x',y') <- WSum.extractCommon (asWeightedSum x) (asWeightedSum y)
   , not (WSum.isZero z) =
@@ -3703,8 +3842,23 @@ bvSum :: (1 <= w)
 bvSum = undefined
 -}
 
+
 instance IsExprBuilder (ExprBuilder t st fs) where
   getConfiguration = sbConfiguration
+
+  setSolverLogListener sb = writeIORef (sbSolverLogger sb)
+  getSolverLogListener sb = readIORef (sbSolverLogger sb)
+
+  logSolverEvent sb ev =
+    readIORef (sbSolverLogger sb) >>= \case
+      Nothing -> return ()
+      Just f  -> f ev
+
+  getStatistics sb = do
+    allocs <- countNoncesGenerated (exprCounter sb)
+    nonLinearOps <- readIORef (sbNonLinearOps sb)
+    return $ Statistics { statAllocs = allocs
+                        , statNonLinearOps = nonLinearOps }
 
   ----------------------------------------------------------------------
   -- Program location operations
@@ -3835,14 +3989,14 @@ instance IsExprBuilder (ExprBuilder t st fs) where
     = return (backendPred sym b)
 
     | otherwise
-    = semiRingEq sym SemiRingNat x y
+    = semiRingEq sym SemiRingNat (natEq sym) x y
 
   natLe sym x y
     | Just b <- natCheckLe (exprAbsValue x) (exprAbsValue y)
     = return (backendPred sym b)
 
     | otherwise
-    = semiRingLe sym SemiRingNat x y
+    = semiRingLe sym SemiRingNat (natLe sym) x y
 
   ----------------------------------------------------------------------
   -- Integer operations.
@@ -3926,7 +4080,7 @@ instance IsExprBuilder (ExprBuilder t st fs) where
          then return (falsePred sym)
          else bvEq sym ybv =<< bvLit sym w xi
 
-    | otherwise = semiRingEq sym SemiRingInt x y
+    | otherwise = semiRingEq sym SemiRingInt (intEq sym) x y
 
   intLe sym x y
       -- Use abstract domains
@@ -4017,7 +4171,7 @@ instance IsExprBuilder (ExprBuilder t st fs) where
 -}
 
     | otherwise
-    = semiRingLe sym SemiRingInt x y
+    = semiRingLe sym SemiRingInt (intLe sym) x y
 
   intAbs sym x
     | Just i <- asInteger x = intLit sym (abs i)
@@ -4110,14 +4264,6 @@ instance IsExprBuilder (ExprBuilder t st fs) where
         , Just LeqProof <- isPosNat (addNat n1 n2)
         , Just LeqProof <- testLeq (addNat idx2 (addNat n1 n2)) (bvWidth a) ->
             bvSelect sym idx2 (addNat n1 n2) a
-      -- concat an adjacent selects to a trunc just makes a single select
-      _ | Just (BVSelect idx1 n1 a) <- asApp x
-        , Just (BVTrunc n2 b) <- asApp y
-        , Just Refl <- testEquality a b
-        , Just Refl <- testEquality idx1 n2
-        , Just LeqProof <- isPosNat (addNat n1 n2)
-        , Just LeqProof <- testLeq (addNat n1 n2) (bvWidth a) ->
-            bvSelect sym (knownNat :: NatRepr 0) (addNat n1 n2) a
       -- always reassociate to the right
       _ | Just (BVConcat _w a b) <- asApp x
         , Just _bv <- asUnsignedBV b
@@ -4150,20 +4296,39 @@ instance IsExprBuilder (ExprBuilder t st fs) where
     , Just LeqProof <- testLeq (addNat idx2 n) (bvWidth b) =
       bvSelect sb idx2 n b
 
-      -- select of a truncate is the same select before the truncate
-    | Just (BVTrunc _w b) <- asApp x
-    , Just LeqProof <- testLeq (addNat idx n) (bvWidth b) =
-      bvSelect sb idx n b
-
       -- select the entire bitvector is the identity function
     | Just _ <- testEquality idx (knownNat :: NatRepr 0)
     , Just Refl <- testEquality n (bvWidth x) =
       return x
 
-     -- select an initial segment is a truncate
-    | Just _ <- testEquality idx (knownNat :: NatRepr 0)
-    , Just LeqProof <- testLeq (incNat n) (bvWidth x) =
-      bvTrunc sb n x
+    | Just (BVShl w a b) <- asApp x
+    , Just diff <- asUnsignedBV b
+    , Just (Some diffRepr) <- someNat diff
+    , Just LeqProof <- testLeq diffRepr idx = do
+      Just LeqProof <- return $ testLeq (addNat (subNat idx diffRepr) n) w
+      bvSelect sb (subNat idx diffRepr) n a
+    | Just (BVShl _w _a b) <- asApp x
+    , Just diff <- asUnsignedBV b
+    , Just (Some diffRepr) <- someNat diff
+    , Just LeqProof <- testLeq (addNat idx n) diffRepr =
+      bvLit sb n 0
+
+    | Just (BVAshr w a b) <- asApp x
+    , Just diff <- asUnsignedBV b
+    , Just (Some diffRepr) <- someNat diff
+    , Just LeqProof <- testLeq (addNat (addNat idx diffRepr) n) w =
+      bvSelect sb (addNat idx diffRepr) n a
+
+    | Just (BVLshr w a b) <- asApp x
+    , Just diff <- asUnsignedBV b
+    , Just (Some diffRepr) <- someNat diff
+    , Just LeqProof <- testLeq (addNat (addNat idx diffRepr) n) w =
+      bvSelect sb (addNat idx diffRepr) n a
+    | Just (BVLshr w _a b) <- asApp x
+    , Just diff <- asUnsignedBV b
+    , Just (Some diffRepr) <- someNat diff
+    , Just LeqProof <- testLeq w (addNat idx diffRepr) =
+      bvLit sb n 0
 
       -- select from a sign extension
     | Just (BVSext w b) <- asApp x = do
@@ -4234,6 +4399,29 @@ instance IsExprBuilder (ExprBuilder t st fs) where
      Just Refl <- return $ testEquality (addNat n1 n2) n
      bvConcat sb a' b'
 
+    | Just (BVBitAnd _w a b) <- asApp x = do
+      a' <- bvSelect sb idx n a
+      b' <- bvSelect sb idx n b
+      bvAndBits sb a' b'
+
+    | Just (BVBitOr _w a b) <- asApp x = do
+      a' <- bvSelect sb idx n a
+      b' <- bvSelect sb idx n b
+      bvOrBits sb a' b'
+
+    | Just (BVBitXor _w a b) <- asApp x = do
+      a' <- bvSelect sb idx n a
+      b' <- bvSelect sb idx n b
+      bvXorBits sb a' b'
+
+    | Just (BVBitNot _w a) <- asApp x = do
+      a' <- bvSelect sb idx n a
+      bvNotBits sb a'
+
+    | Just (BVUnaryTerm u) <- asApp x
+    , Just Refl <- testEquality idx (knownNat @0) =
+      bvUnary sb =<< UnaryBV.trunc sb u n
+
       -- if none of the above apply, produce a basic select term
     | otherwise = sbMakeExpr sb $ BVSelect idx n x
 
@@ -4243,8 +4431,8 @@ instance IsExprBuilder (ExprBuilder t st fs) where
 
       -- Constant evaluation
     | Just yc <- asUnsignedBV y
-    , i <= toInteger (maxBound :: Int) =
-      return $! backendPred sym (yc `Bits.testBit` fromInteger i)
+    , i <= fromIntegral (maxBound :: Int) =
+      return $! backendPred sym (yc `Bits.testBit` fromIntegral i)
 
     | Just (BVZext _w y') <- asApp y =
       if i >= natValue (bvWidth y') then
@@ -4297,6 +4485,11 @@ instance IsExprBuilder (ExprBuilder t st fs) where
     , Just Refl <- testEquality w w' =
       do z <- bvIte sym c x' y'
          bvSext sym w z
+
+    | Just (FloatToBinary fpp1 x') <- asApp x
+    , Just (FloatToBinary fpp2 y') <- asApp y
+    , Just Refl <- testEquality fpp1 fpp2 =
+      floatToBinary sym =<< floatIte sym c x' y'
 
     | otherwise = do
         ut <- CFG.getOpt (sbUnaryThreshold sym)
@@ -4456,91 +4649,24 @@ instance IsExprBuilder (ExprBuilder t st fs) where
       Just LeqProof <- return $ testLeq (knownNat :: NatRepr 1) w
       sbMakeExpr sym (BVSext w x)
 
-  bvTrunc sym w x
-    -- constant case
-    | Just i <- asUnsignedBV x = bvLit sym w i
-
-    -- truncate of a select is a shorter select
-    | Just (BVSelect idx _n b) <- asApp x
-    , Just LeqProof <- testLeq (addNat idx w) (bvWidth b) =
-        bvSelect sym idx w b
-
-    -- trunc of a concat gives the second argument of concat
-    -- when the lengths are right
-    | Just (BVConcat _w' _a b) <- asApp x
-    , Just Refl <- testEquality w (bvWidth b) =
-        return b
-
-    -- trunc of a concat gives a trunc of the second argument
-    -- when the trunc is shorter than that argument
-    | Just (BVConcat _w' _a b) <- asApp x
-    , Just LeqProof <- testLeq (incNat w) (bvWidth b) =
-        bvTrunc sym w b
-
-    -- (trunc w (concat a b)) gives (concat a' b) when w is longer
-    -- than b, and where a' is an appropriately-truncated portion of a
-    | Just (BVConcat _w' a b) <- asApp x
-    , Just LeqProof <- testLeq (bvWidth b) w
-    , let diff = subNat w (bvWidth b)
-    , Just LeqProof <- isPosNat diff
-    , Just Refl <- testEquality (addNat diff (bvWidth b)) w
-    , Just LeqProof <- testLeq (incNat diff) (bvWidth a) = do
-        a' <- bvTrunc sym diff a
-        bvConcat sym a' b
-
-    -- trunc of a zero extend is either trunc of the argument (or the argument itself)
-    -- or else is just a shorter zero extend
-    | Just (BVZext _ y) <- asApp x = do
-      case compareF w (bvWidth y) of
-        LTF -> do
-          -- Add dynamic check for GHC typechecker.
-          Just LeqProof <- return $ testLeq (incNat w) (bvWidth y)
-          bvTrunc sym w y
-        EQF -> return y
-        GTF -> do
-         -- Add dynamic check for GHC typechecker.
-         Just LeqProof <- return $ testLeq (incNat (bvWidth y)) w
-         bvZext sym w y
-
-    -- trunc of a sign extend is either trunc of the argument (or the argument itself)
-    -- or else is just a shorter sign extend
-    | Just (BVSext _ y) <- asApp x = do
-      case compareF w (bvWidth y) of
-        LTF -> do
-          -- Add dynamic check for GHC typechecker.
-          Just LeqProof <- return $ testLeq (incNat w) (bvWidth y)
-          bvTrunc sym w y
-        EQF -> return y
-        GTF -> do
-         -- Add dynamic check for GHC typechecker.
-         Just LeqProof <- return $ testLeq (incNat (bvWidth y)) w
-         bvSext sym w y
-
-      -- Extend unary representation.
-    | Just (BVUnaryTerm u) <- asApp x = do
-      -- Add dynamic check for GHC typechecker.
-      Just LeqProof <- return $ isPosNat w
-      u' <- UnaryBV.trunc sym u w
-      bvUnary sym u'
-
-    -- nested truncs collapse
-    | Just (BVTrunc _ y) <- asApp x = do
-      Just LeqProof <- return $ testLeq (incNat w) (bvWidth y)
-      sbMakeExpr sym (BVTrunc w y)
-
-
-    -- no special case applies, just make a basic trunc expression
-    | otherwise =
-      sbMakeExpr sym $ BVTrunc w x
-
   bvNotBits sym x
     | Just i <- asUnsignedBV x = do
       bvLit sym (bvWidth x) $ i `Bits.xor` (maxUnsigned (bvWidth x))
     | Just (BVBitNot _ y) <- asApp x = return y
     | otherwise = sbMakeExpr sym $ BVBitNot (bvWidth x) x
 
-  bvAndBits = bvBinOp1 (Bits..&.) BVBitAnd
-  bvOrBits  = bvBinOp1 (Bits..|.) BVBitOr
+  bvAndBits sym x y
+    | Just 0 <- asUnsignedBV x = return x
+    | Just 0 <- asUnsignedBV y = return y
+    | Just (maxUnsigned (bvWidth x)) == asUnsignedBV x = return y
+    | Just (maxUnsigned (bvWidth x)) == asUnsignedBV y = return x
+    | otherwise = bvBinOp1 (Bits..&.) BVBitAnd sym x y
+  bvOrBits sym x y
+    | Just 0 <- asUnsignedBV x = return y
+    | Just 0 <- asUnsignedBV y = return x
+    | Just (maxUnsigned (bvWidth x)) == asUnsignedBV x = return x
+    | Just (maxUnsigned (bvWidth x)) == asUnsignedBV y = return y
+    | otherwise = bvBinOp1 (Bits..|.) BVBitOr sym x y
 
   -- Special case for the self-XOR trick, which compilers sometimes will use
   -- to zero the state of a register
@@ -4634,10 +4760,25 @@ instance IsExprBuilder (ExprBuilder t st fs) where
           zro <- bvLit sym w 0
           notPred sym =<< bvEq sym x zro
 
-  bvUdiv = bvBinDivOp1 div BVUdiv
+  bvUdiv = bvBinDivOp1 quot BVUdiv
   bvUrem = bvBinDivOp1 rem BVUrem
-  bvSdiv = bvSignedBinDivOp div BVSdiv
+  bvSdiv = bvSignedBinDivOp quot BVSdiv
   bvSrem = bvSignedBinDivOp rem BVSrem
+
+  bvPopcount sym x
+    | Just i <- asUnsignedBV x = bvLit sym w (toInteger (Bits.popCount i))
+    | otherwise = sbMakeExpr sym $ BVPopcount w x
+   where w = bvWidth x
+
+  bvCountTrailingZeros sym x
+    | Just i <- asUnsignedBV x = bvLit sym w (ctz w i)
+    | otherwise = sbMakeExpr sym $ BVCountTrailingZeros w x
+   where w = bvWidth x
+
+  bvCountLeadingZeros sym x
+    | Just i <- asUnsignedBV x = bvLit sym w (clz w i)
+    | otherwise = sbMakeExpr sym $ BVCountLeadingZeros w x
+   where w = bvWidth x
 
   mkStruct sym args = do
     sbMakeExpr sym $ StructCtor (fmapFC exprType args) args
@@ -4990,7 +5131,7 @@ instance IsExprBuilder (ExprBuilder t st fs) where
          else return (falsePred sym)
 
     | otherwise
-    = semiRingEq sym SemiRingReal x y
+    = semiRingEq sym SemiRingReal (realEq sym) x y
 
   realLe sym x y
       -- Use range check
@@ -5015,7 +5156,7 @@ instance IsExprBuilder (ExprBuilder t st fs) where
     = join (intLe sym <$> intLit sym (ceiling xr) <*> pure yi)
 
     | otherwise
-    = semiRingLe sym SemiRingReal x y
+    = semiRingLe sym SemiRingReal (realLe sym) x y
 
   realIte sym c x y = semiRingIte sym SemiRingReal c x y
 
@@ -5118,7 +5259,9 @@ instance IsExprBuilder (ExprBuilder t st fs) where
   floatMax = floatIEEEArithBinOp FloatMax
   floatFMA sym r x y z =
     let BaseFloatRepr fpp = exprType x in sbMakeExpr sym $ FloatFMA fpp r x y z
-  floatEq = floatIEEELogicBinOp FloatEq
+  floatEq sym x y
+    | x == y = return $! truePred sym
+    | otherwise = (floatIEEELogicBinOp FloatEq) sym x y
   floatNe sym x y = notPred sym =<< floatEq sym x y
   floatFpEq = floatIEEELogicBinOp FloatFpEq
   floatFpNe = floatIEEELogicBinOp FloatFpNe
@@ -5126,8 +5269,13 @@ instance IsExprBuilder (ExprBuilder t st fs) where
   floatLt = floatIEEELogicBinOp FloatLt
   floatGe sym x y = floatLe sym y x
   floatGt sym x y = floatLt sym y x
-  floatIte sym c x y =
-    let BaseFloatRepr fpp = exprType x in sbMakeExpr sym $ FloatIte fpp c x y
+  floatIte sym c x y
+    | Just TrueBool  <- asApp c = return x
+    | Just FalseBool <- asApp c = return y
+    | x == y = return x
+    | Just (NotBool c') <- asApp c = floatIte sym c' y x
+    | otherwise =
+      let BaseFloatRepr fpp = exprType x in sbMakeExpr sym $ FloatIte fpp c x y
   floatIsNaN = floatIEEELogicUnOp FloatIsNaN
   floatIsInf = floatIEEELogicUnOp FloatIsInf
   floatIsZero = floatIEEELogicUnOp FloatIsZero
@@ -5135,8 +5283,23 @@ instance IsExprBuilder (ExprBuilder t st fs) where
   floatIsNeg = floatIEEELogicUnOp FloatIsNeg
   floatIsSubnorm = floatIEEELogicUnOp FloatIsSubnorm
   floatIsNorm = floatIEEELogicUnOp FloatIsNorm
-  floatCast sym fpp r = sbMakeExpr sym . FloatCast fpp r
-  floatFromBinary sym fpp = sbMakeExpr sym . FloatFromBinary fpp
+  floatCast sym fpp r x
+    | FloatingPointPrecisionRepr eb sb <- fpp
+    , Just (FloatCast (FloatingPointPrecisionRepr eb' sb') _ fval) <- asApp x
+    , natValue eb <= natValue eb'
+    , natValue sb <= natValue sb'
+    , Just Refl <- testEquality (BaseFloatRepr fpp) (exprType fval)
+    = return fval
+    | otherwise = sbMakeExpr sym $ FloatCast fpp r x
+  floatRound = floatIEEEArithUnOpR FloatRound
+  floatFromBinary sym fpp x
+    | Just (FloatToBinary fpp' fval) <- asApp x
+    , Just Refl <- testEquality fpp fpp'
+    = return fval
+    | otherwise = sbMakeExpr sym $ FloatFromBinary fpp x
+  floatToBinary sym x = case exprType x of
+    BaseFloatRepr fpp | LeqProof <- lemmaFloatPrecisionIsPos fpp ->
+      sbMakeExpr sym $ FloatToBinary fpp x
   bvToFloat sym fpp r = sbMakeExpr sym . BVToFloat fpp r
   sbvToFloat sym fpp r = sbMakeExpr sym . SBVToFloat fpp r
   realToFloat sym fpp r = sbMakeExpr sym . RealToFloat fpp r
@@ -5290,8 +5453,31 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatReal)) wher
   iFloatIsSubnorm sym _ = return $ falsePred sym
   iFloatIsNorm sym = realNe sym $ realZero sym
   iFloatCast _ _ _ = return
-  iFloatFromBinary =
-    fail "Unsupported conversion from IEEE-754 binary representation to real."
+  iFloatRound sym r x =
+    integerToReal sym =<< case r of
+      RNA -> realRound sym x
+      RTP -> realCeil sym x
+      RTN -> realFloor sym x
+      RTZ -> do
+        is_pos <- realLt sym (realZero sym) x
+        iteM intIte sym is_pos (realFloor sym x) (realCeil sym x)
+      RNE -> fail "Unsupported rond to nearest even for real values."
+  iFloatFromBinary sym _ x
+    | Just (FnApp fn args) <- asNonceApp x
+    , "uninterpreted_real_to_float_binary" == solverSymbolAsText (symFnName fn)
+    , UninterpFnInfo param_types (BaseBVRepr _) <- symFnInfo fn
+    , (Ctx.Empty Ctx.:> BaseRealRepr) <- param_types
+    , (Ctx.Empty Ctx.:> rval) <- args
+    = return rval
+    | otherwise = mkFreshUninterpFnApp sym
+                                       "uninterpreted_real_from_float_binary"
+                                       (Ctx.Empty Ctx.:> x)
+                                       knownRepr
+  iFloatToBinary sym fi x =
+    mkFreshUninterpFnApp sym
+                         "uninterpreted_real_to_float_binary"
+                         (Ctx.Empty Ctx.:> x)
+                         (floatInfoToBVTypeRepr fi)
   iBVToFloat sym _ _ = uintToReal sym
   iSBVToFloat sym _ _ = sbvToReal sym
   iRealToFloat _ _ _ = return
@@ -5333,7 +5519,7 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatUninterpret
   iFloatMax = floatUninterpArithBinOp "uninterpreted_float_max"
   iFloatFMA sym r x y z = do
     let ret_type = exprType x
-    r_arg <- roundingModeToSymString sym r
+    r_arg <- roundingModeToSymNat sym r
     mkUninterpFnApp sym
                     "uninterpreted_float_fma"
                     (Ctx.empty Ctx.:> r_arg Ctx.:> x Ctx.:> y Ctx.:> z)
@@ -5356,12 +5542,9 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatUninterpret
   iFloatIsNorm = floatUninterpLogicUnOp "uninterpreted_float_is_norm"
   iFloatCast sym =
     floatUninterpCastOp "uninterpreted_float_cast" sym . iFloatBaseTypeRepr sym
-  iFloatFromBinary sym fi x = do
-    let ret_type = iFloatBaseTypeRepr sym fi
-    mkUninterpFnApp sym
-                    "uninterpreted_float_from_binary"
-                    (Ctx.empty Ctx.:> x)
-                    ret_type
+  iFloatRound = floatUninterpArithUnOpR "uninterpreted_float_round"
+  iFloatFromBinary _ _ = return
+  iFloatToBinary _ _ = return
   iBVToFloat sym =
     floatUninterpCastOp "uninterpreted_bv_to_float" sym . iFloatBaseTypeRepr sym
   iSBVToFloat sym =
@@ -5377,19 +5560,14 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatUninterpret
                     "uninterpreted_float_to_real"
                     (Ctx.empty Ctx.:> x)
                     knownRepr
-  iFloatBaseTypeRepr _ = \case
-    HalfFloatRepr         -> knownRepr
-    SingleFloatRepr       -> knownRepr
-    DoubleFloatRepr       -> knownRepr
-    QuadFloatRepr         -> knownRepr
-    X86_80FloatRepr       -> knownRepr
-    DoubleDoubleFloatRepr -> knownRepr
+  iFloatBaseTypeRepr _ = floatInfoToBVTypeRepr
 
 floatUninterpArithBinOp
   :: (e ~ Expr t) => String -> ExprBuilder t st fs -> e bt -> e bt -> IO (e bt)
 floatUninterpArithBinOp fn sym x y =
   let ret_type = exprType x
   in  mkUninterpFnApp sym fn (Ctx.empty Ctx.:> x Ctx.:> y) ret_type
+
 floatUninterpArithBinOpR
   :: (e ~ Expr t)
   => String
@@ -5400,8 +5578,9 @@ floatUninterpArithBinOpR
   -> IO (e bt)
 floatUninterpArithBinOpR fn sym r x y = do
   let ret_type = exprType x
-  r_arg <- roundingModeToSymString sym r
+  r_arg <- roundingModeToSymNat sym r
   mkUninterpFnApp sym fn (Ctx.empty Ctx.:> r_arg Ctx.:> x Ctx.:> y) ret_type
+
 floatUninterpArithUnOp
   :: (e ~ Expr t) => String -> ExprBuilder t st fs -> e bt -> IO (e bt)
 floatUninterpArithUnOp fn sym x =
@@ -5416,8 +5595,9 @@ floatUninterpArithUnOpR
   -> IO (e bt)
 floatUninterpArithUnOpR fn sym r x = do
   let ret_type = exprType x
-  r_arg <- roundingModeToSymString sym r
+  r_arg <- roundingModeToSymNat sym r
   mkUninterpFnApp sym fn (Ctx.empty Ctx.:> r_arg Ctx.:> x) ret_type
+
 floatUninterpArithCt
   :: (e ~ Expr t)
   => String
@@ -5426,6 +5606,7 @@ floatUninterpArithCt
   -> IO (e bt)
 floatUninterpArithCt fn sym ret_type =
   mkUninterpFnApp sym fn Ctx.empty ret_type
+
 floatUninterpLogicBinOp
   :: (e ~ Expr t)
   => String
@@ -5435,6 +5616,7 @@ floatUninterpLogicBinOp
   -> IO (e BaseBoolType)
 floatUninterpLogicBinOp fn sym x y =
   mkUninterpFnApp sym fn (Ctx.empty Ctx.:> x Ctx.:> y) knownRepr
+
 floatUninterpLogicUnOp
   :: (e ~ Expr t)
   => String
@@ -5443,6 +5625,7 @@ floatUninterpLogicUnOp
   -> IO (e BaseBoolType)
 floatUninterpLogicUnOp fn sym x =
   mkUninterpFnApp sym fn (Ctx.empty Ctx.:> x) knownRepr
+
 floatUninterpCastOp
   :: (e ~ Expr t)
   => String
@@ -5452,22 +5635,13 @@ floatUninterpCastOp
   -> e bt'
   -> IO (e bt)
 floatUninterpCastOp fn sym ret_type r x = do
-  r_arg <- roundingModeToSymString sym r
+  r_arg <- roundingModeToSymNat sym r
   mkUninterpFnApp sym fn (Ctx.empty Ctx.:> r_arg Ctx.:> x) ret_type
-roundingModeToSymString
-  :: (sym ~ ExprBuilder t st fs) => sym -> RoundingMode -> IO (SymString sym)
-roundingModeToSymString sym = stringLit sym . Text.pack . show
 
+roundingModeToSymNat
+  :: (sym ~ ExprBuilder t st fs) => sym -> RoundingMode -> IO (SymNat sym)
+roundingModeToSymNat sym = natLit sym . fromIntegral . fromEnum
 
-type family FloatInfoToPrecision (fi :: FloatInfo) :: FloatPrecision
--- | IEEE binary16
-type instance FloatInfoToPrecision HalfFloat = (FloatingPointPrecision 5 11)
--- | IEEE binary32
-type instance FloatInfoToPrecision SingleFloat = (FloatingPointPrecision 8 24)
--- | IEEE binary64
-type instance FloatInfoToPrecision DoubleFloat = (FloatingPointPrecision 11 53)
--- | IEEE binary128
-type instance FloatInfoToPrecision QuadFloat = (FloatingPointPrecision 15 113)
 
 type instance SymInterpretedFloatType (ExprBuilder t st (Flags FloatIEEE)) fi =
   BaseFloatType (FloatInfoToPrecision fi)
@@ -5513,11 +5687,19 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatIEEE)) wher
   iFloatIsSubnorm = floatIsSubnorm
   iFloatIsNorm = floatIsNorm
   iFloatCast sym = floatCast sym . floatInfoToPrecisionRepr
+  iFloatRound = floatRound
   iFloatFromBinary sym fi x = case fi of
     HalfFloatRepr         -> floatFromBinary sym knownRepr x
     SingleFloatRepr       -> floatFromBinary sym knownRepr x
     DoubleFloatRepr       -> floatFromBinary sym knownRepr x
     QuadFloatRepr         -> floatFromBinary sym knownRepr x
+    X86_80FloatRepr       -> fail "x86_80 is not an IEEE-754 format."
+    DoubleDoubleFloatRepr -> fail "double-double is not an IEEE-754 format."
+  iFloatToBinary sym fi x = case fi of
+    HalfFloatRepr         -> floatToBinary sym x
+    SingleFloatRepr       -> floatToBinary sym x
+    DoubleFloatRepr       -> floatToBinary sym x
+    QuadFloatRepr         -> floatToBinary sym x
     X86_80FloatRepr       -> fail "x86_80 is not an IEEE-754 format."
     DoubleDoubleFloatRepr -> fail "double-double is not an IEEE-754 format."
   iBVToFloat sym = bvToFloat sym . floatInfoToPrecisionRepr
@@ -5528,31 +5710,68 @@ instance IsInterpretedFloatExprBuilder (ExprBuilder t st (Flags FloatIEEE)) wher
   iFloatToReal = floatToReal
   iFloatBaseTypeRepr _ = BaseFloatRepr . floatInfoToPrecisionRepr
 
-floatInfoToPrecisionRepr
-  :: FloatInfoRepr fi
-  -> FloatPrecisionRepr (FloatInfoToPrecision fi)
-floatInfoToPrecisionRepr = \case
-  HalfFloatRepr         -> knownRepr
-  SingleFloatRepr       -> knownRepr
-  DoubleFloatRepr       -> knownRepr
-  QuadFloatRepr         -> knownRepr
-  X86_80FloatRepr       -> error "x86_80 is not an IEEE-754 format."
-  DoubleDoubleFloatRepr -> error "double-double is not an IEEE-754 format."
-
 
 instance IsSymExprBuilder (ExprBuilder t st fs) where
   freshConstant sym nm tp = do
-    v <- sbMakeBoundVar sym nm tp UninterpVarKind
+    v <- sbMakeBoundVar sym nm tp UninterpVarKind Nothing
     updateVarBinding sym nm (VarSymbolBinding v)
     return $! BoundVarExpr v
 
+  freshBoundedBV sym nm w Nothing Nothing = freshConstant sym nm (BaseBVRepr w)
+  freshBoundedBV sym nm w mlo mhi =
+    do v <- sbMakeBoundVar sym nm (BaseBVRepr w) UninterpVarKind (Just $! (BVD.range w lo hi))
+       updateVarBinding sym nm (VarSymbolBinding v)
+       return $! BoundVarExpr v
+   where
+   lo = maybe (minUnsigned w) toInteger mlo
+   hi = maybe (maxUnsigned w) toInteger mhi
+
+  freshBoundedSBV sym nm w Nothing Nothing = freshConstant sym nm (BaseBVRepr w)
+  freshBoundedSBV sym nm w mlo mhi =
+    do v <- sbMakeBoundVar sym nm (BaseBVRepr w) UninterpVarKind (Just $! (BVD.range w lo hi))
+       updateVarBinding sym nm (VarSymbolBinding v)
+       return $! BoundVarExpr v
+   where
+   lo = fromMaybe (minSigned w) mlo
+   hi = fromMaybe (maxSigned w) mhi
+
+  freshBoundedInt sym nm mlo mhi =
+    do v <- sbMakeBoundVar sym nm BaseIntegerRepr UninterpVarKind (absVal mlo mhi)
+       updateVarBinding sym nm (VarSymbolBinding v)
+       return $! BoundVarExpr v
+   where
+   absVal Nothing Nothing = Nothing
+   absVal (Just lo) Nothing = Just $! MultiRange (Inclusive lo) Unbounded
+   absVal Nothing (Just hi) = Just $! MultiRange Unbounded (Inclusive hi)
+   absVal (Just lo) (Just hi) = Just $! MultiRange (Inclusive lo) (Inclusive hi)
+
+  freshBoundedReal sym nm mlo mhi =
+    do v <- sbMakeBoundVar sym nm BaseRealRepr UninterpVarKind (absVal mlo mhi)
+       updateVarBinding sym nm (VarSymbolBinding v)
+       return $! BoundVarExpr v
+   where
+   absVal Nothing Nothing = Nothing
+   absVal (Just lo) Nothing = Just $! RAV (MultiRange (Inclusive lo) Unbounded) Nothing
+   absVal Nothing (Just hi) = Just $! RAV (MultiRange Unbounded (Inclusive hi)) Nothing
+   absVal (Just lo) (Just hi) = Just $! RAV (MultiRange (Inclusive lo) (Inclusive hi)) Nothing
+
+  freshBoundedNat sym nm mlo mhi =
+    do v <- sbMakeBoundVar sym nm BaseNatRepr UninterpVarKind (absVal mlo mhi)
+       updateVarBinding sym nm (VarSymbolBinding v)
+       return $! BoundVarExpr v
+   where
+   absVal Nothing Nothing = Nothing
+   absVal (Just lo) Nothing = Just $! natRange lo Unbounded
+   absVal Nothing (Just hi) = Just $! natRange 0 (Inclusive hi)
+   absVal (Just lo) (Just hi) = Just $! natRange lo (Inclusive hi)
+
   freshLatch sym nm tp = do
-    v <- sbMakeBoundVar sym nm tp LatchVarKind
+    v <- sbMakeBoundVar sym nm tp LatchVarKind Nothing
     updateVarBinding sym nm (VarSymbolBinding v)
     return $! BoundVarExpr v
 
   freshBoundVar sym nm tp =
-    sbMakeBoundVar sym nm tp QuantifierVarKind
+    sbMakeBoundVar sym nm tp QuantifierVarKind Nothing
 
   varExpr _ = BoundVarExpr
 
@@ -5675,4 +5894,17 @@ mkUninterpFnApp sym str_fn_name args ret_type = do
   fn_name <- unsafeUserSymbol str_fn_name
   let arg_types = fmapFC exprType args
   fn <- cachedUninterpFn sym fn_name arg_types ret_type freshTotalUninterpFn
+  applySymFn sym fn args
+
+mkFreshUninterpFnApp
+  :: (sym ~ ExprBuilder t st fs)
+  => sym
+  -> String
+  -> Ctx.Assignment (SymExpr sym) args
+  -> BaseTypeRepr ret
+  -> IO (SymExpr sym ret)
+mkFreshUninterpFnApp sym str_fn_name args ret_type = do
+  fn_name <- unsafeUserSymbol str_fn_name
+  let arg_types = fmapFC exprType args
+  fn <- freshTotalUninterpFn sym fn_name arg_types ret_type
   applySymFn sym fn args

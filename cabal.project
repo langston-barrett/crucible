@@ -14,9 +14,10 @@ packages:
   crucible-llvm/
   crucible-saw/
   crucible-server/
-  crucible-c/
   crucible-syntax/
-
+  crux/
+  crux-llvm/
+  
 optional-packages:
   dependencies/abcBridge/
   dependencies/aig/

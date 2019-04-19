@@ -1,4 +1,4 @@
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 -- |
 -- Module           : Lang.Crucible.Simulator.Evaluation
 -- Description      : Evaluation functions for Crucible core expressions
@@ -11,9 +11,11 @@
 ------------------------------------------------------------------------
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE EmptyCase #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
@@ -32,29 +34,36 @@ module Lang.Crucible.Simulator.Evaluation
   , updateVectorWithSymNat
   ) where
 
+import           Prelude hiding (pred)
+
 import qualified Control.Exception as Ex
 import           Control.Lens
 import           Control.Monad
+import           Data.Bitraversable (bitraverse)
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
-import           Data.Parameterized.Classes
-import           Data.Parameterized.Context as Ctx
-import           Data.Parameterized.TraversableFC
+import           Data.Proxy (Proxy(..))
 import qualified Data.Text as Text
 import qualified Data.Vector as V
 import           Data.Word
 import           Numeric ( showHex )
 import           Numeric.Natural
 
+import           Data.Parameterized.Classes
+import           Data.Parameterized.Context as Ctx
+import           Data.Parameterized.TraversableF (TraversableF(traverseF))
+import           Data.Parameterized.TraversableFC
+
 import           What4.Interface
 import           What4.InterpretedFloatingPoint
-import           What4.Partial
+import           What4.Partial (pattern PE, pattern Unassigned, joinMaybePE)
 import           What4.Symbol (emptySymbol)
 import           What4.Utils.Complex
 import           What4.WordMap
 
 import           Lang.Crucible.Backend
 import           Lang.Crucible.CFG.Expr
+import           Lang.Crucible.CFG.Extension.Safety as Safety
 import           Lang.Crucible.Simulator.Intrinsics
 import           Lang.Crucible.Simulator.RegMap
 import           Lang.Crucible.Simulator.SimError
@@ -248,15 +257,19 @@ type EvalAppFunc sym app = forall f.
 
 {-# INLINE evalApp #-}
 -- | Evaluate the application.
-evalApp :: forall sym ext
-         . IsSymInterface sym
+evalApp :: forall sym ext.
+           ( IsSymInterface sym
+           , HasStructuredAssertions ext
+           , TraversableF (AssertionClassifier ext)
+           , TraversableFC (PartialExpr ext)
+           )
         => sym
         -> IntrinsicTypes sym
         -> (Int -> String -> IO ())
            -- ^ Function for logging messages.
         -> EvalAppFunc sym (ExprExtension ext)
         -> EvalAppFunc sym (App ext)
-evalApp sym itefns _logFn evalExt evalSub a0 = do
+evalApp sym itefns _logFn evalExt (evalSub :: forall tp. f tp -> IO (RegValue sym tp)) a0 = do
   case a0 of
 
     BaseIsEq tp xe ye -> do
@@ -414,9 +427,23 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
     ----------------------------------------------------------------------
     -- Side conditions
 
-    AddSideCondition _ pe rsn e -> do
-      addAssertionM sym (evalSub pe) (AssertFailureSimError rsn)
-      evalSub e
+    WithAssertion _tyRep (Safety.PartialExp assertions val) -> do
+      let (pext, psym) = (Proxy :: Proxy ext, Proxy :: Proxy sym)
+
+      -- Evaluate any subexpressions and massage the type parameter into
+      -- @'SymExpr' sym@. This works because
+      -- @RegValue sym (BaseToType BaseBoolType) = SymExpr sym BaseBoolType@
+      assertions' <-
+        let rvEval :: forall tp. f tp -> IO (RegValue' sym tp)
+            rvEval x = RV <$> evalSub x
+        in bitraverse rvEval (traverseF rvEval) assertions
+
+      let expl = explainTree pext psym assertions'
+      let err  = AssertFailureSimError (show expl)
+      addAssertionM sym (treeToPredicate pext sym assertions') err
+      evalSub val
+
+    WithAssertion _tyRep _ -> error "evalApp: Impossible"
 
     ----------------------------------------------------------------------
     -- Recursive Types
@@ -576,6 +603,11 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
       x <- evalSub x_expr
       y <- evalSub y_expr
       iFloatFpEq @_ @fi sym x y
+    FloatIte _ c_expr (x_expr :: f (FloatType fi)) y_expr -> do
+      c <- evalSub c_expr
+      x <- evalSub x_expr
+      y <- evalSub y_expr
+      iFloatIte @_ @fi sym c x y
     FloatLt (x_expr :: f (FloatType fi)) y_expr -> do
       x <- evalSub x_expr
       y <- evalSub y_expr
@@ -602,6 +634,8 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
       iFloatFpNe @_ @fi sym x y
     FloatCast fi rm (x_expr :: f (FloatType fi')) ->
       iFloatCast @_ @_ @fi' sym fi rm =<< evalSub x_expr
+    FloatFromBinary fi x_expr -> iFloatFromBinary sym fi =<< evalSub x_expr
+    FloatToBinary fi x_expr -> iFloatToBinary sym fi =<< evalSub x_expr
     FloatFromBV fi rm x_expr -> iBVToFloat sym fi rm =<< evalSub x_expr
     FloatFromSBV fi rm x_expr -> iSBVToFloat sym fi rm =<< evalSub x_expr
     FloatFromReal fi rm x_expr -> iRealToFloat sym fi rm =<< evalSub x_expr
@@ -707,6 +741,9 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
       x <- evalSub xe
       y <- evalSub ye
       bvAdd sym x y
+    BVNeg _ xe -> do
+      x <- evalSub xe
+      bvNeg sym x
     BVSub _ xe ye -> do
       x <- evalSub xe
       y <- evalSub ye
@@ -780,6 +817,26 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
       x <- evalSub xe
       y <- evalSub ye
       bvSle sym x y
+    BVUMin _ xe ye -> do
+      x <- evalSub xe
+      y <- evalSub ye
+      c <- bvUle sym x y
+      bvIte sym c x y
+    BVUMax _ xe ye -> do
+      x <- evalSub xe
+      y <- evalSub ye
+      c <- bvUgt sym x y
+      bvIte sym c x y
+    BVSMin _ xe ye -> do
+      x <- evalSub xe
+      y <- evalSub ye
+      c <- bvSle sym x y
+      bvIte sym c x y
+    BVSMax _ xe ye -> do
+      x <- evalSub xe
+      y <- evalSub ye
+      c <- bvSgt sym x y
+      bvIte sym c x y
 
     --------------------------------------------------------------------
     -- Word Maps
@@ -864,6 +921,9 @@ evalApp sym itefns _logFn evalExt evalSub a0 = do
 
     TextLit txt -> stringLit sym txt
     ShowValue _bt x_expr -> do
+      x <- evalSub x_expr
+      stringLit sym (Text.pack (show (printSymExpr x)))
+    ShowFloat _fi x_expr -> do
       x <- evalSub x_expr
       stringLit sym (Text.pack (show (printSymExpr x)))
     AppendString x y -> do

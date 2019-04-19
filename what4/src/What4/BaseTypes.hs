@@ -18,6 +18,7 @@
 ------------------------------------------------------------------------
 {-# LANGUAGE ConstraintKinds#-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE ExplicitNamespaces #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -25,8 +26,10 @@
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -49,11 +52,18 @@ module What4.BaseTypes
   , type FloatPrecision
     -- ** Constructors for kind FloatPrecision
   , FloatingPointPrecision
+    -- ** FloatingPointPrecision aliases
+  , Prec16
+  , Prec32
+  , Prec64
+  , Prec128
     -- * Representations of base types
   , BaseTypeRepr(..)
   , FloatPrecisionRepr(..)
   , arrayTypeIndices
   , arrayTypeResult
+  , floatPrecisionToBVType
+  , lemmaFloatPrecisionIsPos
   , module Data.Parameterized.NatRepr
 
     -- * KnownRepr
@@ -63,11 +73,12 @@ module What4.BaseTypes
 
 
 import           Data.Hashable
+import           Data.Kind
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.NatRepr
 import           Data.Parameterized.TH.GADT
-import           GHC.TypeLits
+import           GHC.TypeNats as TypeNats
 import           Text.PrettyPrint.ANSI.Leijen
 
 --------------------------------------------------------------------------------
@@ -91,7 +102,7 @@ data BaseType
      -- | @BaseRealType@ denotes a real number.
    | BaseRealType
      -- | @BaseBVType n@ denotes a bitvector with @n@-bits.
-   | BaseBVType GHC.TypeLits.Nat
+   | BaseBVType TypeNats.Nat
      -- | @BaseFloatType fpp@ denotes a floating-point number with @fpp@
      -- precision.
    | BaseFloatType FloatPrecision
@@ -113,7 +124,7 @@ type BaseBoolType    = 'BaseBoolType    -- ^ @:: 'BaseType'@.
 type BaseIntegerType = 'BaseIntegerType -- ^ @:: 'BaseType'@.
 type BaseNatType     = 'BaseNatType     -- ^ @:: 'BaseType'@.
 type BaseRealType    = 'BaseRealType    -- ^ @:: 'BaseType'@.
-type BaseBVType      = 'BaseBVType      -- ^ @:: 'GHC.TypeLits.Nat' -> 'BaseType'@.
+type BaseBVType      = 'BaseBVType      -- ^ @:: 'TypeNats.Nat' -> 'BaseType'@.
 type BaseFloatType   = 'BaseFloatType   -- ^ @:: 'FloatPrecision' -> 'BaseType'@.
 type BaseStringType  = 'BaseStringType  -- ^ @:: 'BaseType'@.
 type BaseComplexType = 'BaseComplexType -- ^ @:: 'BaseType'@.
@@ -123,15 +134,21 @@ type BaseArrayType   = 'BaseArrayType   -- ^ @:: 'Ctx.Ctx' 'BaseType' -> 'BaseTy
 -- | This data kind describes the types of floating-point formats.
 -- This consist of the standard IEEE 754-2008 binary floating point formats.
 data FloatPrecision where
-  FloatingPointPrecision :: GHC.TypeLits.Nat -> GHC.TypeLits.Nat -> FloatPrecision
-type FloatingPointPrecision = 'FloatingPointPrecision -- ^ @:: 'GHC.TypeLits.Nat' -> 'GHC.TypeLits.Nat' -> 'FloatPrecision'@.
+  FloatingPointPrecision :: TypeNats.Nat -> TypeNats.Nat -> FloatPrecision
+type FloatingPointPrecision = 'FloatingPointPrecision -- ^ @:: 'GHC.TypeNats.Nat' -> 'GHC.TypeNats.Nat' -> 'FloatPrecision'@.
+
+-- | Floating-point precision aliases
+type Prec16  = FloatingPointPrecision  5  11
+type Prec32  = FloatingPointPrecision  8  24
+type Prec64  = FloatingPointPrecision 11  53
+type Prec128 = FloatingPointPrecision 15 113
 
 ------------------------------------------------------------------------
 -- BaseTypeRepr
 
 -- | A runtime representation of a solver interface type. Parameter @bt@
 -- has kind 'BaseType'.
-data BaseTypeRepr (bt::BaseType) :: * where
+data BaseTypeRepr (bt::BaseType) :: Type where
    BaseBoolRepr :: BaseTypeRepr BaseBoolType
    BaseBVRepr   :: (1 <= w) => !(NatRepr w) -> BaseTypeRepr (BaseBVType w)
    BaseNatRepr  :: BaseTypeRepr BaseNatType
@@ -166,6 +183,22 @@ arrayTypeIndices (BaseArrayRepr i _) = i
 -- | Return the result type of an array type.
 arrayTypeResult :: BaseTypeRepr (BaseArrayType idx tp) -> BaseTypeRepr tp
 arrayTypeResult (BaseArrayRepr _ rtp) = rtp
+
+floatPrecisionToBVType
+  :: FloatPrecisionRepr (FloatingPointPrecision eb sb)
+  -> BaseTypeRepr (BaseBVType (eb + sb))
+floatPrecisionToBVType fpp@(FloatingPointPrecisionRepr eb sb)
+  | LeqProof <- lemmaFloatPrecisionIsPos fpp
+  = BaseBVRepr $ addNat eb sb
+
+lemmaFloatPrecisionIsPos
+  :: forall eb' sb'
+   . FloatPrecisionRepr (FloatingPointPrecision eb' sb')
+  -> LeqProof 1 (eb' + sb')
+lemmaFloatPrecisionIsPos (FloatingPointPrecisionRepr eb sb)
+  | LeqProof <- leqTrans (LeqProof @1 @2) (LeqProof @2 @eb')
+  , LeqProof <- leqTrans (LeqProof @1 @2) (LeqProof @2 @sb')
+  = leqAddPos eb sb
 
 instance KnownRepr BaseTypeRepr BaseBoolType where
   knownRepr = BaseBoolRepr

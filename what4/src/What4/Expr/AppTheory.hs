@@ -130,11 +130,13 @@ appTheory a0 =
     BVAshr{}  -> BitvectorTheory
     BVZext{}  -> BitvectorTheory
     BVSext{}  -> BitvectorTheory
-    BVTrunc{} -> BitvectorTheory
     BVBitNot{} -> BitvectorTheory
     BVBitAnd{} -> BitvectorTheory
     BVBitOr{}  -> BitvectorTheory
     BVBitXor{} -> BitvectorTheory
+    BVPopcount{} -> BitvectorTheory
+    BVCountLeadingZeros{} -> BitvectorTheory
+    BVCountTrailingZeros{} -> BitvectorTheory
 
     ----------------------------
     -- Bitvector operations
@@ -168,7 +170,9 @@ appTheory a0 =
     FloatIsNorm{}     -> FloatingPointTheory
     FloatIte{}        -> FloatingPointTheory
     FloatCast{}       -> FloatingPointTheory
+    FloatRound{}      -> FloatingPointTheory
     FloatFromBinary{} -> FloatingPointTheory
+    FloatToBinary{}   -> FloatingPointTheory
     BVToFloat{}       -> FloatingPointTheory
     SBVToFloat{}      -> FloatingPointTheory
     RealToFloat{}     -> FloatingPointTheory

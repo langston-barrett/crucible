@@ -70,6 +70,7 @@ module Lang.Crucible.CFG.Core
   , stmtSeqTermStmt
   , Stmt(..)
   , ppStmt
+  , nextStmtHeight
 
   , applyEmbeddingStmt
 
@@ -91,10 +92,12 @@ module Lang.Crucible.CFG.Core
 
 import Control.Applicative
 import Control.Lens
-import Data.Maybe
+import Data.Maybe (fromMaybe)
+import Data.Kind (Type)
 import Data.Parameterized.Classes
 import Data.Parameterized.Map (Pair(..))
 import Data.Parameterized.Some
+import Data.Parameterized.TraversableF
 import Data.Parameterized.TraversableFC
 import Data.String
 import Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
@@ -104,6 +107,7 @@ import What4.Symbol
 
 import Lang.Crucible.CFG.Common
 import Lang.Crucible.CFG.Expr
+import Lang.Crucible.CFG.Extension.Safety
 import Lang.Crucible.FunctionHandle
 import Lang.Crucible.Types
 import Lang.Crucible.Utils.PrettyPrint
@@ -168,10 +172,14 @@ instance PrettyApp (ExprExtension ext) => Pretty (Expr ext ctx tp) where
 ppAssignment :: Assignment (Reg ctx) args -> [Doc]
 ppAssignment = toListFC pretty
 
-instance TraversableFC (ExprExtension ext) => ApplyEmbedding' (Expr ext) where
+instance ( TraversableFC (ExprExtension ext)
+         , TraversableF (AssertionClassifier ext)
+         ) => ApplyEmbedding' (Expr ext) where
   applyEmbedding' ctxe (App e) = App (mapApp (applyEmbedding' ctxe) e)
 
-instance TraversableFC (ExprExtension ext) => ExtendContext' (Expr ext) where
+instance ( TraversableFC (ExprExtension ext)
+         , TraversableF (AssertionClassifier ext)
+         ) => ExtendContext' (Expr ext) where
   extendContext' diff (App e) = App (mapApp (extendContext' diff) e)
 
 ------------------------------------------------------------------------
@@ -302,6 +310,11 @@ data Stmt ext (ctx :: Ctx CrucibleType) (ctx' :: Ctx CrucibleType) where
   FreshConstant :: !(BaseTypeRepr bt)
                 -> !(Maybe SolverSymbol)
                 -> Stmt ext ctx (ctx ::> BaseToType bt)
+
+  -- Create a fresh floating-point constant
+  FreshFloat :: !(FloatInfoRepr fi)
+             -> !(Maybe SolverSymbol)
+             -> Stmt ext ctx (ctx ::> FloatType fi)
 
   -- Allocate a new reference cell
   NewRefCell :: !(TypeRepr tp)
@@ -459,6 +472,9 @@ applyEmbeddingStmt ctxe stmt =
     FreshConstant bt nm -> Pair (FreshConstant bt nm)
                                 (Ctx.extendEmbeddingBoth ctxe)
 
+    FreshFloat fi nm -> Pair (FreshFloat fi nm)
+                             (Ctx.extendEmbeddingBoth ctxe)
+
     NewRefCell tp r -> Pair (NewRefCell tp (reg r))
                             (Ctx.extendEmbeddingBoth ctxe)
     NewEmptyRefCell tp -> Pair (NewEmptyRefCell tp)
@@ -561,6 +577,7 @@ nextStmtHeight h s =
     ReadGlobal{} -> incSize h
     WriteGlobal{} -> h
     FreshConstant{} -> Ctx.incSize h
+    FreshFloat{} -> Ctx.incSize h
     NewRefCell{} -> Ctx.incSize h
     NewEmptyRefCell{} ->Ctx.incSize h
     ReadRefCell{} -> Ctx.incSize h
@@ -582,6 +599,7 @@ ppStmt r s =
     ReadGlobal v -> text "read" <+> ppReg r <+> pretty v
     WriteGlobal v e -> text "write" <+> pretty v <+> pretty e
     FreshConstant bt nm -> ppReg r <+> text "=" <+> text "fresh" <+> pretty bt <+> maybe mempty (text . show) nm
+    FreshFloat fi nm -> ppReg r <+> text "=" <+> text "fresh-float" <+> pretty fi <+> maybe mempty (text . show) nm
     NewRefCell _ e -> ppReg r <+> text "=" <+> ppFn "newref" [ pretty e ]
     NewEmptyRefCell tp -> ppReg r <+> text "=" <+> ppFn "emptyref" [ pretty tp ]
     ReadRefCell e -> ppReg r <+> text "= !" <> pretty e
@@ -633,7 +651,7 @@ emptyCFGPostdomInfo sz = Ctx.replicate sz (Const [])
 ------------------------------------------------------------------------
 -- Block
 
--- | A basic block within a function.  Note: postdominators are precalculated.
+-- | A basic block within a function.
 data Block ext (blocks :: Ctx (Ctx CrucibleType)) (ret :: CrucibleType) ctx
    = Block { blockID        :: !(BlockID blocks ctx)
              -- ^ The unique identifier of this block
@@ -668,30 +686,35 @@ blockInputCount b = size (blockInputs b)
 ppBlock :: PrettyExt ext
         => Bool
            -- ^ Print line numbers.
-        -> CFGPostdom blocks
+        -> Bool
+           -- ^ Print block args. Note that you can infer the number
+           -- of block args from the first SSA temp register assigned
+           -- to in the block: if the block has @n@ args, then the
+           -- first register it assigns to will be @$n@.
+        -> Maybe (CFGPostdom blocks)
+           -- ^ Optionally print postdom info.
         -> Block ext blocks ret ctx
            -- ^ Block to print.
         -> Doc
-ppBlock ppLineNumbers pda b = do
+ppBlock ppLineNumbers ppBlockArgs mPda b = do
   let stmts = ppStmtSeq ppLineNumbers (blockInputCount b) (b^.blockStmts)
-  let Const pd = pda ! blockIDIndex (blockID b)
-  let postdom
-        | Prelude.null pd = text "% no postdom"
-        | otherwise = text "% postdom" <+> hsep (viewSome pretty <$> pd)
-  pretty (blockID b) <$$> indent 2 (stmts <$$> postdom)
-
-ppBlock' :: PrettyExt ext
-         => Bool
-           -- ^ Print line numbers.
-          -> Block ext blocks ret ctx
-            -- ^ Block to print.
-         -> Doc
-ppBlock' ppLineNumbers b = do
-  let stmts = ppStmtSeq ppLineNumbers (blockInputCount b) (b^.blockStmts)
-  pretty (blockID b) <$$> indent 2 stmts
+  let mPostdom = flip fmap mPda $ \ pda ->
+        let Const pd = pda ! blockIDIndex (blockID b)
+        in if Prelude.null pd
+           then text "% no postdom"
+           else text "% postdom" <+> hsep (viewSome pretty <$> pd)
+  let numArgs = lengthFC (blockInputs b)
+  let argList = [ char '$' <> pretty n | n <- [0 .. numArgs-1] ]
+  let args = encloseSep lparen rparen comma argList
+  let block = pretty (blockID b) <>
+              if ppBlockArgs then args else Text.PrettyPrint.ANSI.Leijen.empty
+  let body = case mPostdom of
+        Nothing -> stmts
+        Just postdom -> stmts <$$> postdom
+  block <$$> indent 2 body
 
 instance PrettyExt ext => Show (Block ext blocks ret args) where
-  show blk = show $ ppBlock' False blk
+  show blk = show $ ppBlock False False Nothing blk
 
 instance PrettyExt ext => ShowF (Block ext blocks ret)
 
@@ -739,7 +762,7 @@ extendBlockMap = fmapFC extendBlock
 -- the formal arguments of the function represented by this control-flow graph,
 -- which correspond to the formal arguments of the CFG entry point.
 -- The @ret@ type parameter indicates the return type of the function.
-data CFG (ext :: *)
+data CFG (ext :: Type)
          (blocks :: Ctx (Ctx CrucibleType))
          (init :: Ctx CrucibleType)
          (ret :: CrucibleType)
@@ -775,8 +798,8 @@ ppCFG' :: PrettyExt ext
        -> CFGPostdom blocks
        -> CFG ext blocks init ret
        -> Doc
-ppCFG' lineNumbers pdInfo g = vcat (toListFC (ppBlock lineNumbers pdInfo) (cfgBlockMap g))
-
+ppCFG' lineNumbers pdInfo g = vcat (toListFC (ppBlock lineNumbers blockArgs (Just pdInfo)) (cfgBlockMap g))
+  where blockArgs = False
 
 -- | Control flow graph with some blocks.  This data type closes
 --   existentially over the @blocks@ type parameter.

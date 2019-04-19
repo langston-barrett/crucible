@@ -91,6 +91,7 @@ import           What4.Expr.GroundEval
 import           What4.Expr.Builder
 import qualified What4.Expr.WeightedSum as WSum
 import           What4.Solver.Adapter
+import qualified What4.Utils.AbstractDomains as AD
 import           What4.Utils.Complex
 
 import           BLT.Binding
@@ -110,23 +111,37 @@ bltAdapter =
    SolverAdapter
    { solver_adapter_name = "blt"
    , solver_adapter_config_options = bltOptions
-   , solver_adapter_check_sat = \sym _ p cont ->
-           runBLTInOverride (getConfiguration sym) p $ \res ->
-             cont (fmap (\x -> (x, Nothing)) res)
+   , solver_adapter_check_sat = \sym logData ps cont ->
+           runBLTInOverride sym logData ps
+             (cont . runIdentity . traverseSatResult (\x -> pure (x,Nothing)) pure)
    , solver_adapter_write_smt2 = \_ _ _ -> do
        fail "BLT backend does not support writing SMTLIB2 files."
    }
 
-runBLTInOverride :: Config
-                 -> BoolExpr t -- ^ proposition to check
-                 -> (SatResult (GroundEvalFn t) -> IO a)
+runBLTInOverride :: IsExprBuilder sym
+                 => sym
+                 -> LogData
+                 -> [BoolExpr t] -- ^ propositions to check
+                 -> (SatResult (GroundEvalFn t) () -> IO a)
                  -> IO a
-runBLTInOverride cfg p contFn = do
+runBLTInOverride sym logData ps contFn = do
+  let cfg = getConfiguration sym
   epar <- parseBLTParams . T.unpack <$> (getOpt =<< getOptionSetting bltParams cfg)
   par  <- either fail return epar
+  logSolverEvent sym
+    SolverStartSATQuery
+    { satQuerySolverName = "BLT"
+    , satQueryReason = logReason logData
+    }
   withHandle par $ \h -> do
-    assume h p
-    contFn =<< checkSat h
+    forM_ ps (assume h)
+    result <- checkSat h
+    logSolverEvent sym
+      SolverEndSATQuery
+      { satQueryResult = forgetModelAndCore result
+      , satQueryError  = Nothing
+      }
+    contFn result
 
 ------------------------------------------------------------------------
 -- BLTExpr data type and arithmetic
@@ -569,7 +584,15 @@ evalInteger' h (BoundVarExpr info) =
       let i = fromEnum . indexValue $ bvarId info :: Int
       let v = mkBLTVar i
       stToIO $ PH.insert (varIndices h) (bvarId info) (IntegerVarIndex i)
-      return (mkBLT v)
+      let e = mkBLT v
+      case AD.rangeLowBound <$> (bvarAbstractValue info) of
+        Just (AD.Inclusive lo) -> recordLowerBound h (fromInteger lo) e
+        _ -> return ()
+      case AD.rangeHiBound <$> (bvarAbstractValue info) of
+        Just (AD.Inclusive hi) -> recordUpperBound h (fromInteger hi) e
+        _ -> return ()
+      return e
+
 -- Match integer constant
 evalInteger' h (SemiRingLiteral SemiRingInt i _) = do
   when (isVerb h) $ putStrLn ("BLT@evalInteger: integer const " ++ show i)
@@ -618,7 +641,7 @@ evalCplx h (AppExpr ea) =
 ------------------------------------------------------------------------
 
 -- | check here for lwr, upr bounds
-checkSat :: forall t . Handle t -> IO (SatResult (GroundEvalFn t))
+checkSat :: forall t . Handle t -> IO (SatResult (GroundEvalFn t) ())
 checkSat h = do
     let ctx = getCtx h
     bnds <- readIORef (boundMap h)
@@ -627,7 +650,7 @@ checkSat h = do
     doAssumptions ctx bnds
     isTrivial <- readIORef (flagUNSAT h)
     if isTrivial
-       then return Unsat
+       then return (Unsat ())
        else doCheck ctx
   where
   -- assert inequalities to BLT
@@ -658,7 +681,7 @@ checkSat h = do
   doCheck ctx = do
     rc <- bltCheck ctx
     case () of
-      _ | bltUNSAT == rc -> return Unsat
+      _ | bltUNSAT == rc -> return (Unsat ())
         | bltSAT   == rc -> do
           groundCache <- newIdxCache
           let f :: Expr t tp -> IO (GroundValue tp)

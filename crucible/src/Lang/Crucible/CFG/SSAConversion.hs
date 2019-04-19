@@ -36,8 +36,11 @@ import           Control.Monad.State.Strict
 import qualified Data.Foldable as Fold
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
-import           Data.Maybe
+import           Data.Maybe (isJust, fromMaybe)
+import qualified Data.Parameterized.Context as Ctx
+import           Data.Parameterized.ClassesC (OrdC(..))
 import           Data.Parameterized.Some
+import           Data.Parameterized.TraversableF (TraversableF)
 import           Data.Parameterized.TraversableFC
 import           Data.Sequence (Seq)
 import           Data.Set (Set)
@@ -50,6 +53,7 @@ import           What4.ProgramLoc
 import           Lang.Crucible.Analysis.Reachable
 import qualified Lang.Crucible.CFG.Core as C
 import qualified Lang.Crucible.CFG.Expr as C
+import qualified Lang.Crucible.CFG.Extension.Safety as C
 import           Lang.Crucible.CFG.Reg
 import           Lang.Crucible.FunctionHandle
 
@@ -625,14 +629,20 @@ type AppRegMap ext ctx = MapF (C.App ext (C.Reg ctx)) (C.Reg ctx)
 appRegMap_extend :: AppRegMap ext ctx -> AppRegMap ext (ctx ::> tp)
 appRegMap_extend = unsafeCoerce
 
-appRegMap_insert :: (TraversableFC (C.ExprExtension ext), OrdFC (C.ExprExtension ext))
+appRegMap_insert :: ( TraversableFC (C.ExprExtension ext)
+                    , OrdFC (C.ExprExtension ext)
+                    , TraversableF (C.AssertionClassifier ext)
+                    , OrdC (C.AssertionClassifier ext)
+                    )
                  => C.App ext (C.Reg ctx) tp
                  -> C.Reg (ctx ::> tp) tp
                  -> AppRegMap ext ctx
                  -> AppRegMap ext (ctx ::> tp)
 appRegMap_insert k v m = MapF.insert (fmapFC C.extendReg k) v (appRegMap_extend m)
 
-appRegMap_lookup :: OrdFC (C.ExprExtension ext)
+appRegMap_lookup :: ( OrdFC (C.ExprExtension ext)
+                    , OrdC (C.AssertionClassifier ext)
+                    )
                  => C.App ext (C.Reg ctx) tp
                  -> AppRegMap ext ctx
                  -> Maybe (C.Reg ctx tp)
@@ -788,6 +798,14 @@ resolveStmts nm bi sz reg_map bindings appMap (Posd p s0:rest) t = do
           let stmt = C.FreshConstant bt cnm
           C.ConsStmt pl stmt (resolveStmts nm bi sz' reg_map' bindings' appMap' rest t)
 
+        FreshFloat fi cnm -> do
+          let sz' = incSize sz
+          let reg_map'  = reg_map  & assignRegister (AtomValue a) sz
+          let bindings' = bindings & extendRegExprs NothingF
+          let appMap'   = appMap   & appRegMap_extend
+          let stmt = C.FreshFloat fi cnm
+          C.ConsStmt pl stmt (resolveStmts nm bi sz' reg_map' bindings' appMap' rest t)
+
         Call h args _ -> do
           let return_type = typeOfAtom a
           let h' = resolveAtom reg_map h
@@ -822,9 +840,10 @@ data SomeBlockMap ext ret where
 resolveBlockMap :: forall ext s ret
                  . C.IsSyntaxExtension ext
                 => FunctionName
+                -> Label s
                 -> [Block ext s ret]
                 -> SomeBlockMap ext ret
-resolveBlockMap nm blocks = do
+resolveBlockMap nm entry blocks = do
   let resolveBlock :: BlockInfo ext s ret blocks
                    -> BlockInput ext s blocks ret args
                    -> C.Block ext blocks ret args
@@ -841,7 +860,7 @@ resolveBlockMap nm blocks = do
                 }
   case inferBlockInfo blocks of
     Some bi ->
-      case lookupJumpInfo (Label 0) (biJumpInfo bi) of
+      case lookupJumpInfo entry (biJumpInfo bi) of
         Nothing -> error "Missing initial block."
         Just (JumpInfo (C.BlockID idx) _ _) ->
           SomeBlockMap idx $ fmapFC (resolveBlock bi) (biBlocks bi)
@@ -858,8 +877,9 @@ toSSA :: C.IsSyntaxExtension ext
 toSSA g = do
   let h = cfgHandle g
   let initTypes = cfgInputTypes g
+  let entry = cfgEntryLabel g
   let blocks = cfgBlocks g
-  case resolveBlockMap (handleName h) blocks of
+  case resolveBlockMap (handleName h) entry blocks of
     SomeBlockMap idx block_map -> do
           let b = block_map ! idx
           case C.blockInputs b `testEquality` initTypes of

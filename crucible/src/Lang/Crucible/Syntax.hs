@@ -86,6 +86,7 @@ module Lang.Crucible.Syntax
   ) where
 
 import           Control.Lens
+import           Data.Kind
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some
@@ -102,7 +103,7 @@ import           Lang.Crucible.Types
 
 -- | A typeclass for injecting applications into expressions.
 class IsExpr e where
-  type ExprExt e :: *
+  type ExprExt e :: Type
   app   :: App (ExprExt e) e tp -> e tp
   asApp :: e tp -> Maybe (App (ExprExt e) e tp)
   exprType :: e tp -> TypeRepr tp
@@ -398,7 +399,7 @@ bigEndianStore
 bigEndianStore addrWidth cellWidth valWidth num basePtr v wordMap = go num
   where go 0 = wordMap
         go n
-          | Just (Some idx) <- someNat $ (toInteger (num-n)) * (toInteger (natValue cellWidth))
+          | Just (Some idx) <- someNat $ (fromIntegral (num-n)) * (intValue cellWidth)
           , Just LeqProof <- testLeq (addNat idx cellWidth) valWidth
             = app $ InsertWordMap addrWidth (BaseBVRepr cellWidth)
                   (app $ BVAdd addrWidth basePtr (app $ BVLit addrWidth (toInteger (n-1))))
@@ -419,7 +420,7 @@ littleEndianStore
 littleEndianStore addrWidth cellWidth valWidth num basePtr v wordMap = go num
   where go 0 = wordMap
         go n
-          | Just (Some idx) <- someNat $ (toInteger (n-1)) * (toInteger (natValue cellWidth))
+          | Just (Some idx) <- someNat $ (fromIntegral (n-1)) * (intValue cellWidth)
           , Just LeqProof <- testLeq (addNat idx cellWidth) valWidth
             = app $ InsertWordMap addrWidth (BaseBVRepr cellWidth)
                   (app $ BVAdd addrWidth basePtr (app $ BVLit addrWidth (toInteger (n-1))))
