@@ -9,6 +9,7 @@ Build-type:    Simple
 Cabal-version: >= 1.10
 Category:      Language
 Synopsis:      Support for translating and executing JVM code in Crucible
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 executable crucible-jvm
 

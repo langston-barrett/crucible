@@ -11,6 +11,7 @@ Synopsis:      Crucible bindings to SAW
 Description:
   This package provides a Crucible solver backend that produces
   SAWCore terms.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 library
   build-depends:

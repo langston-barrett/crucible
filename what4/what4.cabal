@@ -14,6 +14,7 @@ Description:
   contain references to symbolic values, representing unknown variables.
   It provides support for communicating with a variety of SAT and SMT solvers,
   including Z3, CVC4, Yices, STP, and dReal.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 library
   build-depends:

@@ -14,6 +14,7 @@ Description:
   boolean circuits expressed using And-Inverter Graphs (AIGs).  This
   package provides support for lowering What4 formulae to AIGs
   and binding to ABC solver subroutines.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 library
   build-depends:

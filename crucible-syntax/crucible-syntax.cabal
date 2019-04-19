@@ -11,6 +11,7 @@ Synopsis:      A syntax for reading and writing Crucible control-flow graphs
 Description:
   This package provides a syntax for directly constructing Crucible
   control-flow graphs, as well as for observing them.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 extra-source-files:
 

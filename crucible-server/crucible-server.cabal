@@ -12,6 +12,7 @@ Description:
   The Crucible server provides a host-language-agnostic interface to a
   subset of the Crucible library functionality.  This API is exposed via
   protocol buffer messages.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 extra-source-files:
   proto/crucible.proto

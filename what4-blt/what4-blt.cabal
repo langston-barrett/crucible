@@ -13,6 +13,7 @@ Description:
   reducing the problem to bounded lattice search.  This package
   provides support for lowering Crucible formulae to linear systems
   of the sort understood by BLT, and for executing the underlying solver.
+tested-with:   GHC==8.6.4, GHC==8.4.4, GHC==8.2.2
 
 library
   build-depends:
