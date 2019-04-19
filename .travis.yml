@@ -6,6 +6,8 @@
 #
 # version: 0.3
 #
+# An extra apt package "libboost-all-dev" was added by hand.
+#
 language: c
 dist: xenial
 
