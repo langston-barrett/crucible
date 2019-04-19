@@ -41,4 +41,4 @@ script:
   - git submodule init --recursive
   - git submodule update
   - cabal update
-  - cabal new-build -j --disable-optimization --allow-newer
+  - cabal new-build all -j --disable-optimization --allow-newer
