@@ -19,10 +19,28 @@ matrix:
   include:
     - env: CABALVER="2.4" GHCVER="8.6.3"
       compiler: ": #GHC 8.6.3"
-      addons: {apt: {packages: [libntl-dev,libboost-all-dev,cabal-install-2.4,ghc-8.6.3], sources: [hvr-ghc]}}
+      addons:
+        apt:
+          sources: [hvr-ghc]
+          packages:
+            - libglpk-dev
+            - libntl-dev
+            - libboost-all-dev
+            - cabal-install-2.4
+            - ghc-8.6.3
+
     - env: CABALVER="2.4" GHCVER="8.4.3"
       compiler: ": #GHC 8.4.3"
-      addons: {apt: {packages: [libntl-dev,libboost-all-dev,cabal-install-2.4,ghc-8.4.3], sources: [hvr-ghc]}}
+      addons:
+        apt:
+          sources: [hvr-ghc]
+          packages:
+            - libglpk-dev
+            - libntl-dev
+            - libboost-all-dev
+            - cabal-install-2.4
+            - ghc-8.4.3
+
     - os: osx
       env: CABALVER="2.4" GHCVER="8.6.3"
       compiler: ": #GHC 8.6.3"
