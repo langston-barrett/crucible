@@ -8,12 +8,8 @@ cache:
   - $HOME/.ghc
   - $HOME/.cabal
 
-# Normally, travis tries `git submodule update --init --recursive`, but
-# that fails for us right now due to some submodules from `macaw`. We
-# only really care about one recursive submodule, so we do the update
-# manually in the `script` section.
 git:
-  submodules: false
+  submodules: true
 
 matrix:
   include:
@@ -23,7 +19,6 @@ matrix:
         apt:
           sources: [hvr-ghc]
           packages:
-            - berkeley-abc # abcBridge
             - libglpk-dev # blt
             - libntl-dev # blt
             - libboost-all-dev
@@ -36,7 +31,6 @@ matrix:
         apt:
           sources: [hvr-ghc]
           packages:
-            - berkeley-abc # abcBridge
             - libglpk-dev # blt
             - libntl-dev # blt
             - libboost-all-dev
@@ -58,7 +52,5 @@ before_install:
   - export PATH=/opt/ghc/bin:$HOME/.cabal/bin:$PATH
 
 script:
-  - git submodule init
-  - git submodule update
   - cabal update
   - cabal new-build all -j --disable-optimization --allow-newer
