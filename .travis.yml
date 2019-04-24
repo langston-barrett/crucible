@@ -23,8 +23,9 @@ matrix:
         apt:
           sources: [hvr-ghc]
           packages:
-            - libglpk-dev
-            - libntl-dev
+            - berkeley-abc # abcBridge
+            - libglpk-dev # blt
+            - libntl-dev # blt
             - libboost-all-dev
             - cabal-install-2.4
             - ghc-8.6.3
@@ -35,8 +36,9 @@ matrix:
         apt:
           sources: [hvr-ghc]
           packages:
-            - libglpk-dev
-            - libntl-dev
+            - berkeley-abc # abcBridge
+            - libglpk-dev # blt
+            - libntl-dev # blt
             - libboost-all-dev
             - cabal-install-2.4
             - ghc-8.4.3
