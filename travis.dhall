@@ -90,6 +90,8 @@ in  { language =
         ]
     , script =
         [ "cabal update"
+        , "cabal install hlint"
+        , "hlint crucible{,-jvm,-llvm,-saw,-server,-syntax} crux{,-llvm} what4{,-abc,-blt}"
 		-- We don't build crucible-server, it requires hpb
         , "cabal new-build crucible{,-jvm,-llvm,-saw,-syntax} crux{,-llvm} what4{,-abc,-blt} -j --disable-optimization --allow-newer"
         ]
