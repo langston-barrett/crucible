@@ -69,6 +69,7 @@ import           Lang.Crucible.LLVM.Intrinsics.Common
 import qualified Lang.Crucible.LLVM.Intrinsics.LLVM as LLVM
 import qualified Lang.Crucible.LLVM.Intrinsics.Libc as Libc
 import qualified Lang.Crucible.LLVM.Intrinsics.Libcxx as Libcxx
+import qualified Lang.Crucible.LLVM.Intrinsics.OpenSSL as OpenSSL
 
 llvmIntrinsicTypes :: IsSymInterface sym => IntrinsicTypes sym
 llvmIntrinsicTypes =
@@ -220,6 +221,9 @@ declare_overrides =
   -- Some architecture-dependent intrinsics
   , register_llvm_override LLVM.llvmX86_SSE2_storeu_dq
   , register_llvm_override LLVM.llvmX86_pclmulqdq
+
+  -- OpenSSL assembly functions
+  , register_llvm_override OpenSSL.openSSLCleanseOverride
   ]
 
 
