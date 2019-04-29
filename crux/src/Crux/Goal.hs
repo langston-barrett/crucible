@@ -167,6 +167,4 @@ proveGoals ctxt (Just gs0) =
     conn = solverConn sp
 
     lookupnm namemap x =
-      case Map.lookup x namemap of
-        Just v  -> v
-        Nothing -> error $ "Named predicate " ++ show x ++ " not found!"
+      fromMaybe error $ "Named predicate " ++ show x ++ " not found!" Map.lookup x namemap
