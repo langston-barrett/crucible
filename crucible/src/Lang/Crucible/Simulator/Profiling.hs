@@ -10,19 +10,15 @@
 ------------------------------------------------------------------------
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
 module Lang.Crucible.Simulator.Profiling
   ( profilingFeature
@@ -403,7 +399,7 @@ isMergeState tgt st =
           case other_branch of
             VFFActivePath{} -> False
             VFFCompletePath{} -> True
-    VFFPartial _ctx _p _ar NeedsToBeAborted -> True
+    VFFPartial _ctx _loc _p _ar NeedsToBeAborted -> True
     _ -> False
 
 

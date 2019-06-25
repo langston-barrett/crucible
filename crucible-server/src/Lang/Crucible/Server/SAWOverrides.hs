@@ -9,12 +9,8 @@
 -- Function implementations that are specific to the SAW backend.
 ------------------------------------------------------------------------
 
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
@@ -171,7 +167,7 @@ sawFulfillSimulateVerificationHarnessRequest sim harness opts =
                     FinishedResult ctx' (TotalRes (GlobalPair _r _globals)) -> do
                       sendTextResponse sim "Finished!"
                       writeIORef (simContext sim) $! ctx'
-                    FinishedResult ctx' (PartialRes _ (GlobalPair _r _globals) _) -> do
+                    FinishedResult ctx' (PartialRes _ _ (GlobalPair _r _globals) _) -> do
                       sendTextResponse sim "Finished, some paths aborted!"
                       writeIORef (simContext sim) $! ctx'
                     AbortedResult ctx' _ -> do

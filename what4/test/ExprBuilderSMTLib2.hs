@@ -2,7 +2,9 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -15,6 +17,9 @@ import Test.Tasty.HUnit
 import           Control.Monad (void)
 import qualified Data.Binary.IEEE754 as IEEE754
 import           Data.Foldable
+import qualified Data.Map as Map (empty, singleton)
+import           Data.Versions (Version(Version))
+import qualified Data.Versions as Versions
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Nonce
@@ -69,8 +74,8 @@ withModel s p action = do
   assume (sessionWriter s) p
   runCheckSat s $ \case
     Sat (GroundEvalFn {..}, _) -> action groundEval
-    Unsat _                    -> "unsat" @?= "sat"
-    Unknown                    -> "unknown" @?= "sat"
+    Unsat _                    -> "unsat" @?= ("sat" :: String)
+    Unknown                    -> "unknown" @?= ("sat" :: String)
 
 -- exists y . (x + 2.0) + (x + 2.0) < y
 iFloatTestPred
@@ -318,6 +323,113 @@ testUninterpretedFunctionScope = testCase "uninterpreted function scope" $
     res2 <- checkSatisfiable s "test" p2
     isUnsat res2 @? "unsat"
 
+testBVIteNesting :: TestTree
+testBVIteNesting = testCase "nested bitvector ites" $ withZ3' $ \sym s -> do
+  bv0 <- bvLit sym (knownNat @32) 0
+  let setSymBit bv idx = do
+        c1 <- freshConstant sym (userSymbol' ("c1_" ++ show idx)) knownRepr
+        c2 <- freshConstant sym (userSymbol' ("c2_" ++ show idx)) knownRepr
+        c3 <- freshConstant sym (userSymbol' ("c3_" ++ show idx)) knownRepr
+        tt1 <- freshConstant sym (userSymbol' ("tt1_" ++ show idx)) knownRepr
+        tt2 <- freshConstant sym (userSymbol' ("tt2_" ++ show idx)) knownRepr
+        tt3 <- freshConstant sym (userSymbol' ("tt3_" ++ show idx)) knownRepr
+        tt4 <- freshConstant sym (userSymbol' ("tt4_" ++ show idx)) knownRepr
+        ite1 <- itePred sym c1 tt1 tt2
+        ite2 <- itePred sym c2 tt3 tt4
+        ite3 <- itePred sym c3 ite1 ite2
+        bvSet sym bv idx ite3
+  bv1 <- foldlM setSymBit bv0 [0..31]
+  p <- testBitBV sym 0 bv1
+  assume (sessionWriter s) p
+  runCheckSat s $ \res -> isSat res @? "sat"
+
+testRotate1 :: TestTree
+testRotate1 = testCase "rotate test1" $ withOnlineZ3' $ \sym s -> do
+  bv <- freshConstant sym (userSymbol' "bv") (BaseBVRepr (knownNat @32))
+
+  bv1 <- bvRol sym bv =<< bvLit sym knownNat 8
+  bv2 <- bvRol sym bv1 =<< bvLit sym knownNat 16
+  bv3 <- bvRol sym bv2 =<< bvLit sym knownNat 8
+  bv4 <- bvRor sym bv2 =<< bvLit sym knownNat 24
+  bv5 <- bvRor sym bv2 =<< bvLit sym knownNat 28
+
+  res <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv3
+  isUnsat res @? "unsat1"
+
+  res1 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv4
+  isUnsat res1 @? "unsat2"
+
+  res2 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv5
+  isSat res2 @? "sat"
+
+testRotate2 :: TestTree
+testRotate2 = testCase "rotate test2" $ withOnlineZ3' $ \sym s -> do
+  bv  <- freshConstant sym (userSymbol' "bv") (BaseBVRepr (knownNat @32))
+  amt <- freshConstant sym (userSymbol' "amt") (BaseBVRepr (knownNat @32))
+
+  bv1 <- bvRol sym bv amt
+  bv2 <- bvRor sym bv1 amt
+  bv3 <- bvRol sym bv =<< bvLit sym knownNat 20
+
+  bv == bv2 @? "syntactic equality"
+
+  res1 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv2
+  isUnsat res1 @? "unsat"
+
+  res2 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv3
+  isSat res2 @? "sat"
+
+testRotate3 :: TestTree
+testRotate3 = testCase "rotate test3" $ withOnlineZ3' $ \sym s -> do
+  bv  <- freshConstant sym (userSymbol' "bv") (BaseBVRepr (knownNat @7))
+  amt <- freshConstant sym (userSymbol' "amt") (BaseBVRepr (knownNat @7))
+
+  bv1 <- bvRol sym bv amt
+  bv2 <- bvRor sym bv1 amt
+  bv3 <- bvRol sym bv =<< bvLit sym knownNat 3
+
+  -- Note, because 7 is not a power of two, this simplification doesn't quite
+  -- work out... it would probably be significant work to make it do so.
+  -- bv == bv2 @? "syntactic equality"
+
+  res1 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv2
+  isUnsat res1 @? "unsat"
+
+  res2 <- checkSatisfiable s "test" =<< notPred sym =<< bvEq sym bv bv3
+  isSat res2 @? "sat"
+
+testSymbolPrimeCharZ3 :: TestTree
+testSymbolPrimeCharZ3 = testCase "z3 symbol prime (') char" $
+  withZ3' $ \sym s -> do
+    x <- freshConstant sym (userSymbol' "x'") knownRepr
+    y <- freshConstant sym (userSymbol' "y'") knownRepr
+    p <- natLt sym x y
+    assume (sessionWriter s) p
+    runCheckSat s $ \res -> isSat res @? "sat"
+
+-- | These tests simply ensure that no exceptions are raised.
+testSolverInfo :: TestTree
+testSolverInfo = testGroup "solver info queries" $
+  [ testCase "test get solver version" $ withOnlineZ3' $ \_ proc -> do
+      let conn = solverConn proc
+      getVersion conn
+      _ <- versionResult conn (solverResponse proc)
+      pure ()
+  , testCase "test get solver name" $ withOnlineZ3' $ \_ proc -> do
+      let conn = solverConn proc
+      getName conn
+      nm <- nameResult conn (solverResponse proc)
+      nm @?= "Z3"
+  ]
+
+testSolverVersion :: TestTree
+testSolverVersion = testCase "test solver version bounds" $
+  withOnlineZ3' $ \_ proc -> do
+    let v = Version { _vEpoch = Nothing
+                    , _vChunks = [[Versions.Digits 0]]
+                    , _vRel = [] }
+    checkSolverVersion' (Map.singleton "Z3" v) Map.empty proc >> return ()
+
 main :: IO ()
 main = defaultMain $ testGroup "Tests"
   [ testInterpretedFloatReal
@@ -337,4 +449,12 @@ main = defaultMain $ testGroup "Tests"
   , testBVSelectShl
   , testBVSelectLshr
   , testUninterpretedFunctionScope
+  , testBVIteNesting
+  , testRotate1
+  , testRotate2
+  , testRotate3
+  , testSymbolPrimeCharZ3
+  , testSolverInfo
+  , testSolverVersion
+
   ]

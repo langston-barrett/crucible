@@ -1,38 +1,19 @@
 {- |
-Module           : Lang.Crucible.JVM.Generator
+Module           : Lang.Crucible.JVM.Translation.Monad
 Description      : The JVMGenerator monad
 Copyright        : (c) Galois, Inc 2018
 License          : BSD3
-Maintainer       : sweirich@galois.com
+Maintainer       : huffman@galois.com, sweirich@galois.com
 Stability        : provisional
 -}
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE ImplicitParams #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE PatternSynonyms #-}
-{-# LANGUAGE RankNTypes #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE ViewPatterns #-}
-{-# LANGUAGE AllowAmbiguousTypes #-}
 
 {-# OPTIONS_GHC -haddock #-}
 
-{-# OPTIONS_GHC -fno-warn-orphans -fno-warn-unused-imports #-}
-
-
-module Lang.Crucible.JVM.Generator where
+module Lang.Crucible.JVM.Translation.Monad where
 
 -- base
-import           Data.Semigroup
 import           Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import           Control.Monad.State.Strict
@@ -45,140 +26,19 @@ import qualified Language.JVM.CFG as J
 -- parameterized-utils
 import qualified Data.Parameterized.Context as Ctx
 
-
 -- crucible
 import           Lang.Crucible.CFG.Expr
 import           Lang.Crucible.CFG.Generator
-import           Lang.Crucible.FunctionHandle
 import           Lang.Crucible.Types
 import           Lang.Crucible.Panic
 
 -- crucible-jvm
 import           Lang.Crucible.JVM.Types
+import           Lang.Crucible.JVM.Context
 -- what4
 import           What4.ProgramLoc (Position(InternalPos))
 
 import Debug.Trace
-
-----------------------------------------------------------------------
--- * Registers and Frame
-
-data JVMReg s
-  = DReg (Reg s JVMDoubleType)
-  | FReg (Reg s JVMFloatType)
-  | IReg (Reg s JVMIntType)
-  | LReg (Reg s JVMLongType)
-  | RReg (Reg s JVMRefType)
-   deriving (Show)
-
-data JVMFrame v
-  = JVMFrame
-    { _operandStack   :: ![v]
-    , _localVariables :: !(Map J.LocalVariableIndex v)
-    }
-
-instance Functor JVMFrame where
-  fmap f (JVMFrame os lv) = JVMFrame (fmap f os) (fmap f lv)
-
-instance Foldable JVMFrame where
-  foldr f z (JVMFrame os lv) = foldr f (foldr f z lv) os
-
-instance Traversable JVMFrame where
-  traverse f (JVMFrame os lv) = JVMFrame <$> traverse f os <*> traverse f lv
-
-operandStack :: Simple Lens (JVMFrame v) [v]
-operandStack = lens _operandStack (\s v -> s{ _operandStack = v})
-
-localVariables :: Simple Lens (JVMFrame v) (Map J.LocalVariableIndex v)
-localVariables = lens _localVariables (\s v -> s{ _localVariables = v})
-
-type JVMExprFrame s = JVMFrame (JVMValue s)
-type JVMRegisters s = JVMFrame (JVMReg s)
-
-----------------------------------------------------------------------
--- * JVMContext
-
-
-type StaticFieldTable = Map (J.ClassName, J.FieldId) (GlobalVar JVMValueType)
-type MethodHandleTable = Map (J.ClassName, J.MethodKey) JVMHandleInfo
-
-data JVMHandleInfo where
-  JVMHandleInfo :: J.MethodKey -> FnHandle init ret -> JVMHandleInfo
-
--- | Contains information about crucible function handles and global variables
--- that is statically known during the class translation.
-data JVMContext = JVMContext
-  { methodHandles :: Map (J.ClassName, J.MethodKey) JVMHandleInfo
-      -- ^ Map from static and dynamic methods to Crucible function handles.
-  , staticFields :: Map (J.ClassName, J.FieldId) (GlobalVar JVMValueType)
-      -- ^ Map from static field names to Crucible global variables.
-      -- We know about these fields at translation time so we can allocate
-      -- global variables to store them.
-  , classTable :: Map J.ClassName J.Class
-      -- ^ Map from class names to their declarations.
-      -- This contains all of the information about class declarations at
-      -- translation time.
-  , dynamicClassTable :: GlobalVar JVMClassTableType
-      -- ^ A global variable storing information about the class that can be
-      -- used at runtime: includes initialization status, superclass (if any),
-      -- and a map from method names to their handles for dynamic dispatch.
-  }
-
--- | Left-biased merge of two contexts.
--- NOTE: There should only ever be one dynamic class table global variable.
-instance Semigroup JVMContext where
-  c1 <> c2 =
-    JVMContext
-    { methodHandles     = Map.union (methodHandles   c1) (methodHandles   c2)
-    , staticFields      = Map.union (staticFields c1) (staticFields c2)
-    , classTable        = Map.union (classTable  c1) (classTable  c2)
-    , dynamicClassTable = dynamicClassTable c1
-    }
-
-------------------------------------------------------------------------
--- * JVMState used during the translation
-
-data JVMState ret s
-  = JVMState
-  { _jsLabelMap :: !(Map J.BBId (Label s))
-  , _jsFrameMap :: !(Map J.BBId (JVMFrame (JVMReg s)))
-  , _jsCFG      :: J.CFG
-  , jsRetType   :: TypeRepr ret
-  , jsContext   :: JVMContext
-  , _jsVerbosity :: Int
-  }
-
-jsLabelMap :: Simple Lens (JVMState ret s) (Map J.BBId (Label s))
-jsLabelMap = lens _jsLabelMap (\s v -> s { _jsLabelMap = v })
-
-jsFrameMap :: Simple Lens (JVMState ret s) (Map J.BBId (JVMFrame (JVMReg s)))
-jsFrameMap = lens _jsFrameMap (\s v -> s { _jsFrameMap = v })
-
-jsCFG :: Simple Lens (JVMState ret s) J.CFG
-jsCFG = lens _jsCFG (\s v -> s { _jsCFG = v })
-
-jsVerbosity :: Simple Lens (JVMState ret s) Int
-jsVerbosity = lens _jsVerbosity (\s v -> s { _jsVerbosity = v })
-
-
--- | Build the initial JVM generator state upon entry to the entry
--- point of a method.
-initialState :: JVMContext -> Int -> J.Method -> TypeRepr ret -> JVMState ret s
-initialState ctx verbosity method ret =
-  JVMState {
-    _jsLabelMap = Map.empty,
-    _jsFrameMap = Map.empty,
-    _jsCFG = methodCFG method,
-    jsRetType = ret,
-    jsContext = ctx,
-    _jsVerbosity = verbosity
-  }
-
-methodCFG :: J.Method -> J.CFG
-methodCFG method =
-  case J.methodBody method of
-    J.Code _ _ cfg _ _ _ _ -> cfg
-    _                      -> error ("Method " ++ show method ++ " has no body")
 
 ------------------------------------------------------------------------
 -- * Generator Monad
@@ -202,8 +62,126 @@ debug level mesg = do
   v <- use jsVerbosity
   when (level <= v) $ traceM mesg
 
+----------------------------------------------------------------------
+-- * Registers
+
+data JVMReg s
+  = DReg (Reg s JVMDoubleType)
+  | FReg (Reg s JVMFloatType)
+  | IReg (Reg s JVMIntType)
+  | LReg (Reg s JVMLongType)
+  | RReg (Reg s JVMRefType)
+   deriving (Show)
+
+------------------------------------------------------------------------
+-- * JVMState used during the translation
+
+data JVMState ret s
+  = JVMState
+  { _jsLabelMap  :: !(Map J.BBId (Label s))
+  , _jsStackMap  :: !(Map J.BBId [JVMReg s])
+  , _jsLocalsD   :: !(Map J.LocalVariableIndex (Reg s JVMDoubleType))
+  , _jsLocalsF   :: !(Map J.LocalVariableIndex (Reg s JVMFloatType))
+  , _jsLocalsI   :: !(Map J.LocalVariableIndex (Reg s JVMIntType))
+  , _jsLocalsL   :: !(Map J.LocalVariableIndex (Reg s JVMLongType))
+  , _jsLocalsR   :: !(Map J.LocalVariableIndex (Reg s JVMRefType))
+  , _jsCFG       :: J.CFG
+  , jsRetType    :: TypeRepr ret
+  , jsContext    :: JVMContext
+  , _jsVerbosity :: Int
+  }
+
+jsLabelMap :: Simple Lens (JVMState ret s) (Map J.BBId (Label s))
+jsLabelMap = lens _jsLabelMap (\s v -> s { _jsLabelMap = v })
+
+jsStackMap :: Simple Lens (JVMState ret s) (Map J.BBId [JVMReg s])
+jsStackMap = lens _jsStackMap (\s v -> s { _jsStackMap = v })
+
+jsLocalsD :: Simple Lens (JVMState ret s) (Map J.LocalVariableIndex (Reg s JVMDoubleType))
+jsLocalsD = lens _jsLocalsD (\s v -> s { _jsLocalsD = v })
+
+jsLocalsF :: Simple Lens (JVMState ret s) (Map J.LocalVariableIndex (Reg s JVMFloatType))
+jsLocalsF = lens _jsLocalsF (\s v -> s { _jsLocalsF = v })
+
+jsLocalsI :: Simple Lens (JVMState ret s) (Map J.LocalVariableIndex (Reg s JVMIntType))
+jsLocalsI = lens _jsLocalsI (\s v -> s { _jsLocalsI = v })
+
+jsLocalsL :: Simple Lens (JVMState ret s) (Map J.LocalVariableIndex (Reg s JVMLongType))
+jsLocalsL = lens _jsLocalsL (\s v -> s { _jsLocalsL = v })
+
+jsLocalsR :: Simple Lens (JVMState ret s) (Map J.LocalVariableIndex (Reg s JVMRefType))
+jsLocalsR = lens _jsLocalsR (\s v -> s { _jsLocalsR = v })
+
+jsCFG :: Simple Lens (JVMState ret s) J.CFG
+jsCFG = lens _jsCFG (\s v -> s { _jsCFG = v })
+
+jsVerbosity :: Simple Lens (JVMState ret s) Int
+jsVerbosity = lens _jsVerbosity (\s v -> s { _jsVerbosity = v })
+
+
+-- | Build the initial JVM generator state upon entry to the entry
+-- point of a method.
+initialState :: JVMContext -> Verbosity -> J.Method -> TypeRepr ret -> JVMState ret s
+initialState ctx verbosity method ret =
+  JVMState {
+    _jsLabelMap = Map.empty,
+    _jsStackMap = Map.empty,
+    _jsLocalsD = Map.empty,
+    _jsLocalsF = Map.empty,
+    _jsLocalsI = Map.empty,
+    _jsLocalsL = Map.empty,
+    _jsLocalsR = Map.empty,
+    _jsCFG = methodCFG method,
+    jsRetType = ret,
+    jsContext = ctx,
+    _jsVerbosity = verbosity
+  }
+
+methodCFG :: J.Method -> J.CFG
+methodCFG method =
+  case J.methodBody method of
+    J.Code _ _ cfg _ _ _ _ -> cfg
+    _                      -> error ("Method " ++ show method ++ " has no body")
+
 ------------------------------------------------------------------
 -- * JVMValue
+
+-- | Tagged JVM value.
+--
+-- NOTE: we could switch the below to @type JVMValue s = Expr JVM s
+-- JVMValueType@. However, that would give the translator less
+-- information. With the type below, the translator can branch on the
+-- variant. This is important for translating stack manipulations such
+-- as 'popType1' and 'popType2'.
+data JVMValue s
+  = DValue (JVMDouble s)
+  | FValue (JVMFloat s)
+  | IValue (JVMInt s)
+  | LValue (JVMLong s)
+  | RValue (JVMRef s)
+  deriving Show
+
+-- | Returns a default value for given type, suitable for initializing
+-- fields and arrays.
+defaultValue :: J.Type -> JVMValue s
+defaultValue (J.ArrayType _tp) = RValue $ App $ NothingValue knownRepr
+defaultValue J.BooleanType     = IValue $ App $ BVLit knownRepr 0
+defaultValue J.ByteType        = IValue $ App $ BVLit knownRepr 0
+defaultValue J.CharType        = IValue $ App $ BVLit knownRepr 0
+defaultValue (J.ClassType _st) = RValue $ App $ NothingValue knownRepr
+defaultValue J.DoubleType      = DValue $ App $ DoubleLit 0.0
+defaultValue J.FloatType       = FValue $ App $ FloatLit 0.0
+defaultValue J.IntType         = IValue $ App $ BVLit knownRepr 0
+defaultValue J.LongType        = LValue $ App $ BVLit knownRepr 0
+defaultValue J.ShortType       = IValue $ App $ BVLit knownRepr 0
+
+-- | Convert a statically tagged value to a dynamically tagged value.
+valueToExpr :: JVMValue s -> Expr JVM s JVMValueType
+valueToExpr (DValue x) = App $ InjectVariant knownRepr tagD x
+valueToExpr (FValue x) = App $ InjectVariant knownRepr tagF x
+valueToExpr (IValue x) = App $ InjectVariant knownRepr tagI x
+valueToExpr (LValue x) = App $ InjectVariant knownRepr tagL x
+valueToExpr (RValue x) = App $ InjectVariant knownRepr tagR x
 
 projectVariant ::
   KnownRepr (Ctx.Assignment TypeRepr) ctx =>
@@ -281,11 +259,11 @@ fromDValue _ = jvmFail "fromDValue"
 
 fromFValue :: HasCallStack => JVMValue s -> JVMGenerator h s ret (JVMFloat s)
 fromFValue (FValue v) = return v
-fromFValue _ = error "fromFValue"
+fromFValue _ = jvmFail "fromFValue"
 
 fromRValue :: HasCallStack => JVMValue s -> JVMGenerator h s ret (JVMRef s)
 fromRValue (RValue v) = return v
-fromRValue v = error $ "fromRValue:" ++ show v
+fromRValue v = jvmFail $ "fromRValue:" ++ show v
 
 
 ------------------------------------------------------------------
@@ -350,6 +328,5 @@ iterate_ count body = do
         (InternalPos, do
            j <- readReg i
            body j
-           modifyReg i (\j0 -> j0 + 1)
+           modifyReg i (\j0 -> App (BVAdd w32 j0 (App (BVLit w32 1))))
         )
-

@@ -8,6 +8,9 @@ so that clients can generate new values that are not exposed through
 this interface.
 -}
 
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 module What4.Protocol.SMTLib2.Syntax
   ( -- * Commands
@@ -15,6 +18,10 @@ module What4.Protocol.SMTLib2.Syntax
   , setLogic
   , setOption
   , setProduceModels
+  , SMTInfoFlag(..)
+  , getInfo
+  , getVersion
+  , getName
   , exit
      -- * Declarations
   , declareSort
@@ -131,11 +138,15 @@ import           Data.Bits hiding (xor)
 import           Data.Char (intToDigit)
 import           Data.Monoid ((<>))
 import           Data.String
-import           Data.Text (Text)
+import           Data.Text (Text, cons)
 import           Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Builder.Int as Builder
 import           Numeric.Natural
+
+import           GHC.Generics (Generic)
+import           Data.Data (Data)
+import           Data.Typeable (Typeable)
 
 import qualified Prelude
 import           Prelude hiding (and, or, concat, negate, div, mod, abs, not)
@@ -317,7 +328,10 @@ exists vars r =
 letBinding :: (Text, Term) -> Builder
 letBinding (nm, t) = app_list (Builder.fromText nm) [renderTerm t]
 
--- | Create a let binding
+-- | Create a let binding.  NOTE: SMTLib2 defines this to be
+--   a \"parallel\" let, which means that the bound variables
+--   are NOT in scope in the right-hand sides of other
+--   bindings, even syntactically-later ones.
 letBinder :: [(Text, Term)] -> Term -> Term
 letBinder [] r = r
 letBinder vars r =
@@ -494,6 +508,7 @@ bit1 = T "#b1"
 bvbinary :: Integer -> Natural -> Term
 bvbinary u w0
     | w0 > fromIntegral (maxBound :: Int) = error $ "Integer width is too large."
+    | w0 == 0 = error $ "bvbinary width must be positive."
     | otherwise = T $ "#b" <> go (fromIntegral w0)
   where go :: Int -> Builder
         go 0 = mempty
@@ -510,6 +525,7 @@ bvbinary u w0
 -- The literal uses a decimal notation.
 bvdecimal :: Integer -> Natural -> Term
 bvdecimal u w
+    | w == 0 = error "bvdecimal expects positive width"
     | otherwise = T $ mconcat [ "(_ bv", Builder.decimal d, " ", Builder.decimal w, ")"]
   where d = u .&. (2^w - 1)
 
@@ -518,10 +534,10 @@ bvdecimal u w
 -- The width @w@ must be a positive multiple of 4.
 --
 -- The literal uses hex notation.
-bvhexadecimal :: Integer -> Integer -> Term
+bvhexadecimal :: Integer -> Natural -> Term
 bvhexadecimal u w0
-    | w0 <= 0 = error $ "bvhexadecimal width must be positive."
-    | w0 > toInteger (maxBound :: Int) = error $ "Integer width is too large."
+    | w0 == 0 = error $ "bvhexadecimal width must be positive."
+    | w0 > fromIntegral (maxBound :: Int) = error $ "Integer width is too large."
     | otherwise = T $ "#x" <> go (fromIntegral w0)
   where go :: Int -> Builder
         go 0 = mempty
@@ -811,3 +827,27 @@ push n =  Cmd $ "(push " <> Builder.decimal n <> ")"
 -- | Pop the given number of scope frames to the SMT solver.
 pop :: Integer -> Command
 pop n =  Cmd $ "(pop " <> Builder.decimal n <> ")"
+
+-- | This is a subtype of the type of the same name in Data.SBV.Control.
+data SMTInfoFlag =
+    Name
+  | Version
+  | InfoKeyword Text
+  deriving (Data, Eq, Ord, Generic, Show, Typeable)
+
+flagToSExp :: SMTInfoFlag -> Text
+flagToSExp = (cons ':') .
+  \case
+    Name -> "name"
+    Version -> "version"
+    InfoKeyword s -> s
+
+-- | A @get-info@ command
+getInfo :: SMTInfoFlag -> Command
+getInfo flag = Cmd $ app "get-info" [Builder.fromText (flagToSExp flag)]
+
+getVersion :: Command
+getVersion = getInfo Version
+
+getName :: Command
+getName = getInfo Name

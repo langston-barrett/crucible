@@ -9,26 +9,23 @@
 -- Stability        : provisional
 ------------------------------------------------------------------------
 
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE StandaloneDeriving #-}
-{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE UndecidableInstances #-}
+
 module Lang.Crucible.LLVM.MemModel.Generic
   ( Mem
   , emptyMem
@@ -58,12 +55,17 @@ module Lang.Crucible.LLVM.MemModel.Generic
   , branchAbortMem
   , mergeMem
 
+  , SomeAlloc(..)
+  , possibleAllocs
+  , ppSomeAlloc
+
     -- * Pretty printing
   , ppType
   , ppPtr
   , ppAlloc
   , ppAllocs
   , ppMem
+  , ppTermExpr
   ) where
 
 import           Prelude hiding (pred)
@@ -74,6 +76,7 @@ import           Control.Monad.State.Strict
 import           Data.Coerce (coerce)
 import           Data.IORef
 import           Data.Maybe
+import qualified Data.List as List
 import           Data.List.NonEmpty (NonEmpty((:|)))
 import qualified Data.Map as Map
 import qualified Data.Vector as V
@@ -82,12 +85,14 @@ import           Numeric.Natural
 import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>))
 import           Lang.Crucible.Panic (panic)
 
+
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Ctx (SingleCtx)
 import           Data.Parameterized.Some
 
 import           What4.Interface
+import qualified What4.Concrete as W4
 import qualified What4.Partial as W4P
 import qualified What4.Partial.AssertionTree as W4AT
 
@@ -106,10 +111,10 @@ import qualified Lang.Crucible.LLVM.Extension.Safety as Safety
 import qualified Lang.Crucible.LLVM.Extension.Safety.UndefinedBehavior as UB
 
 data AllocType = StackAlloc | HeapAlloc | GlobalAlloc
-  deriving (Show)
+  deriving (Eq, Ord, Show)
 
 data Mutability = Mutable | Immutable
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 -- | Stores writeable memory allocations.
 data MemAlloc sym
@@ -513,11 +518,48 @@ readMemStore sym w end (LLVMPointer blk off) ltp d t stp loadAlign storeAlign re
                      | Just{} <- ld = FixedLoad
                      | otherwise = NeitherFixed
 
-            let align' = min loadAlign storeAlign
+            let alignStride = fromAlignment $ min loadAlign storeAlign
+
+            -- compute the linear form of (load offset - store offset)
+            let (diffStride, diffDelta)
+                  | Just (load_a, _x, load_b) <- asAffineVar off
+                  , Just (store_a, _y, store_b) <- asAffineVar d = do
+                    let stride' = gcd
+                          (W4.fromConcreteUnsignedBV load_a)
+                          (W4.fromConcreteUnsignedBV store_a)
+                    -- mod returns a non-negative integer
+                    let delta' = mod
+                          (W4.fromConcreteUnsignedBV load_b - W4.fromConcreteUnsignedBV store_b)
+                          stride'
+                    (fromInteger stride', fromInteger delta')
+                  | Just (load_a, _x, load_b) <- asAffineVar off
+                  , Just store_b <- asUnsignedBV d = do
+                    let stride' = W4.fromConcreteUnsignedBV load_a
+                    let delta' = mod (W4.fromConcreteUnsignedBV load_b - store_b) stride'
+                    (fromInteger stride', fromInteger delta')
+                  | Just load_b <- asUnsignedBV off
+                  , Just (store_a, _y, store_b) <- asAffineVar d = do
+                    let stride' = W4.fromConcreteUnsignedBV store_a
+                    let delta' = mod (load_b - W4.fromConcreteUnsignedBV store_b) stride'
+                    (fromInteger stride', fromInteger delta')
+                  | otherwise = (1, 0)
+
+            let (stride, delta) = if diffStride >= alignStride
+                  then (diffStride, diffDelta)
+                  else (alignStride, 0)
+
             diff <- liftIO $ bvSub sym off d
 
-            evalMuxValueCtor sym w end varFn subFn $
-              symbolicValueLoad pref ltp (signedBVBounds diff) (ValueViewVar stp) align'
+            -- skip computing the mux tree if it would be empty
+            if storageTypeSize stp <= delta && (typeEnd 0 ltp) <= (stride - delta)
+              then readPrev ltp $ LLVMPointer blk off
+              else evalMuxValueCtor sym w end varFn subFn $
+                symbolicValueLoad
+                  pref
+                  ltp
+                  (signedBVBounds diff)
+                  (ValueViewVar stp)
+                  (LinearLoadStoreOffsetDiff stride delta)
 
 -- | Read from a memory with an array store to the same block we are reading.
 readMemArrayStore
@@ -603,16 +645,32 @@ readMem sym w l tp alignment m = do
   sz         <- bvLit sym w (bytesToInteger (typeEnd 0 tp))
   p1         <- isAllocated sym w alignment l (Just sz) m
   p2         <- isAligned sym w l alignment
-  readMem' sym w (memEndianForm m) l tp alignment (memWrites m) >>=
-    \case
-      e@(W4P.Err _) -> return e
-      PartLLVMVal p v ->
-        let ub1 = UB.ReadUnallocated  (UB.pointerView l)
-            ub2 = UB.ReadBadAlignment (UB.pointerView l) alignment
-            p'  = W4AT.And (p :| [ W4AT.Leaf (undefinedBehavior ub1 p1)
-                                 , W4AT.Leaf (undefinedBehavior ub2 p2)
-                                 ])
-        in return $ PartLLVMVal p' v
+  maybe_allocation_array <- asMemAllocationArrayStore sym w l m
+  part_val <- case maybe_allocation_array of
+    -- if this read is inside an allocation backed by a SMT array store,
+    -- then decompose this read into reading the individual bytes and
+    -- assembling them to obtain the value, without introducing any
+    -- ite operations
+    Just (arr, _arr_sz) -> do
+      let loadArrayByteFn :: Offset -> IO (PartLLVMVal arch sym)
+          loadArrayByteFn off = do
+            blk0 <- natLit sym 0
+            idx <- bvAdd sym (llvmPointerOffset l)
+              =<< bvLit sym w (bytesToInteger off)
+            byte <- arrayLookup sym arr $ Ctx.singleton idx
+            return $ Partial.totalLLVMVal sym $ LLVMValInt blk0 byte
+      genValueCtor sym (memEndianForm m)
+        =<< loadTypedValueFromBytes 0 tp loadArrayByteFn
+    Nothing -> readMem' sym w (memEndianForm m) l tp alignment (memWrites m)
+  case part_val of
+    e@(W4P.Err _) -> return e
+    PartLLVMVal p v ->
+      let ub1 = UB.ReadUnallocated  (UB.pointerView l)
+          ub2 = UB.ReadBadAlignment (UB.pointerView l) alignment
+          p'  = W4AT.And (p :| [ W4AT.Leaf (undefinedBehavior ub1 p1)
+                              , W4AT.Leaf (undefinedBehavior ub2 p2)
+                              ])
+      in return $ PartLLVMVal p' v
 
 data CacheEntry sym w =
   CacheEntry !(StorageType) !(SymNat sym) !(SymBV sym w)
@@ -1071,11 +1129,7 @@ writeMem :: (1 <= w, IsSymInterface sym)
          -> LLVMVal sym
          -> Mem sym
          -> IO (Mem sym, Pred sym, Pred sym)
-writeMem sym w ptr tp alignment v m =
-  do sz <- bvLit sym w (bytesToInteger (typeEnd 0 tp))
-     p1 <- isAllocatedMutable sym w alignment ptr (Just sz) m
-     p2 <- isAligned sym w ptr alignment
-     return (memAddWrite (MemWrite ptr (MemStore v tp alignment)) m, p1, p2)
+writeMem = writeMemWithAllocationCheck isAllocatedMutable
 
 -- | Write a value to any memory region, mutable or immutable.
 --
@@ -1092,11 +1146,70 @@ writeConstMem ::
   LLVMVal sym   ->
   Mem sym       ->
   IO (Mem sym, Pred sym, Pred sym)
-writeConstMem sym w ptr tp alignment v m =
-  do sz <- bvLit sym w (bytesToInteger (typeEnd 0 tp))
-     p1 <- isAllocated sym w alignment ptr (Just sz) m
-     p2 <- isAligned sym w ptr alignment
-     return (memAddWrite (MemWrite ptr (MemStore v tp alignment)) m, p1, p2)
+writeConstMem = writeMemWithAllocationCheck isAllocated
+
+-- | Write a value to memory.
+--
+-- The returned predicates assert (in this order):
+--  * the pointer satisfies the checks specified by
+--    the @is_allocated@ function
+--  * the pointer's alignment is correct
+writeMemWithAllocationCheck ::
+  forall sym w .
+  (IsSymInterface sym, 1 <= w) =>
+  (sym -> NatRepr w -> Alignment -> LLVMPtr sym w -> Maybe (SymBV sym w) -> Mem sym -> IO (Pred sym)) ->
+  sym ->
+  NatRepr w ->
+  LLVMPtr sym w ->
+  StorageType ->
+  Alignment ->
+  LLVMVal sym ->
+  Mem sym ->
+  IO (Mem sym, Pred sym, Pred sym)
+writeMemWithAllocationCheck is_allocated sym w ptr tp alignment val mem = do
+  let sz = typeEnd 0 tp
+  sz_bv <- constOffset sym w sz
+  p1 <- is_allocated sym w alignment ptr (Just sz_bv) mem
+  p2 <- isAligned sym w ptr alignment
+  maybe_allocation_array <- asMemAllocationArrayStore sym w ptr mem
+  mem_write <- case maybe_allocation_array of
+    -- if this write is inside an allocation backed by a SMT array store,
+    -- then decompose this write into disassembling the value to individual
+    -- bytes, writing them in the SMT array, and writing the updated SMT array
+    -- in the memory
+    Just (arr, arr_sz) -> do
+      let subFn :: ValueLoad Addr -> IO (PartLLVMVal arch sym)
+          subFn = \case
+            LastStore val_view -> applyView
+              sym
+              (memEndianForm mem)
+              (Partial.totalLLVMVal sym val)
+              val_view
+            InvalidMemory tp'-> return $ W4P.Err $ Partial.Invalid tp'
+            OldMemory off _ -> panic "Generic.writeMemWithAllocationCheck"
+              [ "Unexpected offset in storage type"
+              , "*** Offset:  " ++ show off
+              , "*** StorageType:  " ++ show tp
+              ]
+          storeArrayByteFn ::
+            SymArray sym (SingleCtx (BaseBVType w)) (BaseBVType 8) ->
+            Offset ->
+            IO (SymArray sym (SingleCtx (BaseBVType w)) (BaseBVType 8))
+          storeArrayByteFn acc_arr off = do
+            partial_byte <- genValueCtor sym (memEndianForm mem)
+              =<< traverse subFn (loadBitvector off 1 0 (ValueViewVar tp))
+            case partial_byte of
+              PartLLVMVal _ (LLVMValInt _ byte)
+                | Just Refl <- testEquality (knownNat @8) (bvWidth byte) -> do
+                  idx <- bvAdd sym (llvmPointerOffset ptr)
+                    =<< bvLit sym w (bytesToInteger off)
+                  arrayUpdate sym acc_arr (Ctx.singleton idx) byte
+              _ -> return acc_arr
+      res_arr <- foldM storeArrayByteFn arr [0 .. (sz - 1)]
+      arr_sz_bv <- constOffset sym w arr_sz
+      return $ MemWrite ptr (MemArrayStore res_arr (Just arr_sz_bv))
+    Nothing -> return $ MemWrite ptr (MemStore val tp alignment)
+  return (memAddWrite mem_write mem, p1, p2)
 
 -- | Perform a mem copy (a la @memcpy@ in C).
 --
@@ -1256,7 +1369,7 @@ freeMem sym w (LLVMPointer blk off) m =
                Just True  -> return (truePred sym)
                Just False -> isHeapAllocated fallback r
                Nothing    -> orPred sym sameBlock =<< isHeapAllocated fallback r
-        Alloc _ _ _ _ _ _ ->
+        Alloc{} ->
           isHeapAllocated fallback r
         MemFree a ->
           do sameBlock <- natEq sym blk a
@@ -1292,6 +1405,106 @@ mergeMem c x y =
       in x & memState .~ s'
     _ -> error "mergeMem given unexpected memories"
 
+--------------------------------------------------------------------------------
+-- Finding allocations
+
+-- When we have a concrete allocation number, we can ask more specific questions
+-- to the solver and get (overapproximate) concrete answers.
+
+data SomeAlloc sym =
+  forall w. SomeAlloc AllocType Natural (Maybe (SymBV sym w)) Mutability Alignment String
+
+instance IsSymInterface sym => Eq (SomeAlloc sym) where
+  SomeAlloc x_atp x_base x_sz x_mut x_alignment x_loc == SomeAlloc y_atp y_base y_sz y_mut y_alignment y_loc = do
+    let sz_eq = case (x_sz, y_sz) of
+          (Just x_bv, Just y_bv) -> isJust $ testEquality x_bv y_bv
+          (Nothing, Nothing) -> True
+          _ -> False
+    x_atp == y_atp && x_base == y_base && sz_eq && x_mut == y_mut && x_alignment == y_alignment && x_loc == y_loc
+
+ppSomeAlloc :: forall sym. IsExprBuilder sym => SomeAlloc sym -> Doc
+ppSomeAlloc (SomeAlloc atp base sz mut alignment loc) =
+  ppAlloc (Alloc atp base sz mut alignment loc :: MemAlloc sym)
+
+-- | Find an overapproximation of the set of allocations with this number.
+--
+--   Ultimately, only one of these could have happened.
+--
+--   It may be possible to be more precise than this function currently is.
+--   In particular, if we find an 'Alloc' with a matching block number before a
+--   'AllocMerge', then we can (maybe?) just return that 'Alloc'. And if one
+--   call of @helper@ on a 'MemAlloc' returns anything nonempty, that can just
+--   be returned (?).
+possibleAllocs ::
+  forall sym .
+  (IsSymInterface sym) =>
+  Natural              ->
+  Mem sym              ->
+  [SomeAlloc sym]
+possibleAllocs n = helper . memAllocs
+  where helper =
+          foldMap $
+            \case
+              MemFree _ -> []
+              Alloc atp base sz mut alignment loc ->
+                if base == n
+                then [SomeAlloc atp base sz mut alignment loc]
+                else []
+              AllocMerge (asConstantPred -> Just True) as1 as2 -> helper as1
+              AllocMerge (asConstantPred -> Just False) as1 as2 -> helper as2
+              AllocMerge _ as1 as2 -> helper as1 ++ helper as2
+
+-- | Check if @LLVMPtr sym w@ points inside an allocation that is backed
+--   by an SMT array store. If true, return the SMT array and the size of
+--   the allocation.
+--
+--   NOTE: this operation is linear in the size of the list of previous
+--   memory writes. This means that memory writes as well as memory reads
+--   require a traversal of the list of previous writes. The performance
+--   of this operation can be improved by using a map to index the writes
+--   by allocation index.
+asMemAllocationArrayStore ::
+  forall sym w .
+  (IsSymInterface sym, 1 <= w) =>
+  sym ->
+  NatRepr w ->
+  LLVMPtr sym w {- ^ Pointer -} ->
+  Mem sym ->
+  IO (Maybe (SymArray sym (SingleCtx (BaseBVType w)) (BaseBVType 8), Bytes))
+asMemAllocationArrayStore sym w ptr mem
+  | Just blk_no <- asNat (llvmPointerBlock ptr)
+  , [SomeAlloc _ _ (Just sz_bv) _ _ _] <- List.nub (possibleAllocs blk_no mem)
+  , Just sz <- asUnsignedBV sz_bv = do
+    let findArrayStore ::
+          [MemWrite sym] ->
+          IO (Maybe (SymArray sym (SingleCtx (BaseBVType w)) (BaseBVType 8)))
+        findArrayStore = \case
+          head_mem_write : tail_mem_writes -> case head_mem_write of
+            MemWrite write_ptr write_source
+              | Just write_blk_no <- asNat (llvmPointerBlock write_ptr)
+              , blk_no == write_blk_no
+              , MemArrayStore arr (Just arr_store_sz_bv) <- write_source
+              , Just arr_store_sz <- asUnsignedBV arr_store_sz_bv
+              , sz == arr_store_sz
+              , Just Refl <- testEquality w (ptrWidth write_ptr) ->
+                return $ Just arr
+              | Just write_blk_no <- asNat (llvmPointerBlock write_ptr)
+              , blk_no /= write_blk_no ->
+                findArrayStore tail_mem_writes
+              | otherwise -> return Nothing
+            WriteMerge cond lhs_mem_writes rhs_mem_writes -> do
+              lhs_result <- findArrayStore $ lhs_mem_writes ++ tail_mem_writes
+              rhs_result <- findArrayStore $ rhs_mem_writes ++ tail_mem_writes
+              case (lhs_result, rhs_result) of
+                (Just lhs_arr, Just rhs_arr) ->
+                  Just <$> arrayIte sym cond lhs_arr rhs_arr
+                _ -> return Nothing
+          [] -> return Nothing
+    result <- findArrayStore (memWrites mem)
+    return $ case result of
+      Just arr -> Just (arr, fromInteger sz)
+      Nothing -> Nothing
+  | otherwise = return Nothing
 
 --------------------------------------------------------------------------------
 -- Pretty printing
@@ -1337,18 +1550,18 @@ ppMerge vpp c x y =
   indent 2 $
     text "Condition:" <$$>
     indent 2 (printSymExpr c) <$$>
-    text "True Branch:"  <$$>
-    indent 2 (vcat $ map vpp x) <$$>
-    text "False Branch:" <$$>
-    indent 2 (vcat $ map vpp y)
+    ppAllocList x (text "True Branch:") <$$>
+    ppAllocList y (text "False Branch:")
+  where ppAllocList [] = (<+> text "<none>")
+        ppAllocList xs = (<$$> indent 2 (vcat $ map vpp xs))
 
 ppAlloc :: IsExprBuilder sym => MemAlloc sym -> Doc
 ppAlloc (Alloc atp base sz mut _alignment loc) =
   text (show atp) <+> text (show base) <+> (pretty $ printSymExpr <$> sz) <+> text (show mut) <+> text loc
 ppAlloc (MemFree base) =
-  text "free" <+> printSymExpr base
+  text "Free" <+> printSymExpr base
 ppAlloc (AllocMerge c x y) = do
-  text "merge" <$$> ppMerge ppAlloc c x y
+  text "Merge" <$$> ppMerge ppAlloc c x y
 
 ppAllocs :: IsExprBuilder sym => [MemAlloc sym] -> Doc
 ppAllocs xs = vcat $ map ppAlloc xs

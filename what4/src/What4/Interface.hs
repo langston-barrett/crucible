@@ -41,9 +41,9 @@ The canonical implementation of these interface classes is found in "What4.Expr.
 -}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveFunctor #-}
+
+
+
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -151,6 +151,7 @@ module What4.Interface
 import           Control.Exception (assert)
 import           Control.Lens
 import           Control.Monad
+import           Data.Bits
 import           Control.Monad.IO.Class
 import           Data.Coerce (coerce)
 import           Data.Foldable
@@ -295,6 +296,8 @@ class IsExpr e where
 
   -- | If we have bounds information about the term, return signed upper and lower bounds
   signedBVBounds :: (1 <= w) => e (BaseBVType w) -> Maybe (Integer, Integer)
+
+  asAffineVar :: e tp -> Maybe (ConcreteVal tp, e tp, ConcreteVal tp)
 
   -- | Return the string value if this is a constant string
   asString :: e BaseStringType -> Maybe Text
@@ -513,10 +516,6 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
 
   -- | Boolean disjunction
   orPred  :: sym -> Pred sym -> Pred sym -> IO (Pred sym)
-  orPred sym x y = do
-    xn <- notPred sym x
-    yn <- notPred sym y
-    notPred sym =<< andPred sym xn yn
 
   -- | Boolean implication
   impliesPred :: sym -> Pred sym -> Pred sym -> IO (Pred sym)
@@ -847,6 +846,20 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
                         SymBV sym w {- ^ Amount to shift by -} ->
                         IO (SymBV sym w)
 
+  -- | Rotate left.
+  bvRol :: (1 <= w) =>
+    sym ->
+    SymBV sym w {- ^ bitvector to rotate -} ->
+    SymBV sym w {- ^ amount to rotate by -} ->
+    IO (SymBV sym w)
+
+  -- | Rotate right.
+  bvRor :: (1 <= w) =>
+    sym ->
+    SymBV sym w {- ^ bitvector to rotate -} ->
+    SymBV sym w {- ^ amount to rotate by -} ->
+    IO (SymBV sym w)
+
   -- | Zero-extend a bitvector.
   bvZext :: (1 <= u, u+1 <= r) => sym -> NatRepr r -> SymBV sym u -> IO (SymBV sym r)
 
@@ -898,14 +911,24 @@ class (IsExpr (SymExpr sym), HashableF (SymExpr sym)) => IsExprBuilder sym where
         -> Natural     -- ^ 0-based index to set
         -> Pred sym    -- ^ Predicate to set.
         -> IO (SymBV sym w)
-  bvSet sym v i p = assert (i < natValue (bvWidth v)) $ do
-    let setCase :: IO (SymBV sym w)
-        setCase = do
-          bvOrBits sym v =<< bvLit sym (bvWidth v) (2^i)
-        unsetCase :: IO (SymBV sym w)
-        unsetCase = do
-          bvAndBits sym v =<< bvLit sym (bvWidth v) (negate (2^i+1))
-    iteM bvIte sym p setCase unsetCase
+  bvSet sym v i p = assert (i < natValue (bvWidth v)) $
+    -- NB, this representation based on AND/XOR structure is designed so that a
+    -- sequence of bvSet operations will collapse nicely into a xor-linear combination
+    -- of the original term and bvFill terms. It has the nice property that we
+    -- do not introduce any additional subterm sharing.
+    do let w    = bvWidth v
+       let mask = bit (fromIntegral i)
+       pbits <- bvFill sym w p
+       vbits <- bvAndBits sym v =<< bvLit sym w (complement mask)
+       bvXorBits sym vbits =<< bvAndBits sym pbits =<< bvLit sym w mask
+
+  -- | @bvFill sym w p@ returns a bitvector @w@-bits long where every bit
+  --   is given by the boolean value of @p@.
+  bvFill :: forall w. (1 <= w) =>
+    sym       {-^ symbolic interface -} ->
+    NatRepr w {-^ output bitvector width -} ->
+    Pred sym  {-^ predicate to fill the bitvector with -} ->
+    IO (SymBV sym w)
 
   -- | Return the bitvector of the desired width with all 0 bits;
   --   this is the minimum unsigned integer.

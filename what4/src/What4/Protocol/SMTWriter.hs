@@ -19,13 +19,13 @@ if structs are supported or nested arrays if they are not.
 The solver should detect when something is not supported and give an
 error rather than sending invalid output to a file.
 -}
+
 {-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DoAndIfThenElse #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -36,7 +36,7 @@ error rather than sending invalid output to a file.
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
-{-# LANGUAGE ViewPatterns #-}
+
 module What4.Protocol.SMTWriter
   ( -- * Type classes
     SupportTermOps(..)
@@ -98,6 +98,7 @@ import           Control.Monad.Trans.Maybe
 import           Data.Bits (shiftL)
 import           Data.IORef
 import           Data.Kind
+import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.Map.Strict as Map
 import           Data.Maybe
 import           Data.Parameterized.Classes (ShowF(..))
@@ -123,12 +124,14 @@ import qualified System.IO.Streams as Streams
 import           What4.BaseTypes
 import           What4.Interface (ArrayResultWrapper(..), IndexLit(..), RoundingMode(..))
 import           What4.ProblemFeatures
+import qualified What4.Expr.BoolMap as BM
 import           What4.Expr.Builder
 import           What4.Expr.GroundEval
 import qualified What4.Expr.WeightedSum as WSum
 import qualified What4.Expr.UnaryBV as UnaryBV
 import           What4.ProgramLoc
 import           What4.SatResult
+import qualified What4.SemiRing as SR
 import           What4.Symbol
 import           What4.Utils.AbstractDomains
 import qualified What4.Utils.BVDomain as BVD
@@ -222,10 +225,11 @@ instance TestEquality TypeMap where
     Just Refl
   testEquality _ _ = Nothing
 
-semiRingTypeMap :: SemiRingRepr tp -> TypeMap tp
-semiRingTypeMap SemiRingNat  = NatTypeMap
-semiRingTypeMap SemiRingInt  = IntegerTypeMap
-semiRingTypeMap SemiRingReal = RealTypeMap
+semiRingTypeMap :: SR.SemiRingRepr sr -> TypeMap (SR.SemiRingBase sr)
+semiRingTypeMap SR.SemiRingNatRepr         = NatTypeMap
+semiRingTypeMap SR.SemiRingIntegerRepr     = IntegerTypeMap
+semiRingTypeMap SR.SemiRingRealRepr        = RealTypeMap
+semiRingTypeMap (SR.SemiRingBVRepr _flv w) = BVTypeMap w
 
 type ArrayConstantFn v
    = [Some TypeMap]
@@ -261,7 +265,10 @@ class Num v => SupportTermOps v where
   impliesExpr :: v -> v -> v
   impliesExpr x y = notExpr x .|| y
 
-  -- | Create a let expression.
+  -- | Create a let expression.  This is a "sequential" let,
+  --   which is syntactic sugar for a nested series of single
+  --   let bindings.  As a consequence, bound variables are in
+  --   scope for the right-hand-sides of subsequent bindings.
   letExpr :: [(Text, v)] -> v -> v
 
   -- | Create an if-then-else expression.
@@ -976,17 +983,17 @@ typeMapFirstClass :: WriterConn t h -> BaseTypeRepr tp -> Either BaseTypeError (
 typeMapFirstClass conn tp0 = do
   let feat = supportedFeatures conn
   case tp0 of
-    BaseBoolRepr -> Right $! BoolTypeMap
+    BaseBoolRepr -> Right BoolTypeMap
     BaseBVRepr w -> Right $! BVTypeMap w
     BaseFloatRepr fpp -> Right $! FloatTypeMap fpp
-    BaseRealRepr -> Right $! RealTypeMap
-    BaseNatRepr  -> Right $! NatTypeMap
-    BaseIntegerRepr -> Right $! IntegerTypeMap
-    BaseStringRepr -> Left $! StringTypeUnsupported
+    BaseRealRepr -> Right RealTypeMap
+    BaseNatRepr  -> Right NatTypeMap
+    BaseIntegerRepr -> Right IntegerTypeMap
+    BaseStringRepr -> Left StringTypeUnsupported
     BaseComplexRepr
-      | feat `hasProblemFeature` useStructs        -> Right $! ComplexToStructTypeMap
-      | feat `hasProblemFeature` useSymbolicArrays -> Right $! ComplexToArrayTypeMap
-      | otherwise -> Left $! ComplexTypeUnsupported
+      | feat `hasProblemFeature` useStructs        -> Right ComplexToStructTypeMap
+      | feat `hasProblemFeature` useSymbolicArrays -> Right ComplexToArrayTypeMap
+      | otherwise -> Left ComplexTypeUnsupported
     BaseArrayRepr idxTp eltTp -> do
       -- This is a proxy for the property we want, because we assume that EITHER
       -- the solver uses symbolic arrays, OR functions are first-class objects
@@ -1286,7 +1293,7 @@ bvIntTerm w x = sumExpr ((\i -> digit (i-1)) <$> [1..natValue w])
  where digit :: Natural -> v
        digit d = ite (bvTestBit w d x)
                      (fromInteger (2^d))
-                     (fromInteger 0)
+                     0
 
 sbvIntTerm :: SupportTermOps v
            => NatRepr w
@@ -1295,7 +1302,7 @@ sbvIntTerm :: SupportTermOps v
 sbvIntTerm w0 x0 = sumExpr (signed_offset : go w0 x0 (natValue w0 - 2))
  where signed_offset = ite (bvTestBit w0 (natValue w0 - 1) x0)
                            (fromInteger (negate (2^(widthVal w0 - 1))))
-                           (fromInteger 0)
+                           0
        go :: SupportTermOps v => NatRepr w -> v -> Natural -> [v]
        go w x n
         | n > 0     = digit w x n : go w x (n-1)
@@ -1306,7 +1313,7 @@ sbvIntTerm w0 x0 = sumExpr (signed_offset : go w0 x0 (natValue w0 - 2))
        digit :: SupportTermOps v => NatRepr w -> v -> Natural -> v
        digit w x d = ite (bvTestBit w d x)
                          (fromInteger (2^d))
-                         (fromInteger 0)
+                         0
 
 unsupportedTerm  :: Monad m => Expr t tp -> m a
 unsupportedTerm e =
@@ -1507,20 +1514,23 @@ defineSMTFunction conn var action =
 
 -- | Convert an expression into a SMT Expression.
 mkExpr :: SMTWriter h => Expr t tp -> SMTCollector t h (SMTExpr h tp)
-mkExpr t@(SemiRingLiteral SemiRingNat n _) = do
+mkExpr (BoolExpr b _) =
+  return (SMTExpr BoolTypeMap (boolExpr b))
+mkExpr t@(SemiRingLiteral SR.SemiRingNatRepr n _) = do
   checkLinearSupport t
   return (SMTExpr NatTypeMap (fromIntegral n))
-mkExpr t@(SemiRingLiteral SemiRingInt i _) = do
+mkExpr t@(SemiRingLiteral SR.SemiRingIntegerRepr i _) = do
   checkLinearSupport t
   return (SMTExpr IntegerTypeMap (fromIntegral i))
-mkExpr t@(SemiRingLiteral SemiRingReal r _) = do
+mkExpr t@(SemiRingLiteral SR.SemiRingRealRepr r _) = do
   checkLinearSupport t
   return (SMTExpr RealTypeMap (rationalTerm r))
+mkExpr t@(SemiRingLiteral (SR.SemiRingBVRepr _flv w) x _) = do
+  checkLinearSupport t
+  return $ SMTExpr (BVTypeMap w) $ bvTerm w x
 mkExpr t@(StringExpr{}) =
   do conn <- asks scConn
      theoryUnsupported conn "strings" t
-mkExpr (BVExpr w x _) =
-  return $ SMTExpr (BVTypeMap w) $ bvTerm w x
 mkExpr (NonceAppExpr ea) =
   cacheWriterResult (nonceExprId ea) DeleteOnPop $
     predSMTExpr ea
@@ -1675,31 +1685,46 @@ appSMTExpr ae = do
   let i = AppExpr ae
   liftIO $ updateProgramLoc conn (appExprLoc ae)
   case appExprApp ae of
-    TrueBool  ->
-      return $! SMTExpr BoolTypeMap (boolExpr True)
-    FalseBool ->
-      return $! SMTExpr BoolTypeMap (boolExpr False)
-    NotBool x   -> do
-      xb <- mkExpr x
-      freshBoundTerm BoolTypeMap $ notExpr (asBase xb)
-    AndBool x y -> do
-      xb <- mkExpr x
-      yb <- mkExpr y
-      freshBoundTerm BoolTypeMap $ asBase xb .&& asBase yb
-    XorBool x y -> do
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm BoolTypeMap $ xb ./= yb
-    IteBool c x y -> do
-      cb <- mkBaseExpr c
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm BoolTypeMap $ ite cb xb yb
 
-    SemiRingEq _sr x y -> do
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm BoolTypeMap $ xb .== yb
+    BaseEq _ x y ->
+      do xe <- mkExpr x
+         ye <- mkExpr y
+
+         let xtp = smtExprType xe
+         let ytp = smtExprType ye
+
+         let checkArrayType z (FnArrayTypeMap{}) = do
+               fail $ show $ text (smtWriterName conn) <+>
+                 text "does not support checking equality for the array generated at"
+                 <+> pretty (plSourceLoc (exprLoc z)) <> text ":" <$$>
+                 indent 2 (pretty z)
+             checkArrayType _ _ = return ()
+
+         checkArrayType x xtp
+         checkArrayType y ytp
+
+         when (xtp /= ytp) $ do
+           fail $ unwords ["Type representations are not equal:", show xtp, show ytp]
+
+         freshBoundTerm BoolTypeMap $ asBase xe .== asBase ye
+
+    BaseIte btp _ c x y -> do
+      let errMsg typename =
+           show
+             $   text "we do not support if/then/else expressions at type"
+             <+> text typename
+             <+> text "with solver"
+             <+> text (smtWriterName conn ++ ".")
+      case typeMap conn btp of
+        Left  StringTypeUnsupported  -> fail $ errMsg "string"
+        Left  ComplexTypeUnsupported -> fail $ errMsg "complex"
+        Left  ArrayUnsupported       -> fail $ errMsg "array"
+        Right FnArrayTypeMap{}       -> fail $ errMsg "function-backed array"
+        Right tym ->
+          do cb <- mkBaseExpr c
+             xb <- mkBaseExpr x
+             yb <- mkBaseExpr y
+             freshBoundTerm tym $ ite cb xb yb
 
     SemiRingLe _sr x y -> do
       xb <- mkBaseExpr x
@@ -1710,19 +1735,11 @@ appSMTExpr ae = do
       rb <- mkBaseExpr r
       freshBoundTerm BoolTypeMap $! realIsInteger rb
 
-    PredToBV p -> do
-      pb <- mkBaseExpr p
-      freshBoundTerm (BVTypeMap (knownNat @1)) $
-        ite pb (bvTerm (knownNat @1) 1) (bvTerm (knownNat @1) 0)
     BVTestBit n xe -> do
       x <- mkBaseExpr xe
       let this_bit = bvExtract (bvWidth xe) n 1 x
           one = bvTerm (knownNat :: NatRepr 1) 1
       freshBoundTerm BoolTypeMap $ this_bit .== one
-    BVEq xe ye -> do
-      x <- mkBaseExpr xe
-      y <- mkBaseExpr ye
-      freshBoundTerm BoolTypeMap $ x .== y
     BVSlt xe ye -> do
       x <- mkBaseExpr xe
       y <- mkBaseExpr ye
@@ -1731,28 +1748,10 @@ appSMTExpr ae = do
       x <- mkBaseExpr xe
       y <- mkBaseExpr ye
       freshBoundTerm BoolTypeMap $ x `bvULt` y
-    ArrayEq xe ye -> do
-      x <- mkExpr xe
-      y <- mkExpr ye
-      let xtp = smtExprType x
-      let ytp = smtExprType y
-
-      let checkArrayType z (FnArrayTypeMap{}) = do
-            fail $ show $ text (smtWriterName conn) <+>
-              text "does not support checking equality for the array generated at"
-              <+> pretty (plSourceLoc (exprLoc z)) <> text ":" <$$>
-              indent 2 (pretty z)
-          checkArrayType _ _ = return ()
-      checkArrayType xe xtp
-      checkArrayType ye ytp
-
-      when (xtp /= ytp) $ do
-        fail $ "Array types are not equal."
-      freshBoundTerm BoolTypeMap $ asBase x .== asBase y
 
     IntDiv xe ye -> do
       case ye of
-        SemiRingLiteral SemiRingInt _ _ -> return ()
+        SemiRingLiteral _ _ _ -> return ()
         _ -> checkNonlinearSupport i
 
       x <- mkBaseExpr xe
@@ -1762,7 +1761,7 @@ appSMTExpr ae = do
 
     IntMod xe ye -> do
       case ye of
-        SemiRingLiteral SemiRingInt _ _ -> return ()
+        SemiRingLiteral _ _ _ -> return ()
         _ -> checkNonlinearSupport i
 
       x <- mkBaseExpr xe
@@ -1780,7 +1779,7 @@ appSMTExpr ae = do
 
     NatDiv xe ye -> do
       case ye of
-        SemiRingLiteral SemiRingNat _ _ -> return ()
+        SemiRingLiteral _ _ _ -> return ()
         _ -> checkNonlinearSupport i
 
       x <- mkBaseExpr xe
@@ -1790,7 +1789,7 @@ appSMTExpr ae = do
 
     NatMod xe ye -> do
       case ye of
-        SemiRingLiteral SemiRingNat _ _ -> return ()
+        SemiRingLiteral _ _ _ -> return ()
         _ -> checkNonlinearSupport i
 
       x <- mkBaseExpr xe
@@ -1798,57 +1797,123 @@ appSMTExpr ae = do
 
       freshBoundTerm NatTypeMap (intMod x y)
 
+    NotPred x -> freshBoundTerm BoolTypeMap . notExpr =<< mkBaseExpr x
+
+    DisjPred xs ->
+      let pol (x,Positive) = mkBaseExpr x
+          pol (x,Negative) = notExpr <$> mkBaseExpr x
+      in
+      case BM.viewBoolMap xs of
+        BM.BoolMapUnit ->
+          return $ SMTExpr BoolTypeMap $ boolExpr False
+        BM.BoolMapDualUnit ->
+          return $ SMTExpr BoolTypeMap $ boolExpr True
+        BM.BoolMapTerms (t:|[]) ->
+          SMTExpr BoolTypeMap <$> pol t
+        BM.BoolMapTerms (t:|ts) ->
+          do cnj <- orAll <$> mapM pol (t:ts)
+             freshBoundTerm BoolTypeMap cnj
+
+    ConjPred xs ->
+      let pol (x,Positive) = mkBaseExpr x
+          pol (x,Negative) = notExpr <$> mkBaseExpr x
+      in
+      case BM.viewBoolMap xs of
+        BM.BoolMapUnit ->
+          return $ SMTExpr BoolTypeMap $ boolExpr True
+        BM.BoolMapDualUnit ->
+          return $ SMTExpr BoolTypeMap $ boolExpr False
+        BM.BoolMapTerms (t:|[]) ->
+          SMTExpr BoolTypeMap <$> pol t
+        BM.BoolMapTerms (t:|ts) ->
+          do cnj <- andAll <$> mapM pol (t:ts)
+             freshBoundTerm BoolTypeMap cnj
+
     ------------------------------------------
     -- Real operations.
 
-    SemiRingMul SemiRingReal (SemiRingLiteral SemiRingReal (-1) _) x -> do
-      xb <- mkBaseExpr x
-      freshBoundTerm RealTypeMap $ negate xb
-    SemiRingMul SemiRingInt (SemiRingLiteral SemiRingInt (-1) _) x -> do
-      xb <- mkBaseExpr x
-      freshBoundTerm IntegerTypeMap $ negate xb
-    SemiRingMul sr x y -> do
-      case (x,y) of
-        (SemiRingLiteral{}, _) -> return ()
-        (_, SemiRingLiteral{}) -> return ()
-        _ -> checkNonlinearSupport i
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm (semiRingTypeMap sr) $ xb * yb
+    SemiRingProd pd ->
+      case WSum.prodRepr pd of
+        SR.SemiRingBVRepr SR.BVArithRepr w ->
+          do pd' <- WSum.prodEvalM (\a b -> pure (bvMul a b)) mkBaseExpr pd
+             maybe (return $ SMTExpr (BVTypeMap w) $ bvTerm w 1)
+                   (freshBoundTerm (BVTypeMap w))
+                   pd'
 
-    SemiRingSum SemiRingNat s -> do
-      let smul c e
-            | c ==  1   = (:[]) <$> mkBaseExpr e
-            | otherwise = (:[]) . (integerTerm (toInteger c) *) <$> mkBaseExpr e
-      freshBoundTerm NatTypeMap . sumExpr
-        =<< WSum.eval (liftM2 (++)) smul (pure . (:[]) . integerTerm . toInteger) s
+        SR.SemiRingBVRepr SR.BVBitsRepr w ->
+          do pd' <- WSum.prodEvalM (\a b -> pure (bvAnd a b)) mkBaseExpr pd
+             maybe (return $ SMTExpr (BVTypeMap w) $ bvTerm w (maxUnsigned w))
+                   (freshBoundTerm (BVTypeMap w))
+                   pd'
+        sr ->
+          do checkNonlinearSupport i
+             pd' <- WSum.prodEvalM (\a b -> pure (a * b)) mkBaseExpr pd
+             maybe (return $ SMTExpr (semiRingTypeMap sr) $ integerTerm 1)
+                   (freshBoundTerm (semiRingTypeMap sr))
+                   pd'
 
-    SemiRingSum SemiRingInt s -> do
-      let smul c e
-            | c ==  1   = (:[]) <$> mkBaseExpr e
-            | c == -1   = (:[]) . negate <$> mkBaseExpr e
-            | otherwise = (:[]) . (integerTerm c *) <$> mkBaseExpr e
-      freshBoundTerm IntegerTypeMap . sumExpr
-        =<< WSum.eval (liftM2 (++)) smul (pure . (:[]) . integerTerm) s
+    SemiRingSum s ->
+      case WSum.sumRepr s of
+        SR.SemiRingNatRepr ->
+          let smul c e
+                | c ==  1   = (:[]) <$> mkBaseExpr e
+                | otherwise = (:[]) . (integerTerm (toInteger c) *) <$> mkBaseExpr e
+              cnst 0 = []
+              cnst x = [integerTerm (toInteger x)]
+          in
+          freshBoundTerm NatTypeMap . sumExpr
+            =<< WSum.evalM (\x y -> pure (x++y)) smul (pure . cnst) s
 
-    SemiRingSum SemiRingReal rs -> do
-      let smul c e
-            | c ==  1 = (:[]) <$> mkBaseExpr e
-            | c == -1 = (:[]) . negate <$> mkBaseExpr e
-            | otherwise = (:[]) . (rationalTerm c *) <$> mkBaseExpr e
-      freshBoundTerm RealTypeMap . sumExpr
-        =<< WSum.eval (liftM2 (++)) smul (pure . (:[]) . rationalTerm) rs
+        SR.SemiRingIntegerRepr ->
+          let smul c e
+                | c ==  1   = (:[]) <$> mkBaseExpr e
+                | c == -1   = (:[]) . negate <$> mkBaseExpr e
+                | otherwise = (:[]) . (integerTerm c *) <$> mkBaseExpr e
+              cnst 0 = []
+              cnst x = [integerTerm x]
+          in
+          freshBoundTerm IntegerTypeMap . sumExpr
+            =<< WSum.evalM (\x y -> pure (x++y)) smul (pure . cnst) s
 
-    SemiRingIte sr c x y -> do
-      cb <- mkBaseExpr c
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm (semiRingTypeMap sr) $ ite cb xb yb
+        SR.SemiRingRealRepr ->
+          let smul c e
+                | c ==  1 = (:[]) <$> mkBaseExpr e
+                | c == -1 = (:[]) . negate <$> mkBaseExpr e
+                | otherwise = (:[]) . (rationalTerm c *) <$> mkBaseExpr e
+              cnst 0 = []
+              cnst x = [rationalTerm x]
+          in
+          freshBoundTerm RealTypeMap . sumExpr
+            =<< WSum.evalM (\x y -> pure (x++y)) smul (pure . cnst) s
+
+        SR.SemiRingBVRepr SR.BVArithRepr w ->
+          let smul c e
+                | c ==  1   = (:[]) <$> mkBaseExpr e
+                | c == -1   = (:[]) . bvNeg <$> mkBaseExpr e
+                | otherwise = (:[]) <$> (bvMul (bvTerm w c)) <$> mkBaseExpr e
+              cnst 0 = []
+              cnst x = [bvTerm w x]
+           in
+           freshBoundTerm (BVTypeMap w) . bvSumExpr w
+             =<< WSum.evalM (\x y -> pure (x++y)) smul (pure . cnst) s
+
+        SR.SemiRingBVRepr SR.BVBitsRepr w ->
+          let smul c e
+                | c == maxUnsigned w = (:[]) <$> mkBaseExpr e
+                | otherwise          = (:[]) <$> (bvAnd (bvTerm w c)) <$> mkBaseExpr e
+              cnst 0 = []
+              cnst x = [bvTerm w x]
+
+              xorsum [] = bvTerm w 0
+              xorsum xs = foldr1 bvXor xs
+           in
+           freshBoundTerm (BVTypeMap w) . xorsum
+             =<< WSum.evalM (\x y -> pure (x++y)) smul (pure . cnst) s
 
     RealDiv xe ye -> do
       x <- mkBaseExpr xe
       case ye of
-        SemiRingLiteral SemiRingReal r _ -> do
+        SemiRingLiteral SR.SemiRingRealRepr r _ -> do
           freshBoundTerm RealTypeMap $ x * rationalTerm (recip r)
         _ -> do
           checkNonlinearSupport i
@@ -1925,6 +1990,14 @@ appSMTExpr ae = do
           return ()
       return nm
 
+    BVOrBits pd ->
+      case WSum.prodRepr pd of
+        SR.SemiRingBVRepr _ w ->
+          do pd' <- WSum.prodEvalM (\a b -> pure (bvOr a b)) mkBaseExpr pd
+             maybe (return $ SMTExpr (BVTypeMap w) $ bvTerm w 0)
+                   (freshBoundTerm (BVTypeMap w))
+                   pd'
+
     BVConcat w xe ye -> do
       x <- mkBaseExpr xe
       y <- mkBaseExpr ye
@@ -1933,20 +2006,6 @@ appSMTExpr ae = do
     BVSelect idx n xe -> do
       x <- mkBaseExpr xe
       freshBoundTerm (BVTypeMap n) $ bvExtract (bvWidth xe) (natValue idx) (natValue n) x
-
-    BVNeg w xe -> do
-      x <- mkBaseExpr xe
-      freshBoundTerm (BVTypeMap w) $ bvNeg x
-
-    BVAdd w xe ye -> do
-      x <- mkBaseExpr xe
-      y <- mkBaseExpr ye
-      freshBoundTerm (BVTypeMap w) $ bvAdd x y
-
-    BVMul w xe ye -> do
-      x <- mkBaseExpr xe
-      y <- mkBaseExpr ye
-      freshBoundTerm (BVTypeMap w) $ bvMul x y
 
     BVUdiv w xe ye -> do
       x <- mkBaseExpr xe
@@ -1968,12 +2027,6 @@ appSMTExpr ae = do
       y <- mkBaseExpr ye
       freshBoundTerm (BVTypeMap w) $ bvSRem x y
 
-    BVIte w _ c x y -> do
-      cb <- mkBaseExpr c
-      xb <- mkBaseExpr x
-      yb <- mkBaseExpr y
-      freshBoundTerm (BVTypeMap w) $ ite cb xb yb
-
     BVShl w xe ye -> do
       x <- mkBaseExpr xe
       y <- mkBaseExpr ye
@@ -1988,6 +2041,30 @@ appSMTExpr ae = do
       x <- mkBaseExpr xe
       y <- mkBaseExpr ye
       freshBoundTerm (BVTypeMap w) $ bvAshr x y
+
+    BVRol w xe ye -> do
+      x  <- mkBaseExpr xe
+      y  <- mkBaseExpr ye
+
+      let w' = bvTerm w (intValue w)
+      y' <- asBase <$> (freshBoundTerm (BVTypeMap w) $ bvURem y w')
+
+      let lo = bvLshr x (bvSub w' y')
+      let hi = bvShl x y'
+
+      freshBoundTerm (BVTypeMap w) $ bvXor hi lo
+
+    BVRor w xe ye -> do
+      x  <- mkBaseExpr xe
+      y  <- mkBaseExpr ye
+
+      let w' = bvTerm w (intValue w)
+      y' <- asBase <$> (freshBoundTerm (BVTypeMap w) $ bvURem y w')
+
+      let lo = bvLshr x y'
+      let hi = bvShl x (bvSub w' y')
+
+      freshBoundTerm (BVTypeMap w) $ bvXor hi lo
 
     BVZext w' xe -> do
       let w = bvWidth xe
@@ -2006,10 +2083,16 @@ appSMTExpr ae = do
       case someNat n of
         Just (Some w2) | Just LeqProof <- isPosNat w' -> do
           let zeros = bvTerm w2 0
-          let ones  = bvTerm w2 (2^n - 1)
+          let ones  = bvTerm w2 (maxUnsigned w2)
           let sgn = bvTestBit w (natValue w - 1) x
           freshBoundTerm (BVTypeMap w') $ bvConcat (ite sgn ones zeros) x
         _ -> fail "invalid sign extension"
+
+    BVFill w xe ->
+      do x <- mkBaseExpr xe
+         let zeros = bvTerm w 0
+         let ones  = bvTerm w (maxUnsigned w)
+         freshBoundTerm (BVTypeMap w) $ ite x ones zeros
 
     BVPopcount w xe ->
       do x <- mkBaseExpr xe
@@ -2033,22 +2116,6 @@ appSMTExpr ae = do
      go !idx x
        | idx < natValue w = ite (bvTestBit w idx x) (bvTerm w (toInteger idx)) (go (idx+1) x)
        | otherwise = bvTerm w (intValue w)
-
-    BVBitNot w xe -> do
-      x <- mkBaseExpr xe
-      freshBoundTerm (BVTypeMap w) $ bvNot x
-    BVBitAnd w xe ye -> do
-      x <- mkBaseExpr xe
-      y <- mkBaseExpr ye
-      freshBoundTerm (BVTypeMap w) $ bvAnd x y
-    BVBitOr w xe ye -> do
-      x <- mkBaseExpr xe
-      y <- mkBaseExpr ye
-      freshBoundTerm (BVTypeMap w) $ bvOr x y
-    BVBitXor _w xe ye -> do
-      x <- mkExpr xe
-      y <- mkExpr ye
-      freshBoundTerm (smtExprType x) $ bvXor (asBase x) (asBase y)
 
     ------------------------------------------
     -- Floating-point operations
@@ -2104,10 +2171,6 @@ appSMTExpr ae = do
       ye <- mkBaseExpr y
       ze <- mkBaseExpr z
       freshBoundTerm (FloatTypeMap fpp) $ floatFMA r xe ye ze
-    FloatEq x y -> do
-      xe <- mkBaseExpr x
-      ye <- mkBaseExpr y
-      freshBoundTerm BoolTypeMap $ floatEq xe ye
     FloatFpEq x y -> do
       xe <- mkBaseExpr x
       ye <- mkBaseExpr y
@@ -2148,11 +2211,6 @@ appSMTExpr ae = do
     FloatIsNorm x -> do
       xe <- mkBaseExpr x
       freshBoundTerm BoolTypeMap $ floatIsNorm xe
-    FloatIte fpp c x y -> do
-      ce <- mkBaseExpr c
-      xe <- mkBaseExpr x
-      ye <- mkBaseExpr y
-      freshBoundTerm (FloatTypeMap fpp) $ ite ce xe ye
     FloatCast fpp r x -> do
       xe <- mkBaseExpr x
       freshBoundTerm (FloatTypeMap fpp) $
@@ -2275,19 +2333,6 @@ appSMTExpr ae = do
           -- Create names for index variables.
           args <- liftIO $ createTypeMapArgsForArray conn idx_types
           SMTName array_type <$> freshBoundFn args value_type (asBase v)
-
-    MuxArray _idxRepr _bRepr ce xe ye -> do
-      c <- mkExpr ce
-      x <- mkExpr xe
-      y <- mkExpr ye
-      let xtp = smtExprType x
-      let ytp = smtExprType y
-      case (xtp,ytp) of
-        (PrimArrayTypeMap{}, PrimArrayTypeMap{}) | xtp == ytp ->
-          freshBoundTerm xtp $ ite (asBase c) (asBase x) (asBase y)
-        -- TODO: Support FnArrayTypeMap
-        _ -> do
-          fail $ "SMTWriter expects compatible array types."
 
     SelectArray _bRepr a idx -> do
       aexpr <- mkExpr a
@@ -2455,14 +2500,6 @@ appSMTExpr ae = do
          let n = Ctx.sizeInt (Ctx.size flds)
          freshBoundTerm tp $
            structFieldSelect n (asBase expr) (Ctx.indexVal idx)
-    StructIte _ p x y -> do
-      pe <- mkExpr p
-      xe <- mkExpr x
-      ye <- mkExpr y
-      when (smtExprType xe /= smtExprType ye) $ do
-        fail $ "Expected structs to have same type."
-      let tp = smtExprType xe
-      freshBoundTerm tp $ ite (asBase pe) (asBase xe) (asBase ye)
 
 defineFn :: SMTWriter h
          => WriterConn t h
@@ -2549,7 +2586,7 @@ getSMTSymFn conn fn arg_types = do
       nm <- getSymbolName conn (FnSymbolBinding fn)
       ret_type <- mkSMTSymFn conn nm fn arg_types
       cacheValueFn conn n DeleteOnPop $! SMTSymFn nm arg_types ret_type
-      return $! (nm, ret_type)
+      return (nm, ret_type)
 
 ------------------------------------------------------------------------
 -- Writer high-level interface.
@@ -2571,10 +2608,12 @@ mkAtomicFormula conn p = runOnLiveConnection conn $
 -- | Write assume formula predicates for asserting predicate holds.
 assume :: SMTWriter h => WriterConn t h -> BoolExpr t -> IO ()
 assume c p = do
-  forM_ (asConjunction p) $ \v -> do
+  forM_ (asConjunction p) $ \(v,pl) -> do
     f <- mkFormula c v
     updateProgramLoc c (exprLoc v)
-    assumeFormula c f
+    case pl of
+      BM.Positive -> assumeFormula c f
+      BM.Negative -> assumeFormula c (notExpr f)
 
 type SMTEvalBVArrayFn h w v =
     (1 <= w,
@@ -2626,6 +2665,7 @@ class SMTWriter h => SMTReadWriter h where
   --   The boolean indicates the polarity of the atom: true for an ordinary
   --   atom, false for a negated atom.
   smtUnsatAssumptionsResult :: f h -> Streams.InputStream Text -> IO [(Bool,Text)]
+
 
 -- | Return the terms associated with the given ground index variables.
 smtIndicesTerms :: forall v idx

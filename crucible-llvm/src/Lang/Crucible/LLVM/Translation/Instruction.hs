@@ -11,15 +11,13 @@
 -- is responsable for interpreting the LLVM instruction set into
 -- corresponding crucible statements.
 -----------------------------------------------------------------------
+
 {-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE ImplicitParams        #-}
-{-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE OverloadedStrings     #-}
-{-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE PatternGuards         #-}
 {-# LANGUAGE PatternSynonyms       #-}
 {-# LANGUAGE PolyKinds             #-}
 {-# LANGUAGE RankNTypes            #-}
@@ -156,8 +154,8 @@ instrResultType instr =
     L.Load x _ _ -> case L.typedType x of
                    L.PtrTo ty -> liftMemType ty
                    _ -> fail $ unwords ["load through non-pointer type", show (L.typedType x)]
-    L.ICmp _ _ _ -> liftMemType (L.PrimType (L.Integer 1))
-    L.FCmp _ _ _ -> liftMemType (L.PrimType (L.Integer 1))
+    L.ICmp{} -> liftMemType (L.PrimType (L.Integer 1))
+    L.FCmp{} -> liftMemType (L.PrimType (L.Integer 1))
     L.Phi tp _   -> liftMemType tp
 
     L.GEP inbounds base elts ->
@@ -1059,10 +1057,24 @@ atomicRWOp op x y =
 
 integerCompare ::
   L.ICmpOp ->
+  MemType ->
+  LLVMExpr s arch ->
+  LLVMExpr s arch ->
+  LLVMGenerator h s arch ret (LLVMExpr s arch)
+integerCompare op (VecType n tp) (explodeVector n -> Just xs) (explodeVector n -> Just ys) =
+  VecExpr (IntType 1) <$> sequence (Seq.zipWith (integerCompare op tp) xs ys)
+
+integerCompare op _ x y = do
+  b <- scalarIntegerCompare op x y
+  return (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
+                   (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
+
+scalarIntegerCompare ::
+  L.ICmpOp ->
   LLVMExpr s arch ->
   LLVMExpr s arch ->
   LLVMGenerator h s arch ret (Expr (LLVM arch) s BoolType)
-integerCompare op x y =
+scalarIntegerCompare op x y =
   case (asScalar x, asScalar y) of
     (Scalar (LLVMPointerRepr w) x'', Scalar (LLVMPointerRepr w') y'')
        | Just Refl <- testEquality w w'
@@ -1467,11 +1479,10 @@ generateInstr retType lab instr assign_f k =
              _ -> fail $ unwords ["Floating point comparison on incompatible values", show x, show y]
 
     L.ICmp op x y -> do
+           tp <- liftMemType' (L.typedType x)
            x' <- transTypedValue x
            y' <- transTypedValue (L.Typed (L.typedType x) y)
-           b <- integerCompare op x' y'
-           assign_f (BaseExpr (LLVMPointerRepr (knownNat :: NatRepr 1))
-                              (BitvectorAsPointerExpr knownNat (App (BoolToBV knownNat b))))
+           assign_f =<< integerCompare op tp x' y'
            k
 
     L.Select c x y -> do
@@ -1537,7 +1548,7 @@ generateInstr retType lab instr assign_f k =
 
                   let a0 = memTypeAlign (llvmDataLayout ?lc) resTy
                   oldVal <- callLoad resTy expectTy ptr' a0
-                  cmp <- integerCompare L.Ieq oldVal cmpVal
+                  cmp <- scalarIntegerCompare L.Ieq oldVal cmpVal
                   let flag = BaseExpr (LLVMPointerRepr (knownNat @1))
                                       (BitvectorAsPointerExpr knownNat
                                          (App (BoolToBV knownNat cmp)))
@@ -1736,7 +1747,7 @@ typedValueAsCrucibleValue tv = case L.typedValue tv of
       Just (Right (Some a)) -> return $ Some $ AtomValue a
       Nothing -> reportError $ fromString $
         "Could not find identifier " ++ show i ++ "."
-  v@_ -> reportError $ fromString $
+  v -> reportError $ fromString $
     "Unsupported breakpoint parameter: " ++ show v ++ "."
 
 

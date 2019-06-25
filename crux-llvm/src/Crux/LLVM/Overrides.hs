@@ -1,13 +1,14 @@
-{-# Language ImplicitParams #-}
-{-# Language RankNTypes #-}
-{-# Language TypeFamilies #-}
-{-# Language TypeApplications #-}
-{-# Language TypeOperators #-}
-{-# Language DataKinds #-}
-{-# Language PatternSynonyms #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# Language ConstraintKinds #-}
+{-# Language DataKinds #-}
+{-# Language ImplicitParams #-}
 {-# Language LambdaCase #-}
-module Overrides where
+{-# Language PatternSynonyms #-}
+{-# Language RankNTypes #-}
+{-# Language TypeApplications #-}
+{-# Language TypeFamilies #-}
+{-# Language TypeOperators #-}
+module Crux.LLVM.Overrides where
 
 import Data.String(fromString)
 import qualified Data.Map as Map
@@ -19,14 +20,14 @@ import System.IO (hPutStrLn)
 
 import Data.Parameterized.Classes(showF)
 import Data.Parameterized.Context.Unsafe (Assignment)
-import Data.Parameterized.Context(pattern Empty, pattern (:>))
+import Data.Parameterized.Context(pattern Empty, pattern (:>), singleton)
 
 
 import What4.FunctionName(functionNameFromText)
 import What4.Symbol(userSymbol, emptySymbol)
 import What4.Interface
-          (freshConstant, bvLit, bvEq, asUnsignedBV,notPred
-          , getCurrentProgramLoc, printSymExpr)
+          (freshConstant, bvLit, bvEq, bvAdd, asUnsignedBV,notPred
+          , getCurrentProgramLoc, printSymExpr, arrayUpdate)
 import What4.InterpretedFloatingPoint (freshFloatConstant, iFloatBaseTypeRepr)
 
 import Lang.Crucible.Types
@@ -61,13 +62,12 @@ import Lang.Crucible.LLVM.Translation
 import Lang.Crucible.LLVM.DataLayout
   (noAlignment)
 import Lang.Crucible.LLVM.MemModel
-  (Mem, LLVMPointerType, pattern LLVMPointerRepr,loadString,HasPtrWidth,
-   llvmPointer_bv, projectLLVM_bv, doArrayStore)
+  (Mem, LLVMPointerType, pattern LLVMPointerRepr,loadString,HasPtrWidth, doMalloc, AllocType(HeapAlloc), Mutability(Mutable),
+   llvmPointer_bv, projectLLVM_bv, doArrayStore, doArrayConstStore)
 
-import Lang.Crucible.LLVM.Extension(LLVM)  
+import Lang.Crucible.LLVM.Extension(LLVM)
 import Lang.Crucible.LLVM.Extension(ArchWidth)
 
-import Crux.Error
 import Crux.Types
 import Crux.Model
 
@@ -79,6 +79,9 @@ type TBits n        = LLVMPointerType n
 
 tPtr :: HasPtrWidth w => TypeRepr (LLVMPointerType w)
 tPtr = LLVMPointerRepr ?ptrWidth
+
+tBVPtrWidth :: (HasPtrWidth w) => TypeRepr (TBits w)
+tBVPtrWidth = LLVMPointerRepr ?ptrWidth
 
 setupOverrides ::
   (ArchOk arch, IsSymInterface b) =>
@@ -102,6 +105,14 @@ setupOverrides ctxt =
         (Empty :> tPtr) knownRepr (lib_fresh_i32 mvar)
      regOver ctxt "crucible_uint64_t"
         (Empty :> tPtr) knownRepr (lib_fresh_i64 mvar)
+
+     regOver ctxt "crucible_float"
+        (Empty :> tPtr) knownRepr (lib_fresh_cfloat mvar)
+     regOver ctxt "crucible_double"
+        (Empty :> tPtr) knownRepr (lib_fresh_cdouble mvar)
+
+     regOver ctxt "crucible_string"
+        (Empty :> tPtr :> tBVPtrWidth) tPtr (lib_fresh_str mvar)
 
      regOver ctxt "crucible_assume"
         (Empty :> knownRepr :> tPtr :> knownRepr) knownRepr lib_assume
@@ -188,7 +199,7 @@ regOver ctxt n argT retT x =
               do let over = mkOverride' nm retT x
                  registerFnBinding (FnBinding h (UseOverride over))
            _ ->
-             throwBug $ unlines
+             error $ unlines
                 [ "[bug] Invalid type for implementation of " ++ show n
                 , "*** Expected: " ++ showF (handleArgTypes h) ++
                             " -> " ++ showF (handleReturnType h)
@@ -270,6 +281,61 @@ lib_fresh_i64 ::
   GlobalVar Mem -> Fun sym (LLVM arch) (EmptyCtx ::> TPtr arch) (TBits 64)
 lib_fresh_i64 mem = lib_fresh_bits mem knownNat
 
+lib_fresh_float ::
+  (ArchOk arch, IsSymInterface sym) =>
+  GlobalVar Mem -> FloatInfoRepr fi -> Fun sym (LLVM arch) (EmptyCtx ::> TPtr arch) (FloatType fi)
+lib_fresh_float mvar fi =
+  do RegMap args <- getOverrideArgs
+     pName <- case args of Empty :> pName -> pure pName
+     name <- lookupString mvar pName
+     mkFreshFloat name fi
+
+lib_fresh_cfloat ::
+  (ArchOk arch, IsSymInterface sym) =>
+  GlobalVar Mem -> Fun sym (LLVM arch) (EmptyCtx ::> TPtr arch) (FloatType SingleFloat)
+lib_fresh_cfloat mvar = lib_fresh_float mvar SingleFloatRepr
+
+lib_fresh_cdouble ::
+  (ArchOk arch, IsSymInterface sym) =>
+  GlobalVar Mem -> Fun sym (LLVM arch) (EmptyCtx ::> TPtr arch) (FloatType DoubleFloat)
+lib_fresh_cdouble mvar = lib_fresh_float mvar DoubleFloatRepr
+
+lib_fresh_str ::
+  (ArchOk arch, IsSymInterface sym) =>
+  GlobalVar Mem -> Fun sym (LLVM arch) (EmptyCtx ::> TPtr arch ::> TBits (ArchWidth arch)) (TPtr arch)
+lib_fresh_str mvar = do
+  RegMap args <- getOverrideArgs
+  case args of
+    Empty :> pName :> maxLen -> do
+      name <- lookupString mvar pName
+      sym <- getSymInterface
+
+      -- Compute the allocation length, which is the requested length plus one
+      -- to hold the NUL terminator
+      one <- liftIO $ bvLit sym ?ptrWidth 1
+      maxLenBV <- liftIO $ projectLLVM_bv sym (regValue maxLen)
+      len <- liftIO $ bvAdd sym maxLenBV one
+      mem0 <- readGlobal mvar
+
+      -- Allocate memory to hold the string
+      (ptr, mem1) <- liftIO $ doMalloc sym HeapAlloc Mutable name mem0 len noAlignment
+
+      -- Allocate contents for the string - we want to make each byte symbolic,
+      -- so we allocate a fresh array (which has unbounded length) with symbolic
+      -- contents and write it into our allocation.  This write does not cover
+      -- the NUL terminator.
+      contentsName <- case userSymbol (name ++ "_contents") of
+        Left err -> fail (show err)
+        Right nm -> return nm
+      let arrayRep = BaseArrayRepr (Empty :> BaseBVRepr ?ptrWidth) (BaseBVRepr (knownNat @8))
+      initContents <- liftIO $ freshConstant sym contentsName arrayRep
+      zeroByte <- liftIO $ bvLit sym (knownNat @8) 0
+      -- Put the NUL terminator in place
+      initContentsZ <- liftIO $ arrayUpdate sym initContents (singleton maxLenBV) zeroByte
+      mem2 <- liftIO $ doArrayConstStore sym mem1 ptr noAlignment initContentsZ len
+
+      writeGlobal mvar mem2
+      return ptr
 
 lib_assume ::
   (ArchOk arch, IsSymInterface sym) =>
