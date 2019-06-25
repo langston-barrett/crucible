@@ -19,7 +19,9 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Lang.Crucible.LLVM.Intrinsics.OpenSSL where
+module Lang.Crucible.LLVM.Intrinsics.OpenSSL
+  ( openSSLCleanseOverride
+  ) where
 
 import           Control.Lens ((^.), _1, _2)
 import           Control.Monad.Reader
