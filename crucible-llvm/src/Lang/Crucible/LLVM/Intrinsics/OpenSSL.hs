@@ -61,7 +61,8 @@ openSSLCleanseOverride =
   ( L.Declare
     { L.decRetType = L.PrimType L.Void
     , L.decName    = L.Symbol nm
-    , L.decArgs    = [ L.PtrTo $ L.PrimType L.Void
+    -- Note that C's void* becomes i8* in LLVM
+    , L.decArgs    = [ L.PtrTo $ L.PrimType $ L.Integer 8
                      , llvmSizeT
                      ]
     , L.decVarArgs = False
