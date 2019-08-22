@@ -35,6 +35,7 @@ module What4.Partial.AssertionTree
  , absurdAT
  ) where
 
+import           Control.Lens (folded)
 import           GHC.Generics (Generic, Generic1)
 import           Data.Data (Data)
 
@@ -46,7 +47,6 @@ import           Text.Show.Deriving (deriveShow1, deriveShow2)
 import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NonEmpty
 import           Data.Void (Void, absurd)
-import           Control.Monad (foldM)
 
 import           What4.Interface
 
@@ -198,8 +198,8 @@ collapseAT :: (IsExprBuilder sym)
            -> IO (Pred sym)
 collapseAT sym leafToPred iteToPred = cataMAT
   leafToPred
-  (foldM (andPred sym) (truePred sym))
-  (foldM (orPred sym) (falsePred sym))
+  (andAllOf sym folded)
+  (orOneOf sym folded)
   (\c p1 p2 -> iteToPred c >>= \p -> itePred sym p p1 p2)
 
 -- | If the leaves are absurd, so is the whole structure.

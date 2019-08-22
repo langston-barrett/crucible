@@ -101,11 +101,9 @@ evalLogFn ::
   IO ()
 evalLogFn verb s n msg = do
   let h = s^.stateContext.to printHandle
-  if verb >= n then
-      do hPutStr h msg
-         hFlush h
-  else
-      return ()
+  when (verb >= n) $
+    do hPutStr h msg
+       hFlush h
 
 -- | Evaluate an expression.
 evalExpr :: forall p sym ext ctx tp rtp blocks r.

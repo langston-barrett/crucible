@@ -36,11 +36,10 @@ module Lang.Crucible.LLVM.MemModel.Value
   , testEqual
   ) where
 
-import           Control.Lens (view)
+import           Control.Lens (folded, view)
 import           Control.Monad (foldM, join)
 import           Data.Map (Map)
 import           Data.Coerce (coerce)
-import           Data.Foldable (toList)
 import           Data.Functor.Identity (Identity(..))
 import           Data.Maybe (fromMaybe, mapMaybe)
 import           Data.List (intersperse)
@@ -223,30 +222,6 @@ instance IsExpr (SymExpr sym) => Show (LLVMVal sym) where
            ++ intersperse ", " (map show $ V.toList xs)
            ++ [ "]" ]
 
--- | An efficient n-way @and@: it quits early if it finds any concretely false
--- values, rather than chaining a bunch of 'andPred's.
-allOf :: (IsExprBuilder sym)
-      => sym
-      -> [Pred sym]
-      -> IO (Pred sym)
-allOf sym xs =
-  if and (mapMaybe asConstantPred xs)
-  then foldM (andPred sym) (truePred sym) xs
-  else pure (falsePred sym)
-
-{-
--- | An efficient n-way @or@: it quits early if it finds any concretely false
--- values, rather than chaining a bunch of 'orPred's.
-oneOf :: (IsExprBuilder sym)
-      => sym
-      -> [Pred sym]
-      -> IO (Pred sym)
-oneOf sym xs =
-  if or (mapMaybe asConstantPred xs)
-  then pure (truePred sym)
-  else foldM (orPred sym) (falsePred sym) xs
--}
-
 -- | Commute an applicative with Maybe
 commuteMaybe :: Applicative n => Maybe (n a) -> n (Maybe a)
 commuteMaybe (Just val) = Just <$> val
@@ -301,7 +276,7 @@ isZero sym v =
     areZero' :: Traversable t => t (LLVMVal sym) -> IO (Maybe (Pred sym))
     areZero' vs =
       -- This could probably be simplified with a well-placed =<<...
-      join $ fmap commuteMaybe $ fmap (fmap (allOf sym . toList)) $ areZero vs
+      join $ fmap commuteMaybe $ fmap (fmap (andAllOf sym folded)) $ areZero vs
 
 -- | A predicate denoting the equality of two LLVMVals.
 --
