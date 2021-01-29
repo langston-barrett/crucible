@@ -171,6 +171,21 @@ simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
 
                  return (Crux.RunnableState initSt, explainFailure)
 
+findFun ::
+  (ArchOk arch, Logs) =>
+  String -> ModuleCFGMap arch -> IO (AnyCFG (LLVM arch))
+findFun nm mp =
+  case Map.lookup (fromString nm) mp of
+    Just (_, anyCfg) -> pure anyCfg
+    Nothing -> throwCError (MissingFun nm)
+
+-- | Construct arguments for the function.
+-- In verification mode, the entrypoint must not take any arguments, in
+-- bugfinding mode arguments are constructed in a type-based manner.
+-- regMap ::
+--   (ArchOk arch, Logs) =>
+--   String -> ModuleCFGMap arch -> ()
+-- checkFun nm mp =
 
 checkFun ::
   (ArchOk arch, Logs) =>
@@ -182,7 +197,7 @@ checkFun nm mp =
         Empty ->
           do liftIO $ say "Crux" ("Simulating function " ++ show nm)
              (callCFG anyCfg emptyRegMap) >> return ()
-        _     -> throwCError BadFun
+        _     -> throwCError BadFun  -- TODO(lb): Suggest bugfinding mode
     Nothing -> throwCError (MissingFun nm)
 
 ---------------------------------------------------------------------

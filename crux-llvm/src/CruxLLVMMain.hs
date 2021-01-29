@@ -18,6 +18,7 @@ import Crux.Log (OutputConfig(..), defaultOutputConfig)
 import Crux.Config.Common(CruxOptions(..))
 
 -- local
+import Crux.LLVM.Bugfinding (bugfindingLoop)
 import Crux.LLVM.Config
 import Crux.LLVM.Compile
 import Crux.LLVM.Simulate
@@ -31,9 +32,13 @@ mainWithOutputConfig outCfg =
   Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \initOpts ->
     do (cruxOpts, llvmOpts) <- processLLVMOptions initOpts
        genBitCode cruxOpts llvmOpts
-       res <- Crux.runSimulator cruxOpts (simulateLLVM cruxOpts llvmOpts)
-       makeCounterExamplesLLVM cruxOpts llvmOpts res
-       Crux.postprocessSimResult cruxOpts res
+       if bugfindingMode cruxOpts
+         then
+           do bugfindingLoop cruxOpts llvmOpts
+         else
+           do res <- Crux.runSimulator cruxOpts (simulateLLVM cruxOpts llvmOpts)
+              makeCounterExamplesLLVM cruxOpts llvmOpts res
+              Crux.postprocessSimResult cruxOpts res
 
 processLLVMOptions :: (CruxOptions,LLVMOptions) -> IO (CruxOptions,LLVMOptions)
 processLLVMOptions (cruxOpts,llvmOpts) =

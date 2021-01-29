@@ -37,6 +37,7 @@ library
 
   exposed-modules:
     CruxLLVMMain
+    Crux.LLVM.Bugfinding
     Crux.LLVM.Compile
     Crux.LLVM.Config
     Crux.LLVM.Overrides

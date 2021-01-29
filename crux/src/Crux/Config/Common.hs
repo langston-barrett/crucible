@@ -136,6 +136,10 @@ data CruxOptions = CruxOptions
 
   , printFailures            :: Bool
     -- ^ Print errors regarding failed verification goals
+
+  , bugfindingMode           :: Bool
+    -- ^ Perform under-constrained symbolic execution on this function
+    -- TODO(lb): Reorganize into subcommands? `crux verify` vs `crux find-bugs`?
   }
 
 
@@ -264,6 +268,10 @@ cruxOptions = Config
             "If true, stop attempting to prove goals as soon as one of them is disproved"
 
           onlineProblemFeatures <- pure noFeatures
+
+          bugfindingMode <-
+            section "bugfinding" yesOrNoSpec False
+            "If true, use Crux in bugfinding, rather than verification, mode"
 
           pure CruxOptions { .. }
 
@@ -397,6 +405,10 @@ cruxOptions = Config
       , Option "q" ["quiet"]
         "Quiet mode; produce minimal output"
         $ NoArg $ \opts -> Right opts{ quietMode = True }
+
+      , Option [] ["bugfinding"]
+        "Bugfinding" -- TODO(lb)
+        $ NoArg $ \opts -> Right opts { bugfindingMode = True }
 
       , Option "f" ["floating-point"]
         ("Select floating point representation,"
