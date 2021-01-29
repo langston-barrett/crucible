@@ -59,6 +59,7 @@ library
     lens,
     llvm-pretty,
     llvm-pretty-bc-parser,
+    lumberjack,
     mtl,
     parameterized-utils,
     prettyprinter >= 1.7.0,

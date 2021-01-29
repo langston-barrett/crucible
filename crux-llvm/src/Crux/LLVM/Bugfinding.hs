@@ -1,9 +1,12 @@
 -- TODO(lb) trim
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE PolyKinds #-}
@@ -16,22 +19,29 @@ module Crux.LLVM.Bugfinding (bugfindingLoop) where
 import System.Exit
   ( ExitCode )
 
+import Data.Foldable (for_, toList)
 import Data.Type.Equality ((:~:)(Refl), testEquality)
 import Data.Proxy (Proxy(..))
+import Data.Void (Void)
+import qualified Data.Text as Text
+import qualified Data.Text.IO as TextIO
 import Data.String (fromString)
 import qualified Data.Map.Strict as Map
 import Data.IORef
 import Control.Lens ((&), (%~), (^.), view)
-import Control.Monad.State(liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text (Text)
 
 import System.FilePath( (</>) )
 import System.IO (stdout)
 
 import Data.Parameterized.Some (Some(..))
+import Data.Parameterized.TraversableFC (foldlMFC)
 import qualified Data.Parameterized.Context as Ctx hiding (Assignment)
 
 import Prettyprinter
+import Prettyprinter.Render.Text
+import Lumberjack as LJ
 
 -- what4
 import qualified What4.Interface as What4
@@ -90,6 +100,16 @@ import Crux.LLVM.Config
 import Crux.LLVM.Compile
 import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
+
+-- newtype IOLog a = IOLog { getIOLog :: IO a }
+--   deriving (Applicative, Functor, Monad, MonadIO)
+
+class MonadIO m => HasIOLog m
+
+instance HasIOLog IO
+
+instance HasIOLog m => LJ.HasLog Text m where
+  getLogAction = pure $ LJ.LogAction (liftIO . TextIO.putStrLn . ("[Crux] " <>))
 
 findFun ::
   (ArchOk arch, Logs) =>
@@ -196,14 +216,56 @@ doGen proxy sym depth types =
         <$> (generateArg proxy sym depth typeRepr)
         <*> (doGen proxy sym depth rest)
 
+showRegEntry ::
+  forall proxy arch sym ty.
+  (Crucible.IsSymInterface sym, ArchOk arch, Logs) =>
+  proxy arch ->
+  What4.IsSymExprBuilder sym =>
+  Crucible.RegEntry sym ty ->
+  Text
+showRegEntry proxy regEntry =
+  case CrucibleTypes.asBaseType (Crucible.regType regEntry) of
+    CrucibleTypes.AsBaseType _baseTyRepr ->
+      Text.pack (show (What4.printSymExpr (Crucible.regValue regEntry)))
+    CrucibleTypes.NotBaseType ->
+      case Crucible.regType regEntry of
+        CrucibleTypes.UnitRepr -> "()"
+        -- TODO(lb): More cases!
+        -- LLVMMem.PtrRepr -> Text.pack (show (Crucible.regValue regEntry))
+        -- CrucibleTypes.IntrinsicRepr
+        --   symbolRepr
+        --   (Ctx.Empty Ctx.:> (CrucibleTypes.asBaseType ->
+        --                         CrucibleTypes.AsBaseType
+        --                           bvRepr@(CrucibleTypes.BaseBVRepr _width))) ->
+        --   undefined
+        _ -> "unimplemented"
+
 -- | Construct minimal arguments for a function based on the types.
 generateMinimalArgs ::
   forall arch sym blocks init ret.
   (Crucible.IsSymInterface sym, ArchOk arch, Logs) =>
   sym ->
+  Text ->
   CFG (LLVM arch) blocks init ret ->
   IO (RegMap sym init)
-generateMinimalArgs sym cfg = doGen (Proxy :: Proxy arch) sym 0 (cfgArgTypes cfg)
+generateMinimalArgs sym entrypoint cfg = do
+ writeLogM ("Generating arguments for " <> entrypoint)
+ args <- doGen (Proxy :: Proxy arch) sym 0 (cfgArgTypes cfg)
+ foldlMFC
+   (\n arg ->
+      do writeLogM (Text.unwords [ "Argument"
+                                 , Text.pack (show n)
+                                 , "of"
+                                 , entrypoint <> ":"
+                                 , Text.pack (show (Crucible.regType arg))
+                                 -- TODO(lb): Pretty print?
+                                 -- , showRegEntry arg
+                                 ])
+         return (n + 1))
+   (0 :: Int)
+   (regMap args)
+
+ return args
 
 -- TODO(lb): Deduplicate with simulateLLVM
 simulateLLVM :: CruxOptions -> LLVMOptions -> Crux.SimulatorCallback
@@ -234,8 +296,9 @@ simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
                           runOverrideSim CrucibleTypes.UnitRepr $
                             do -- TODO(lb): Do this lazily
                                registerFunctions llvm_mod trans
-                               AnyCFG cfg <- liftIO $ findFun (entryPoint llvmOpts) (cfgMap trans)
-                               args <- liftIO $ generateMinimalArgs sym cfg
+                               let entry = entryPoint llvmOpts
+                               AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
+                               args <- liftIO $ generateMinimalArgs sym (Text.pack entry) cfg
                                callCFG cfg args >> return ()
 
                  -- arbitrary, we should probabl make this limit configurable
@@ -261,6 +324,29 @@ simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
 
                  return (Crux.RunnableState initSt, explainFailure)
 
+ppProofResult ::
+  ProofResult (Either Crucible.AssumptionReason Crucible.SimError) -> Doc Void
+ppProofResult =
+  \case
+    Proved _what -> emptyDoc
+    NotProved doc model -> doc
+
+ppProvedGoals ::
+  ProvedGoals (Either Crucible.AssumptionReason Crucible.SimError) -> Doc Void
+ppProvedGoals =
+  \case
+    AtLoc loc maybeLoc proved -> ppProvedGoals proved
+    Branch side1 side2 ->
+      nest 2 (vsep ["Branch:", ppProvedGoals side1, ppProvedGoals side2])
+    Goal assumptions (error, str) trivial result ->
+      viaShow error
+      -- ppProofResult result
+
+showProvedGoals ::
+  ProvedGoals (Either Crucible.AssumptionReason Crucible.SimError) -> Text
+showProvedGoals proved =
+  renderStrict (layoutPretty defaultLayoutOptions (ppProvedGoals proved))
+
 -- | The outer loop of bugfinding mode
 --
 -- TODO(lb): Expand into loop!
@@ -271,5 +357,8 @@ bugfindingLoop ::
   IO ExitCode
 bugfindingLoop cruxOpts llvmOpts =
   do res <- Crux.runSimulator cruxOpts (simulateLLVM cruxOpts llvmOpts)
+     for_ (cruxSimResultGoals res) $ \(processed, proved) ->
+       do say "Crux" ("PROCESSED " <> show (totalProcessedGoals processed))
+          say "Crux" (Text.unpack $ showProvedGoals proved)
      makeCounterExamplesLLVM cruxOpts llvmOpts res
      Crux.postprocessSimResult cruxOpts res
