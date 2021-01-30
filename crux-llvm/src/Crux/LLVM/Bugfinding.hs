@@ -17,7 +17,7 @@
 module Crux.LLVM.Bugfinding (bugfindingLoop) where
 
 import System.Exit
-  ( ExitCode )
+  ( ExitCode(..) )
 
 import Data.Foldable (for_, toList)
 import Data.Type.Equality ((:~:)(Refl), testEquality)
@@ -83,7 +83,8 @@ import Lang.Crucible.LLVM.Translation
 import Lang.Crucible.LLVM.Intrinsics
         (llvmIntrinsicTypes, register_llvm_overrides)
 
-import Lang.Crucible.LLVM.Errors( ppBB )
+import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
+import qualified Lang.Crucible.LLVM.Errors.MemoryError as LLVMErrors
 import Lang.Crucible.LLVM.Extension( ArchWidth, LLVM )
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 
@@ -267,9 +268,36 @@ generateMinimalArgs sym entrypoint cfg = do
 
  return args
 
+
+-- | Reasons that execution can fail
+data Explanation
+  = UninitializedGlobal
+  | UnmappedPointer
+
+
+explainError ::
+  forall sym.
+  (Crucible.IsSymInterface sym, Logs) =>
+  sym ->
+  LLVMErrors.BadBehavior sym ->
+  Explanation
+explainError _sym = _
+  -- \case
+  --   LLVMErrors.BBUndefinedBehavior _ -> "Undefined behavior"
+  --   LLVMErrors.BBMemoryError
+  --     (LLVMErrors.MemoryError
+  --       _op
+  --       (LLVMErrors.NoSatisfyingWrite _ty _ptr)) -> "Read from uninitialized memory"
+  --   _ -> "Unknown"
+
+
 -- TODO(lb): Deduplicate with simulateLLVM
-simulateLLVM :: CruxOptions -> LLVMOptions -> Crux.SimulatorCallback
-simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
+simulateLLVM ::
+  IORef [Explanation] ->
+  CruxOptions ->
+  LLVMOptions ->
+  Crux.SimulatorCallback
+simulateLLVM explanationRef cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
   do llvm_mod   <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
      halloc     <- newHandleAllocator
      let ?laxArith = laxArithmetic llvmOpts
@@ -287,6 +315,7 @@ simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
             let ?recordLLVMAnnotation = \an bb -> modifyIORef bbMapRef (Map.insert an bb) in
               do let simctx = (setupSimCtxt halloc sym (memOpts llvmOpts) llvmCtxt)
                                 { printHandle = view outputHandle ?outputConfig }
+                 -- TODO(lb): More lazy here?
                  mem <- populateAllGlobals sym (globalInitMap trans)
                            =<< initializeAllMemory sym llvmCtxt llvm_mod
 
@@ -301,26 +330,14 @@ simulateLLVM cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _maybeOnline ->
                                args <- liftIO $ generateMinimalArgs sym (Text.pack entry) cfg
                                callCFG cfg args >> return ()
 
-                 -- arbitrary, we should probabl make this limit configurable
-                 let detailLimit = 10
-
-                 -- TODO(lb): Needed?
                  let explainFailure evalFn gl =
                        do bb <- readIORef bbMapRef
                           ex <- explainCex sym bb evalFn >>= \f -> f (gl ^. Crucible.labeledPred)
-                          let details = case ex of
-                                NoExplanation -> mempty
-                                DisjOfFailures xs ->
-                                  case map ppBB xs of
-                                    []  -> mempty
-                                    [x] -> indent 2 x
-                                    xs' | length xs' <= detailLimit
-                                        -> "All of the following conditions failed:" <> line <> indent 2 (vcat xs')
-                                        | otherwise
-                                        -> "All of the following conditions failed (and other conditions have been elided to reduce output): "
-                                               <> line <> indent 2 (vcat (take detailLimit xs'))
-
-                          return $ vcat [ ppSimError (gl^.Crucible.labeledPredMsg), details ]
+                          case ex of
+                            NoExplanation -> pure ()
+                            DisjOfFailures bbs ->
+                              writeIORef explanationRef (map (explainError sym) bbs)
+                          return $ mempty
 
                  return (Crux.RunnableState initSt, explainFailure)
 
@@ -348,17 +365,16 @@ showProvedGoals proved =
   renderStrict (layoutPretty defaultLayoutOptions (ppProvedGoals proved))
 
 -- | The outer loop of bugfinding mode
---
--- TODO(lb): Expand into loop!
 bugfindingLoop ::
   (?outputConfig ::  OutputConfig) =>
   CruxOptions ->
   LLVMOptions ->
   IO ExitCode
 bugfindingLoop cruxOpts llvmOpts =
-  do res <- Crux.runSimulator cruxOpts (simulateLLVM cruxOpts llvmOpts)
-     for_ (cruxSimResultGoals res) $ \(processed, proved) ->
-       do say "Crux" ("PROCESSED " <> show (totalProcessedGoals processed))
-          say "Crux" (Text.unpack $ showProvedGoals proved)
-     makeCounterExamplesLLVM cruxOpts llvmOpts res
-     Crux.postprocessSimResult cruxOpts res
+  do explanationRef <- newIORef []
+     Crux.runSimulator cruxOpts (simulateLLVM explanationRef cruxOpts llvmOpts)
+     explanations <- readIORef explanationRef
+     case explanations of
+       [] -> _ -- TODO(lb): Increase depth till max
+       xs -> _ -- TODO(lb): Apply heuristics, report errors or try again
+     return ExitSuccess
