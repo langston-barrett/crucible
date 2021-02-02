@@ -1,14 +1,11 @@
--- TODO(lb) trim
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE PatternSynonyms #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -29,6 +26,7 @@ import Data.String (fromString)
 import qualified Data.Map.Strict as Map
 import Data.IORef
 import Control.Lens ((&), (%~), (^.), view)
+import Control.Monad (void)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text (Text)
 
@@ -36,7 +34,7 @@ import System.FilePath( (</>) )
 import System.IO (stdout)
 
 import Data.Parameterized.Some (Some(..))
-import Data.Parameterized.TraversableFC (foldlMFC)
+import Data.Parameterized.TraversableFC (foldlMFC, foldrFC)
 import qualified Data.Parameterized.Context as Ctx hiding (Assignment)
 
 import Prettyprinter
@@ -102,6 +100,8 @@ import Crux.LLVM.Compile
 import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 
+import qualified Debug.Trace as Trace
+
 -- newtype IOLog a = IOLog { getIOLog :: IO a }
 --   deriving (Applicative, Functor, Monad, MonadIO)
 
@@ -146,8 +146,6 @@ generateArg _proxy sym depth typeRepr =
             -- TODO(lb): Should be made more complex
             return $ Crucible.AnyValue CrucibleTypes.UnitRepr ()
 
-          -- TODO this doesn't match:
-          -- IntrinsicRepr LLVM_pointer [BVRepr 32]
           LLVMMem.PtrRepr -> LLVMMem.mkNullPointer sym ?ptrWidth
           CrucibleTypes.IntrinsicRepr
             symbolRepr
@@ -207,15 +205,19 @@ generateArg _proxy sym depth typeRepr =
 -- TODO(lb): Per-argument depth
 doGen ::
   (Crucible.IsSymInterface sym, ArchOk arch) =>
-  proxy arch -> sym -> Int -> CrucibleTypes.CtxRepr init -> IO (RegMap sym init)
+  proxy arch ->
+  sym ->
+  Int ->
+  CrucibleTypes.CtxRepr init ->
+  IO (RegMap sym init)
 doGen proxy sym depth types =
   case Ctx.viewAssign types of
     Ctx.AssignEmpty -> pure emptyRegMap
     Ctx.AssignExtend rest typeRepr ->
       Crucible.assignReg
         typeRepr
-        <$> (generateArg proxy sym depth typeRepr)
-        <*> (doGen proxy sym depth rest)
+        <$> generateArg proxy sym depth typeRepr
+        <*> doGen proxy sym depth rest
 
 showRegEntry ::
   forall proxy arch sym ty.
@@ -269,26 +271,108 @@ generateMinimalArgs sym entrypoint cfg = do
  return args
 
 
--- | Reasons that execution can fail
+data TruePositive
+  -- TODO which
+  = UninitializedStackVariable
+  | Generic Text
+
+data MissingPrecondition
+  -- TODO which part
+  = UnmappedArgumentPointer
+  -- TODO which
+  | UninitializedGlobal
+
 data Explanation
-  = UninitializedGlobal
-  | UnmappedPointer
+  = ExTruePositive TruePositive
+  | ExMissingPrecondition MissingPrecondition
+
+ppExplanation :: Explanation -> Text
+ppExplanation =
+  \case
+    ExTruePositive truePositive ->
+      case truePositive of
+        UninitializedStackVariable -> "Uninitialized stack variable"
+        Generic text -> text
+    ExMissingPrecondition missingPrecond ->
+      case missingPrecond of
+        UnmappedArgumentPointer -> "Uninitialized global"
+        UninitializedGlobal -> "Unmapped pointer"
 
 
-explainError ::
-  forall sym.
+{-
+pointerIsReachableFrom ::
+  forall sym ty w.
   (Crucible.IsSymInterface sym, Logs) =>
   sym ->
+  LLVMMem.LLVMPtr sym w ->
+  Crucible.RegEntry sym ty ->
+  Bool
+pointerIsReachableFrom sym ptr (Crucible.RegEntry typeRepr regValue) =
+  let unimplemented = error ("Unimplemented: " ++ show typeRepr) -- TODO(lb)
+  in
+    case CrucibleTypes.asBaseType typeRepr of
+      CrucibleTypes.AsBaseType baseTypeRepr -> False
+      CrucibleTypes.NotBaseType ->
+        case typeRepr of
+          CrucibleTypes.UnitRepr -> False
+          CrucibleTypes.AnyRepr ->
+            case regValue of
+              Crucible.AnyValue innerTypeRepr innerRegValue ->
+                pointerIsReachableFrom sym ptr (Crucible.RegEntry innerTypeRepr innerRegValue)
+          LLVMMem.PtrRepr -> unimplemented
+          CrucibleTypes.IntrinsicRepr
+            symbolRepr
+            (Ctx.Empty Ctx.:> (CrucibleTypes.asBaseType ->
+                                 CrucibleTypes.AsBaseType
+                                   bvRepr@(CrucibleTypes.BaseBVRepr _width))) ->
+              case testEquality symbolRepr (CrucibleTypes.knownSymbol :: CrucibleTypes.SymbolRepr "LLVM_pointer") of
+                Nothing -> unimplemented
+                Just Refl -> unimplemented
+-}
+
+
+-- TODO(lb): fold*FC?
+pointerIsReachableFromAny ::
+  forall sym types w.
+  (Crucible.IsSymInterface sym, Logs) =>
+  sym ->
+  LLVMMem.LLVMPtr sym w ->
+  Crucible.RegMap sym types ->
+  Bool
+pointerIsReachableFromAny sym ptr (Crucible.RegMap regMap) =
+  case Ctx.viewAssign regMap of
+    Ctx.AssignEmpty -> False
+    Ctx.AssignExtend rest regEntry ->
+        {- pointerIsReachableFrom -} undefined sym ptr regEntry ||
+        pointerIsReachableFromAny sym ptr (Crucible.RegMap regMap)
+
+
+-- | Take an error that occurred during symbolic execution, classify it as a
+-- true or false positive. If it is a false positive, deduce further
+-- preconditions.
+explainError ::
+  forall sym init.
+  (Crucible.IsSymInterface sym, Logs) =>
+  sym ->
+  RegMap sym init ->
   LLVMErrors.BadBehavior sym ->
-  Explanation
-explainError _sym = _
-  -- \case
-  --   LLVMErrors.BBUndefinedBehavior _ -> "Undefined behavior"
-  --   LLVMErrors.BBMemoryError
-  --     (LLVMErrors.MemoryError
-  --       _op
-  --       (LLVMErrors.NoSatisfyingWrite _ty _ptr)) -> "Read from uninitialized memory"
-  --   _ -> "Unknown"
+  IO Explanation
+explainError sym args badBehavior =
+  writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
+  case badBehavior of
+    LLVMErrors.BBUndefinedBehavior _ -> undefined
+    LLVMErrors.BBMemoryError
+      (LLVMErrors.MemoryError
+        _op
+        (LLVMErrors.NoSatisfyingWrite _ty ptr)) ->
+          -- Was this pointer reachable from an argument to the function? If so,
+          -- it's a missing precondtion. If not, we count it as an error.
+          -- TODO(lb): More sophisticated reasoning needed.
+          -- TODO(lb): anyFC
+          if pointerIsReachableFromAny sym ptr args
+          then pure (ExMissingPrecondition UnmappedArgumentPointer)
+          else pure (ExTruePositive (Generic "No write"))
+    _ -> error "Unimplemented: explainError"
 
 
 -- TODO(lb): Deduplicate with simulateLLVM
@@ -319,16 +403,17 @@ simulateLLVM explanationRef cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _m
                  mem <- populateAllGlobals sym (globalInitMap trans)
                            =<< initializeAllMemory sym llvmCtxt llvm_mod
 
-                 let globSt = llvmGlobals llvmCtxt mem
 
-                 let initSt = InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $
+                 let entry = entryPoint llvmOpts
+                 AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
+                 args <- liftIO $ generateMinimalArgs sym (Text.pack entry) cfg
+                 let globSt = llvmGlobals llvmCtxt mem
+                 let initSt =
+                       InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $
                           runOverrideSim CrucibleTypes.UnitRepr $
                             do -- TODO(lb): Do this lazily
                                registerFunctions llvm_mod trans
-                               let entry = entryPoint llvmOpts
-                               AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
-                               args <- liftIO $ generateMinimalArgs sym (Text.pack entry) cfg
-                               callCFG cfg args >> return ()
+                               void $ callCFG cfg args
 
                  let explainFailure evalFn gl =
                        do bb <- readIORef bbMapRef
@@ -336,8 +421,9 @@ simulateLLVM explanationRef cruxOpts llvmOpts = Crux.SimulatorCallback $ \sym _m
                           case ex of
                             NoExplanation -> pure ()
                             DisjOfFailures bbs ->
-                              writeIORef explanationRef (map (explainError sym) bbs)
-                          return $ mempty
+                              writeIORef explanationRef
+                                =<< mapM (explainError sym args) bbs
+                          return mempty
 
                  return (Crux.RunnableState initSt, explainFailure)
 
@@ -375,6 +461,12 @@ bugfindingLoop cruxOpts llvmOpts =
      Crux.runSimulator cruxOpts (simulateLLVM explanationRef cruxOpts llvmOpts)
      explanations <- readIORef explanationRef
      case explanations of
-       [] -> _ -- TODO(lb): Increase depth till max
-       xs -> _ -- TODO(lb): Apply heuristics, report errors or try again
+       [] ->
+         do say "Crux" "No errors"
+           -- TODO(lb): Increase depth till max
+       es ->
+         do say "Crux" "Errors!"
+            for_ es $ \explanation ->
+              say "Crux" (show (ppExplanation explanation))
+            -- TODO(lb): Apply heuristics, report errors or try again
      return ExitSuccess
