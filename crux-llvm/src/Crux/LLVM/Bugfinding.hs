@@ -28,13 +28,16 @@ import Data.Text (Text)
 
 import System.FilePath( (</>) )
 
+import qualified Text.LLVM.AST as L
+
 import Data.Parameterized.Some (Some(..))
+import qualified Data.Parameterized.Context as Ctx
 
 import Lumberjack as LJ
 
 -- crucible
-import Lang.Crucible.CFG.Core (AnyCFG(..), cfgArgTypes)
-import Lang.Crucible.FunctionHandle (newHandleAllocator)
+import Lang.Crucible.CFG.Core (CFG, AnyCFG(..), cfgArgTypes)
+import Lang.Crucible.FunctionHandle (HandleAllocator, newHandleAllocator)
 import Lang.Crucible.Simulator
   ( runOverrideSim, callCFG
   , ExecState( InitialState )
@@ -58,6 +61,7 @@ import Lang.Crucible.LLVM.Translation
         )
 
 import Lang.Crucible.LLVM.Extension( LLVM )
+import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
 -- crux
 import qualified Crux
@@ -70,7 +74,7 @@ import Crux.LLVM.Config
 import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 import Crux.LLVM.Bugfinding.Classify (classify, Explanation, ppExplanation)
-import Crux.LLVM.Bugfinding.Constraints (Constraint(..))
+import Crux.LLVM.Bugfinding.Constraints (emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Setup (setupExecution)
 
 class MonadIO m => HasIOLog m
@@ -89,59 +93,50 @@ findFun nm mp =
     Nothing -> throwCError (MissingFun nm)
 
 simulateLLVM ::
+  (ArchOk arch) =>
+  HandleAllocator ->
+  L.Module ->
+  LLVMTrans.ModuleTranslation arch ->
   IORef [Explanation] ->
-  [Constraint] ->
-  CruxOptions ->
+  Constraints init ->
+  CFG (LLVM arch) blocks init ret ->
   LLVMOptions ->
   Crux.SimulatorCallback
-simulateLLVM explanationRef preconds cruxOpts llvmOpts =
+simulateLLVM halloc llvmMod trans explanationRef preconds cfg llvmOpts =
   Crux.SimulatorCallback $ \sym _maybeOnline ->
-    do llvmMod <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
-       halloc <- newHandleAllocator
-       let ?laxArith = laxArithmetic llvmOpts
-       let ?optLoopMerge = loopMerge llvmOpts
-       Some trans <- translateModule halloc llvmMod
+    do liftIO $ say "Crux" $ unwords ["Using pointer width:", show ?ptrWidth]
        let llvmCtxt = trans ^. transContext
+       bbMapRef <- newIORef (Map.empty :: LLVMAnnMap sym)
+       let ?lc = llvmCtxt^.llvmTypeCtx
+       let ?recordLLVMAnnotation = \an bb -> modifyIORef bbMapRef (Map.insert an bb)
+       let simctx = (setupSimCtxt halloc sym (memOpts llvmOpts) llvmCtxt)
+                      { printHandle = view outputHandle ?outputConfig }
 
-       llvmPtrWidth llvmCtxt $ \ptrW ->
-         withPtrWidth ptrW $
-           do liftIO $ say "Crux" $ unwords ["Using pointer width:", show ptrW]
-              bbMapRef <- newIORef (Map.empty :: LLVMAnnMap sym)
-              let ?lc = llvmCtxt^.llvmTypeCtx
-              -- shrug... some weird interaction between do notation and implicit parameters here...
-              -- not sure why I have to let/in this expression...
-              let ?recordLLVMAnnotation = \an bb -> modifyIORef bbMapRef (Map.insert an bb) in
-                do let simctx = (setupSimCtxt halloc sym (memOpts llvmOpts) llvmCtxt)
-                                  { printHandle = view outputHandle ?outputConfig }
+       setupResult <-
+         liftIO $ setupExecution sym llvmMod trans preconds (cfgArgTypes cfg)
+       (args, mem) <-
+         case setupResult of
+           Left err -> error "BLAH ERROR!"
+           Right tup -> pure tup
+       let globSt = llvmGlobals llvmCtxt mem
+       let initSt =
+             InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $
+               runOverrideSim CrucibleTypes.UnitRepr $
+                 do -- TODO(lb): Do this lazily
+                    registerFunctions llvmMod trans
+                    void $ callCFG cfg args
 
+       let explainFailure evalFn gl =
+             do bb <- readIORef bbMapRef
+                ex <- explainCex sym bb evalFn >>= \f -> f (gl ^. Crucible.labeledPred)
+                case ex of
+                  NoExplanation -> pure ()
+                  DisjOfFailures bbs ->
+                    writeIORef explanationRef
+                      =<< mapM (classify sym args) bbs
+                return mempty
 
-                   let entry = entryPoint llvmOpts
-                   AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
-                   setupResult <-
-                     liftIO $ setupExecution sym llvmMod trans preconds (cfgArgTypes cfg)
-                   (args, mem) <-
-                     case setupResult of
-                       Left err -> error "BLAH ERROR!"
-                       Right tup -> pure tup
-                   let globSt = llvmGlobals llvmCtxt mem
-                   let initSt =
-                         InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $
-                            runOverrideSim CrucibleTypes.UnitRepr $
-                              do -- TODO(lb): Do this lazily
-                                 registerFunctions llvmMod trans
-                                 void $ callCFG cfg args
-
-                   let explainFailure evalFn gl =
-                         do bb <- readIORef bbMapRef
-                            ex <- explainCex sym bb evalFn >>= \f -> f (gl ^. Crucible.labeledPred)
-                            case ex of
-                              NoExplanation -> pure ()
-                              DisjOfFailures bbs ->
-                                writeIORef explanationRef
-                                  =<< mapM (classify sym args) bbs
-                            return mempty
-
-                   return (Crux.RunnableState initSt, explainFailure)
+       return (Crux.RunnableState initSt, explainFailure)
 
 -- | The outer loop of bugfinding mode
 bugfindingLoop ::
@@ -150,20 +145,33 @@ bugfindingLoop ::
   LLVMOptions ->
   IO ExitCode
 bugfindingLoop cruxOpts llvmOpts =
-  do explanationRef <- newIORef []
-     let runSim preconds =
-           Crux.runSimulator
-             cruxOpts
-             (simulateLLVM explanationRef preconds cruxOpts llvmOpts)
-     runSim []
-     explanations <- readIORef explanationRef
-     case explanations of
-       [] ->
-         do say "Crux" "No errors"
-           -- TODO(lb): Increase depth till max
-       es ->
-         do say "Crux" "Errors!"
-            for_ es $ \explanation ->
-              say "Crux" (show (ppExplanation explanation))
-            -- TODO(lb): Apply heuristics, report errors or try again
-     return ExitSuccess
+  do
+     -- First translate the LLVM module into Crucible
+     llvmMod <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
+     halloc <- newHandleAllocator
+     Some trans <-
+       let ?laxArith = laxArithmetic llvmOpts
+           ?optLoopMerge = loopMerge llvmOpts
+       in translateModule halloc llvmMod
+     llvmPtrWidth (trans ^. transContext) $
+       \ptrW -> withPtrWidth ptrW $
+         do AnyCFG cfg <- liftIO $ findFun (entryPoint llvmOpts) (cfgMap trans)
+            explanationRef <- newIORef []
+            let runSim preconds =
+                  Crux.runSimulator
+                    cruxOpts
+                    (simulateLLVM halloc llvmMod trans explanationRef preconds cfg llvmOpts)
+            -- Execute the function with no preconditions
+            runSim (emptyConstraints (Ctx.size (cfgArgTypes cfg)))
+            -- Loop, learning preconditions and reporting errors
+            explanations <- readIORef explanationRef
+            case explanations of
+              [] ->
+                do say "Crux" "No errors"
+                  -- TODO(lb): Increase depth till max
+              es ->
+                do say "Crux" "Errors!"
+                   for_ es $ \explanation ->
+                     say "Crux" (show (ppExplanation explanation))
+                   -- TODO(lb): Apply heuristics, report errors or try again
+            return ExitSuccess
