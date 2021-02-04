@@ -67,6 +67,10 @@ module Lang.Crucible.LLVM.MemModel.Pointer
 
     -- * Pretty printing
   , ppPtr
+
+    -- * Annotation
+  , annotatePointerBlock
+  , annotatePointerOffset
   ) where
 
 import           Control.Monad (guard)
@@ -317,3 +321,21 @@ isGlobalPointer' symbolMap needle =
   case testLeq (knownNat :: NatRepr 1) (ptrWidth needle) of
     Nothing       -> Nothing
     Just LeqProof -> isGlobalPointer symbolMap needle
+
+annotatePointerBlock ::
+  forall sym w. (IsSymInterface sym) =>
+  sym ->
+  LLVMPtr sym w ->
+  IO (SymAnnotation sym BaseNatType, LLVMPointer sym w)
+annotatePointerBlock sym (LLVMPointer blk off) =
+  do (annotation, annotatedBlk) <- annotateTerm sym blk
+     pure (annotation, LLVMPointer annotatedBlk off)
+
+annotatePointerOffset ::
+  forall sym w. (IsSymInterface sym) =>
+  sym ->
+  LLVMPtr sym w ->
+  IO (SymAnnotation sym (BaseBVType w), LLVMPointer sym w)
+annotatePointerOffset sym (LLVMPointer blk off) =
+  do (annotation, annotatedOff) <- annotateTerm sym off
+     pure (annotation, LLVMPointer blk annotatedOff)
