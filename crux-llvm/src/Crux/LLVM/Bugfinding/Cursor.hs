@@ -11,8 +11,12 @@ global variable). It's used for describing function preconditions, such as
 \"@x->y@ must not be null\", or \"x[4] must be nonzero\".
 -}
 
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE KindSignatures #-}
+
 module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
+  , Selector(..)
   , TypeSeekError(..)
   , seekType
   ) where
@@ -21,11 +25,22 @@ import           Data.Word (Word64)
 
 import qualified Text.LLVM.AST as L
 
+import           Data.Parameterized.Ctx (Ctx)
+import qualified Data.Parameterized.Context as Ctx
+import           Data.Parameterized.Some (Some)
+
+import           Lang.Crucible.Types (CrucibleType)
+
 data Cursor
   = Here
   | Dereference Cursor
   | Index !Word64 Cursor
   | Field !Word64 Cursor
+
+-- TODO(lb): Not sure why I have to specify the kind here?
+data Selector (argTypes :: Ctx CrucibleType)
+  = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
+  | SelectGlobal !L.Symbol Cursor
 
 data TypeSeekError
   = ArrayIndexOutOfBounds !Word64 !Word64 L.Type

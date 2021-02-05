@@ -3,20 +3,17 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImplicitParams #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE ViewPatterns #-}
 
 module Crux.LLVM.Bugfinding (bugfindingLoop) where
 
 import System.Exit
   ( ExitCode(..) )
 
-import Data.Foldable (for_)
 import qualified Data.Text.IO as TextIO
 import Data.String (fromString)
 import qualified Data.Map.Strict as Map
@@ -49,10 +46,7 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 
 -- crucible-llvm
 import Lang.Crucible.LLVM( llvmGlobals )
-import Lang.Crucible.LLVM.MemModel
-        ( withPtrWidth, LLVMAnnMap
-        , explainCex, CexExplanation(..)
-        )
+import Lang.Crucible.LLVM.MemModel ( withPtrWidth, LLVMAnnMap )
 import Lang.Crucible.LLVM.Translation
         ( translateModule
         , transContext, cfgMap
@@ -60,6 +54,7 @@ import Lang.Crucible.LLVM.Translation
         , llvmPtrWidth, llvmTypeCtx
         )
 
+import Lang.Crucible.LLVM.MemModel.Partial (BoolAnn(BoolAnn))
 import Lang.Crucible.LLVM.Extension( LLVM )
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
@@ -75,7 +70,8 @@ import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 import Crux.LLVM.Bugfinding.Classify (classify, Explanation, ppExplanation)
 import Crux.LLVM.Bugfinding.Constraints (emptyConstraints, Constraints(..))
-import Crux.LLVM.Bugfinding.Setup (setupExecution)
+import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution)
+import qualified What4.Interface as What4
 
 class MonadIO m => HasIOLog m
 
@@ -97,7 +93,7 @@ simulateLLVM ::
   HandleAllocator ->
   L.Module ->
   LLVMTrans.ModuleTranslation arch ->
-  IORef [Explanation] ->
+  IORef (Maybe (Explanation init)) ->
   Constraints init ->
   CFG (LLVM arch) blocks init ret ->
   LLVMOptions ->
@@ -114,9 +110,9 @@ simulateLLVM halloc llvmMod trans explanationRef preconds cfg llvmOpts =
 
        setupResult <-
          liftIO $ setupExecution sym llvmMod trans preconds (cfgArgTypes cfg)
-       (args, mem) <-
+       (mem, argAnnotations, args) <-
          case setupResult of
-           Left err -> error "BLAH ERROR!"
+           Left _err -> error "BLAH ERROR!"
            Right tup -> pure tup
        let globSt = llvmGlobals llvmCtxt mem
        let initSt =
@@ -124,21 +120,24 @@ simulateLLVM halloc llvmMod trans explanationRef preconds cfg llvmOpts =
                runOverrideSim CrucibleTypes.UnitRepr $
                  do -- TODO(lb): Do this lazily
                     registerFunctions llvmMod trans
+                    liftIO $ writeLogM ("Running function on arguments..." :: Text)
+                    liftIO $ logRegMap trans args
                     void $ callCFG cfg args
 
-       let explainFailure evalFn gl =
+       let explainFailure _ gl =
              do bb <- readIORef bbMapRef
-                ex <- explainCex sym bb evalFn >>= \f -> f (gl ^. Crucible.labeledPred)
-                case ex of
-                  NoExplanation -> pure ()
-                  DisjOfFailures bbs ->
-                    writeIORef explanationRef
-                      =<< mapM (classify sym args) bbs
+                case flip Map.lookup bb . BoolAnn =<<
+                       What4.getAnnotation sym (gl ^. Crucible.labeledPred) of
+                  Nothing -> pure ()
+                  Just badBehavior ->
+                    writeIORef explanationRef . Just =<<
+                      classify sym args argAnnotations badBehavior
                 return mempty
 
        return (Crux.RunnableState initSt, explainFailure)
 
 -- | The outer loop of bugfinding mode
+
 bugfindingLoop ::
   (?outputConfig ::  OutputConfig) =>
   CruxOptions ->
@@ -156,7 +155,7 @@ bugfindingLoop cruxOpts llvmOpts =
      llvmPtrWidth (trans ^. transContext) $
        \ptrW -> withPtrWidth ptrW $
          do AnyCFG cfg <- liftIO $ findFun (entryPoint llvmOpts) (cfgMap trans)
-            explanationRef <- newIORef []
+            explanationRef <- newIORef Nothing
             let runSim preconds =
                   Crux.runSimulator
                     cruxOpts
@@ -166,12 +165,10 @@ bugfindingLoop cruxOpts llvmOpts =
             -- Loop, learning preconditions and reporting errors
             explanations <- readIORef explanationRef
             case explanations of
-              [] ->
+              Nothing ->
                 do say "Crux" "No errors"
                   -- TODO(lb): Increase depth till max
-              es ->
-                do say "Crux" "Errors!"
-                   for_ es $ \explanation ->
-                     say "Crux" (show (ppExplanation explanation))
+              Just explanation ->
+                do say "Crux" (show (ppExplanation explanation))
                    -- TODO(lb): Apply heuristics, report errors or try again
             return ExitSuccess

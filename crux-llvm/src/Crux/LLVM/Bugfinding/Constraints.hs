@@ -10,26 +10,30 @@ Stability    : provisional
 {-# LANGUAGE PolyKinds #-}
 
 module Crux.LLVM.Bugfinding.Constraints
-  ( Selector(..)
+  ( Constraint(..)
+  , RelationalConstraint(..)
+  , Selector(..)
   , ValueConstraint(..)
   , Constraints(..)
   , emptyConstraints
+  , oneArgumentConstraint
   ) where
 
+import           Control.Lens (set)
 import           Data.Functor.Const
 import           Data.Map (Map)
 import qualified Data.Map as Map
+
+import           Data.Parameterized.Classes (IxedF(ixF))
 
 import qualified Text.LLVM.AST as L
 
 import qualified Data.Parameterized.Context as Ctx
 
-import qualified Lang.Crucible.Types as CrucibleTypes
-
 import           Crux.LLVM.Bugfinding.Cursor
 
 -- | A constraint on a single value
-data ConstraintBody
+data Constraint
   = NotNull
   -- ^ This pointer is not null
   | SizeAtLeast !Int
@@ -37,35 +41,43 @@ data ConstraintBody
 
 data ValueConstraint
   = ValueConstraint
-      { constraintBody :: ConstraintBody
+      { constraintBody :: Constraint
       , constraintCursor :: Cursor
       }
 
-data Selector
-  = SelectArgument !Int Cursor
-  | SelectGlobal !L.Symbol Cursor
-
 -- | A (possibly) \"relational\" constraint across several values.
-data RelationalConstraint
-  = SizeOfAllocation Selector Selector
+data RelationalConstraint argTypes
+  = SizeOfAllocation (Selector argTypes) (Selector argTypes)
   -- ^ The first argument (a bitvector) is equal to the size of the allocation
   -- pointed to by the second
 
-data Constraints types
+data Constraints argTypes
   = Constraints
-      { argConstraints :: Ctx.Assignment (Const [ValueConstraint]) types
+      { argConstraints :: Ctx.Assignment (Const [ValueConstraint]) argTypes
       , globalConstraints :: Map L.Symbol ValueConstraint
-      , relationalConstraints :: [RelationalConstraint]
+      , relationalConstraints :: [RelationalConstraint argTypes]
       }
 
-emptyConstraints :: Ctx.Size types -> Constraints types
+emptyConstraints :: Ctx.Size argTypes -> Constraints argTypes
 emptyConstraints sz =
   Constraints
-    { argConstraints = Ctx.generate sz (\index -> Const [])
+    { argConstraints = Ctx.generate sz (\_index -> Const [])
     , globalConstraints = Map.empty
     , relationalConstraints = []
     }
 
+oneArgumentConstraint ::
+  Ctx.Size argTypes ->
+  Ctx.Index argTypes tp ->
+  [ValueConstraint] ->
+  Constraints argTypes
+oneArgumentConstraint sz idx constraints =
+  let empty = emptyConstraints sz
+  in empty
+       { argConstraints =
+           set (ixF idx) (Const constraints) (argConstraints empty)
+       }
+
 -- | Union
 instance Semigroup (Constraints types) where
-  cs1 <> cs2 = error "Unimplemented"
+  cs1 <> cs2 = error "Unimplemented"  -- TODO(lb)

@@ -10,12 +10,14 @@ Stability    : provisional
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE StandaloneDeriving #-}
 
 module Crux.LLVM.Bugfinding.Setup.Monad
   ( Setup
   , SetupState
+  , TypedSelector(..)
   , freshSymbol
   , addAnnotation
   , runSetup
@@ -39,44 +41,47 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 
-import           Crux.LLVM.Bugfinding.Cursor
+import           Crux.LLVM.Bugfinding.Cursor (Selector)
 
-data TypedCursor tp = TypedCursor Cursor (CrucibleTypes.BaseTypeRepr tp)
+data TypedSelector argTypes tp =
+  TypedSelector (Selector argTypes) (CrucibleTypes.BaseTypeRepr tp)
 
-data SetupState sym =
+data SetupState sym argTypes =
   SetupState
     { _setupMem :: LLVMMem.MemImpl sym
-    , _setupAnnotations :: MapF (What4.SymAnnotation sym) TypedCursor
+    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
+      -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
+      -- ^ Counter for generating unique/fresh symbols
     }
 
-setupMem :: Simple Lens (SetupState sym) (LLVMMem.MemImpl sym)
+setupMem :: Simple Lens (SetupState sym argTypes) (LLVMMem.MemImpl sym)
 setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 
-setupAnnotations :: Simple Lens (SetupState sym) (MapF (What4.SymAnnotation sym) TypedCursor)
+setupAnnotations :: Simple Lens (SetupState sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector argTypes))
 setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 
-symbolCounter :: Simple Lens (SetupState sym) Int
+symbolCounter :: Simple Lens (SetupState sym argTypes) Int
 symbolCounter = lens _symbolCounter (\s v -> s { _symbolCounter = v })
 
-newtype Setup sym a = Setup (StateT (SetupState sym) IO a)
+newtype Setup sym argTypes a = Setup (StateT (SetupState sym argTypes) IO a)
   deriving (Applicative, Functor, Monad, MonadIO)
 
-deriving instance MonadState (SetupState sym) (Setup sym)
+deriving instance MonadState (SetupState sym argTypes) (Setup sym argTypes)
 
-instance LJ.HasLog Text (Setup sym) where
+instance LJ.HasLog Text (Setup sym argTypes) where
   getLogAction = pure $ LJ.LogAction (liftIO . TextIO.putStrLn . ("[Crux] " <>))
 
 runSetup ::
   MonadIO m =>
   LLVMMem.MemImpl sym ->
-  Setup sym a ->
-  m (LLVMMem.MemImpl sym, MapF (What4.SymAnnotation sym) TypedCursor, a)
+  Setup sym argTypes a ->
+  m (LLVMMem.MemImpl sym, MapF (What4.SymAnnotation sym) (TypedSelector argTypes), a)
 runSetup mem (Setup computation) = do
   (result, state) <- liftIO $ runStateT computation (SetupState mem MapF.empty 0)
   pure (state ^. setupMem, state ^. setupAnnotations, result)
 
-freshSymbol :: Setup sym What4.SolverSymbol
+freshSymbol :: Setup sym argTypes What4.SolverSymbol
 freshSymbol =
   do counter <- symbolCounter <+= 1
      pure $ What4.safeSymbol ("fresh" ++ show counter)
@@ -84,8 +89,8 @@ freshSymbol =
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
   What4.SymAnnotation sym tp ->
-  Cursor ->
+  Selector argTypes ->
   CrucibleTypes.BaseTypeRepr tp ->
-  Setup sym ()
-addAnnotation ann cursor typeRepr =
-  setupAnnotations %= MapF.insert ann (TypedCursor cursor typeRepr)
+  Setup sym argTypes ()
+addAnnotation ann selector typeRepr =
+  setupAnnotations %= MapF.insert ann (TypedSelector selector typeRepr)
