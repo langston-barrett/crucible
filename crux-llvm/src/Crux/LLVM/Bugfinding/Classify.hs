@@ -72,7 +72,7 @@ classify ::
 classify sym args badBehavior =
   -- writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   case badBehavior of
-    LLVMErrors.BBUndefinedBehavior _ -> undefined
+    LLVMErrors.BBUndefinedBehavior _ -> error "Unimplemented"
     LLVMErrors.BBMemoryError
       (LLVMErrors.MemoryError
         _op

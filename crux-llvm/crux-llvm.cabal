@@ -42,6 +42,7 @@ library
     Crux.LLVM.Bugfinding.Constraints
     Crux.LLVM.Bugfinding.Cursor
     Crux.LLVM.Bugfinding.Setup
+    Crux.LLVM.Bugfinding.Setup.Monad
     Crux.LLVM.Compile
     Crux.LLVM.Config
     Crux.LLVM.Overrides
