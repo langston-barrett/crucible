@@ -34,7 +34,7 @@ import           Crux.LLVM.Bugfinding.Cursor
 
 -- | A constraint on a single value
 data Constraint
-  = NotNull
+  = Initialized
   -- ^ This pointer is not null
   | SizeAtLeast !Int
   -- ^ The allocation backing this pointer has at least this size

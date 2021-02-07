@@ -12,16 +12,21 @@ global variable). It's used for describing function preconditions, such as
 -}
 
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE KindSignatures #-}
 
 module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
+  , ppCursor
   , Selector(..)
   , TypeSeekError(..)
   , seekType
   ) where
 
+import           Prettyprinter (Doc)
+import qualified Prettyprinter as PP
 import           Data.Word (Word64)
+import           Data.Void (Void)
 
 import qualified Text.LLVM.AST as L
 
@@ -36,6 +41,14 @@ data Cursor
   | Dereference Cursor
   | Index !Word64 Cursor
   | Field !Word64 Cursor
+
+ppCursor :: Cursor -> Doc Void
+ppCursor =
+  \case
+    Here -> PP.pretty "<top>"
+    Dereference what -> PP.pretty "*" <> ppCursor what
+    Index idx cursor -> ppCursor cursor <> PP.pretty ("[" ++ show idx ++ "]")
+    Field idx cursor -> ppCursor cursor <> PP.pretty ("." ++ show idx)
 
 -- TODO(lb): Not sure why I have to specify the kind here?
 data Selector (argTypes :: Ctx CrucibleType)

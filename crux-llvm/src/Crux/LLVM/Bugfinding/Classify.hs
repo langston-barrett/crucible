@@ -22,7 +22,12 @@ module Crux.LLVM.Bugfinding.Classify
   , classify
   ) where
 
+import           Control.Monad.IO.Class (liftIO, MonadIO)
 import           Data.Text (Text)
+import qualified Data.Text as Text
+
+import           Lumberjack (writeLogM, HasLog)
+
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
@@ -39,10 +44,8 @@ import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
 import qualified Lang.Crucible.LLVM.Errors.MemoryError as LLVMErrors
 
 import           Crux.LLVM.Bugfinding.Constraints
+import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
-import Control.Monad.IO.Class (liftIO, MonadIO)
-import Lumberjack (writeLogM, HasLog)
-import qualified Data.Text as Text
 
 data TruePositive
   -- TODO which
@@ -91,16 +94,20 @@ classify sym (Crucible.RegMap args) annotations badBehavior =
           let annotation =
                 What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)
           in case flip MapF.lookup annotations =<< annotation of
-               -- This pointer was one we generated as part of an argument to
-               -- the function. So it's probably a missing precondition that
-               -- this pointer actually pointed to something.
                Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
-                 return $
-                  ExMissingPreconditions $
-                    oneArgumentConstraint
-                      (Ctx.size args)
-                      idx
-                      [ValueConstraint NotNull cursor]
+                 do writeLogM $
+                      Text.unwords
+                        [ "Conclusion: Read from an unmapped pointer in argument"
+                        , "#" <> Text.pack (show (Ctx.indexVal idx))
+                        , "at"
+                        , Text.pack (show (ppCursor cursor))
+                        ]
+                    return $
+                      ExMissingPreconditions $
+                        oneArgumentConstraint
+                          (Ctx.size args)
+                          idx
+                          [ValueConstraint Initialized cursor]
                Just (TypedSelector (SelectGlobal _symbol _cursor) _typeRepr) ->
                  error "Unimplemented: Global"
                -- TODO(lb): Something about globals, probably?
