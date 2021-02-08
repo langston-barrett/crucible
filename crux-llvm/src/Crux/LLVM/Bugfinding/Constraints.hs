@@ -30,12 +30,18 @@ import qualified Text.LLVM.AST as L
 
 import qualified Data.Parameterized.Context as Ctx
 
+import           Lang.Crucible.LLVM.DataLayout (Alignment)
+
 import           Crux.LLVM.Bugfinding.Cursor
 
 -- | A constraint on a single value
 data Constraint
-  = Initialized
+  = Allocated
   -- ^ This pointer is not null
+  | Initialized
+  -- ^ This pointer points to initialized memory
+  | Aligned Alignment
+  -- ^ This pointer has at least this alignment
   | SizeAtLeast !Int
   -- ^ The allocation backing this pointer has at least this size
 

@@ -8,31 +8,41 @@ Stability    : provisional
 -}
 
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Crux.LLVM.Bugfinding.Setup.Monad
   ( Setup
+  , SetupError
+  , ppSetupError
   , SetupState
+  , SetupAssumption(..)
+  , SetupResult(..)
   , setupMem
   , TypedSelector(..)
   , freshSymbol
+  , assume
   , addAnnotation
   , runSetup
+  , seekType
+  , malloc
   ) where
 
-import           Control.Lens ((.=), (%=), (<+=), Simple, Lens, lens, (^.), view)
+import           Control.Lens (to, (.=), (%=), (<+=), Simple, Lens, lens, (^.), view)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Text (Text)
 import qualified Data.Text.IO as TextIO
-import           Control.Monad.State.Strict (MonadState, StateT, runStateT, gets)
-import           Control.Monad.Reader (ReaderT, runReaderT)
-
-import           Text.LLVM.AST (DataLayout)
+import           Control.Monad.Except (throwError, ExceptT, MonadError, runExceptT)
+import           Control.Monad.Reader (MonadReader, ask)
+import           Control.Monad.State.Strict (MonadState, gets)
+import           Control.Monad.Writer (MonadWriter, tell)
+import           Control.Monad.RWS (RWST, runRWST)
 
 import qualified Lumberjack as LJ
 
@@ -45,17 +55,38 @@ import qualified What4.Interface as What4
 import qualified Lang.Crucible.Types as CrucibleTypes
 
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
+import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
-import           Crux.LLVM.Bugfinding.Cursor (Selector)
+import           Crux.LLVM.Bugfinding.Cursor (TypeSeekError, Selector, Cursor, seekMemType)
 import           Crux.LLVM.Bugfinding.Context
+import           Crux.LLVM.Bugfinding.Constraints (Constraint)
 import qualified Lang.Crucible.Backend as Crucible
 import Lang.Crucible.LLVM.Extension (ArchWidth)
-import Lang.Crucible.LLVM.DataLayout (noAlignment)
+import Lang.Crucible.LLVM.DataLayout (maxAlignment)
+import Data.BitVector.Sized (mkBV)
+import Lang.Crucible.LLVM.MemType (SymType, MemType, memTypeSize)
+import Lang.Crucible.LLVM.Bytes (bytesToInteger)
+import Lang.Crucible.LLVM.TypeContext (TypeContext(llvmDataLayout))
+import qualified Prettyprinter as PP
+import           Prettyprinter (Doc)
+import Data.Void (Void)
 
 data TypedSelector argTypes tp =
   TypedSelector (Selector argTypes) (CrucibleTypes.BaseTypeRepr tp)
+
+data SetupError
+  = SetupTypeSeekError (TypeSeekError SymType)
+
+ppSetupError :: SetupError -> Doc Void
+ppSetupError _ = PP.pretty ("unimplemented" :: Text)
+
+data SetupAssumption sym
+  = SetupAssumption
+      { assumptionReason :: Constraint
+      , assumptionPred :: What4.Pred sym
+      }
 
 data SetupState sym argTypes =
   SetupState
@@ -75,32 +106,62 @@ setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 symbolCounter :: Simple Lens (SetupState sym argTypes) Int
 symbolCounter = lens _symbolCounter (\s v -> s { _symbolCounter = v })
 
-newtype Setup arch sym argTypes a = Setup (ReaderT (Context arch argTypes) (StateT (SetupState sym argTypes) IO) a)
+newtype Setup arch sym argTypes a =
+  Setup
+    (ExceptT
+      SetupError
+      (RWST (Context arch argTypes)
+            [SetupAssumption sym]
+            (SetupState sym argTypes)
+            IO)
+      a)
   deriving (Applicative, Functor, Monad, MonadIO)
 
+deriving instance MonadError SetupError (Setup arch sym argTypes)
 deriving instance MonadState (SetupState sym argTypes) (Setup arch sym argTypes)
+deriving instance MonadReader (Context arch argTypes) (Setup arch sym argTypes)
+deriving instance MonadWriter [SetupAssumption sym] (Setup arch sym argTypes)
 
 instance LJ.HasLog Text (Setup arch sym argTypes) where
   getLogAction = pure $ LJ.LogAction (liftIO . TextIO.putStrLn . ("[Crux] " <>))
+
+data SetupResult sym argTypes =
+  SetupResult
+    { resultMem :: LLVMMem.MemImpl sym
+    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
+    , resultAssumptions :: [SetupAssumption sym]
+    }
 
 runSetup ::
   MonadIO m =>
   Context arch argTypes ->
   LLVMMem.MemImpl sym ->
   Setup arch sym argTypes a ->
-  m (LLVMMem.MemImpl sym, MapF (What4.SymAnnotation sym) (TypedSelector argTypes), a)
+  m (Either SetupError (SetupResult sym argTypes, a))
 runSetup context mem (Setup computation) = do
-  (result, state) <-
+  result <-
     liftIO $
-      runStateT
-        (runReaderT computation context)
-        (SetupState mem MapF.empty 0)
-  pure (state ^. setupMem, state ^. setupAnnotations, result)
+      runRWST (runExceptT computation) context (SetupState mem MapF.empty 0)
+  pure $
+    case result of
+      (Left err, _, _) -> Left err
+      (Right result', state, assumptions) ->
+        Right ( SetupResult (state ^. setupMem)
+                            (state ^. setupAnnotations)
+                            assumptions
+              , result'
+              )
 
 freshSymbol :: Setup arch sym argTypes What4.SolverSymbol
 freshSymbol =
   do counter <- symbolCounter <+= 1
      pure $ What4.safeSymbol ("fresh" ++ show counter)
+
+assume ::
+  Constraint ->
+  What4.Pred sym ->
+  Setup arch sym argTypes ()
+assume constraint pred = tell [SetupAssumption constraint pred]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
@@ -111,28 +172,49 @@ addAnnotation ::
 addAnnotation ann selector typeRepr =
   setupAnnotations %= MapF.insert ann (TypedSelector selector typeRepr)
 
--- malloc ::
---   ( Crucible.IsSymInterface sym
---   , ArchOk arch
---   ) =>
---   sym ->
-  -- Setup arch sym argTypes (LLVMMem.LLVMPtr _ (ArchWidth arch))
--- malloc sym = error "Unimplemented: malloc"
-  -- do mem <- gets (view setupMem)
-  --    sizeBv <- error "Unimplemented: malloc"
-  --      -- liftIO $ What4.bvLit sym ?ptrWidth (mkBV ?ptrWidth (memTypeSize _ _))
-  --    (ptr, mem') <-
-  --      liftIO $
-  --        LLVMMem.doMalloc
-  --          sym
-  --          LLVMMem.HeapAlloc  -- TODO(lb): Change based on arg/global
-  --          LLVMMem.Mutable  -- TODO(lb): Change based on arg/global
-  --          "crux-llvm bugfinding auto-setup"
-  --          mem
-  --          sizeBv
-  --          noAlignment -- TODO is this OK?
-  --    setupMem .= mem'
-  --    pure ptr
+seekType ::
+  Cursor ->
+  MemType ->
+  Setup arch sym argTypes MemType
+seekType cursor memType =
+  do context <- ask
+     let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
+     either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
+
+
+malloc ::
+  ( Crucible.IsSymInterface sym
+  , ArchOk arch
+  ) =>
+  sym ->
+  MemType ->
+  Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
+malloc sym memType =
+  do context <- ask
+     mem <- gets (view setupMem)
+     let dl =
+           context ^.
+             moduleTranslation .
+             LLVMTrans.transContext .
+             LLVMTrans.llvmTypeCtx .
+             to llvmDataLayout
+     (ptr, mem') <-
+       liftIO $
+         do sizeBv <-
+              What4.bvLit
+                sym
+                ?ptrWidth
+                (mkBV ?ptrWidth (bytesToInteger (memTypeSize dl memType)))
+            LLVMMem.doMalloc
+              sym
+              LLVMMem.HeapAlloc  -- TODO(lb): Change based on arg/global
+              LLVMMem.Mutable  -- TODO(lb): Change based on arg/global
+              "crux-llvm bugfinding auto-setup"
+              mem
+              sizeBv
+              (maxAlignment dl) -- TODO is this OK?
+     setupMem .= mem'
+     pure ptr
 
 {-
 debugInfoArgNames :: LLVM.Module -> LLVM.Define -> Map Int Text

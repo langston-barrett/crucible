@@ -16,6 +16,7 @@ import System.Exit
 
 import qualified Data.Text.IO as TextIO
 import Data.String (fromString)
+import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import Data.IORef
 import Control.Lens ((^.), view)
@@ -69,10 +70,12 @@ import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 import Crux.LLVM.Bugfinding.Classify (classify, Explanation(..), ppExplanation)
 import Crux.LLVM.Bugfinding.Constraints (emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Context
-import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution)
+import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
 
 import qualified What4.Interface as What4
 import qualified Data.Text as Text
+import qualified What4.ProgramLoc as What4
+import qualified What4.FunctionName as What4
 
 class MonadIO m => HasIOLog m
 
@@ -111,10 +114,26 @@ simulateLLVM halloc context explanationRef preconds cfg llvmOpts =
 
        setupResult <-
          liftIO $ setupExecution sym context preconds
-       (mem, argAnnotations, args) <-
+       (mem, argAnnotations, assumptions, args) <-
          case setupResult of
            Left _err -> error "BLAH ERROR!"
-           Right tup -> pure tup
+           Right (SetupResult mem anns assumptions, args) ->
+             pure (mem, anns, assumptions, args)
+
+       -- Assume all predicates necessary to satisfy the deduced preconditions
+       for_ assumptions
+            (\(SetupAssumption _constraint pred) ->
+              liftIO $
+                Crucible.addAssumption
+                  sym
+                  (Crucible.LabeledPred
+                     pred
+                     (Crucible.AssumptionReason
+                        (What4.mkProgramLoc
+                           (What4.functionNameFromText (context ^. functionName))
+                           What4.InternalPos)
+                        "constraint")))
+
        let globSt = llvmGlobals llvmCtxt mem
        let initSt =
              InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $

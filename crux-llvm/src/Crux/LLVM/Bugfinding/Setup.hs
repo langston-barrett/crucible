@@ -17,6 +17,8 @@ Stability    : provisional
 module Crux.LLVM.Bugfinding.Setup
   ( setupExecution
   , logRegMap
+  , SetupAssumption(SetupAssumption)
+  , SetupResult(SetupResult)
   ) where
 
 import           Control.Lens (to, view, (^.))
@@ -55,8 +57,6 @@ import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
 import Lang.Crucible.LLVM.MemType (MemType)
 import Data.Maybe (fromMaybe)
-
-data ExecutionSetupError = ExecutionSetupError
 
 ppRegValue ::
   ( Crucible.IsSymInterface sym
@@ -127,7 +127,7 @@ annotatedTerm sym typeRepr selector =
      pure expr
 
 generateMinimalValue ::
-  forall proxy sym arch tp argTypes.
+  forall sym arch tp argTypes.
   (Crucible.IsSymInterface sym, ArchOk arch) =>
   Context arch argTypes ->
   sym ->
@@ -153,8 +153,6 @@ generateMinimalValue _proxy sym typeRepr selector =
           CrucibleTypes.VectorRepr _containedTypeRepr -> unimplemented
           CrucibleTypes.StructRepr _containedTypes -> unimplemented
           _ -> unimplemented -- TODO(lb)
-
--- TODO(lb): Replace with "generate"
 
 generateMinimalArgs ::
   forall arch sym argTypes.
@@ -185,17 +183,6 @@ generateMinimalArgs context sym = do
   return args
 
 
--- -- | Allocate a memory region.
--- doMalloc
--- :: (IsSymInterface sym, HasPtrWidth wptr)
--- => sym
--- -> G.AllocType {- ^ stack, heap, or global -}
--- -> G.Mutability {- ^ whether region is read-only -}
--- -> String {- ^ source location for use in error messages -}
--- -> MemImpl sym
--- -> SymBV sym wptr {- ^ allocation size -}
--- -> Alignment
--- -> IO (LLVMPtr sym wptr, MemImpl sym)
 constrainHere ::
   forall proxy arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
@@ -204,13 +191,22 @@ constrainHere ::
   proxy arch ->
   sym ->
   Constraint ->
+  MemType ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainHere proxy sym constraint (Crucible.RegEntry typeRepr regValue) =
+constrainHere _proxy sym constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
   case constraint of
-    Initialized ->
+    Allocated ->
       case typeRepr of
-        LLVMMem.PtrRepr -> error "Unimplemented: constrainHere"
+        LLVMMem.PtrRepr ->
+          Crucible.RegEntry typeRepr <$> malloc sym memType
+        _ -> error "Bad cursor"
+    Aligned alignment ->
+      case typeRepr of
+        LLVMMem.PtrRepr ->
+          do assume constraint =<<
+               liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
+             pure regEntry
         _ -> error "Bad cursor"
 
 constrainValue ::
@@ -222,49 +218,55 @@ constrainValue ::
   sym ->
   Constraint ->
   Cursor ->
+  MemType {-^ The \"leaf\" 'MemType', passed directly to 'constrainHere' -} ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainValue proxy sym constraint cursor regEntry =
+constrainValue proxy sym constraint cursor memType regEntry =
   case cursor of
-    Here -> constrainHere proxy sym constraint regEntry
+    Here -> constrainHere proxy sym constraint memType regEntry
 
 constrainOneArgument ::
-  forall proxy arch sym argTypes tp.
+  forall arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
-  proxy arch ->
+  Context arch argTypes ->
   sym ->
   [ValueConstraint] ->
+  Some (Ctx.Index argTypes) ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainOneArgument proxy sym constraints regEntry =
+constrainOneArgument context sym constraints (Some idx) regEntry =
   -- TODO fold
   case constraints of
     [] -> pure regEntry
     (ValueConstraint constraint cursor:rest) ->
-      constrainOneArgument proxy sym rest
-        =<< constrainValue proxy sym constraint cursor regEntry
+      do memType <-
+           seekType cursor (context ^. argumentMemTypes . ixF' idx . to getConst)
+         constrainOneArgument context sym rest (Some idx)
+           =<< constrainValue (Proxy :: Proxy arch) sym constraint cursor memType regEntry
 
 constrain ::
-  forall proxy arch sym argTypes.
+  forall arch sym argTypes.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
-  proxy arch ->
+  Context arch argTypes ->
   sym ->
   Constraints argTypes ->
   Crucible.RegMap sym argTypes ->
   Setup arch sym argTypes (Crucible.RegMap sym argTypes)
-constrain proxy sym preconds (Crucible.RegMap args) =
+constrain context sym preconds (Crucible.RegMap args) =
   do writeLogM ("Establishing preconditions..." :: Text)
      writeLogM ("Modifying arguments..." :: Text)
      args' <-
        Ctx.traverseWithIndex
-         (\idx -> constrainOneArgument
-                    proxy
-                    sym
-                    (getConst (argConstraints preconds Ctx.! idx)))
+         (\idx ->
+            constrainOneArgument
+              context
+              sym
+              (getConst (argConstraints preconds Ctx.! idx))
+              (Some idx))
          args
      return (Crucible.RegMap args')
 
@@ -278,7 +280,7 @@ setupExecution ::
   sym ->
   Context arch argTypes ->
   Constraints argTypes ->
-  m (Either ExecutionSetupError (LLVMMem.MemImpl sym, MapF (What4.SymAnnotation sym) (TypedSelector argTypes), Crucible.RegMap sym argTypes))
+  m (Either SetupError (SetupResult sym argTypes, Crucible.RegMap sym argTypes))
 setupExecution sym context preconds = do
   -- TODO(lb): More lazy here?
   let moduleTrans = context ^. moduleTranslation
@@ -289,6 +291,5 @@ setupExecution sym context preconds = do
     in liftIO $
          LLVMGlobals.populateAllGlobals sym (LLVMTrans.globalInitMap moduleTrans)
            =<< LLVMGlobals.initializeAllMemory sym llvmCtxt (context ^. llvmModule)
-  Right <$>
-    runSetup context mem (constrain moduleTrans sym preconds =<<
-                            generateMinimalArgs context sym)
+  runSetup context mem (constrain context sym preconds =<<
+                          generateMinimalArgs context sym)
