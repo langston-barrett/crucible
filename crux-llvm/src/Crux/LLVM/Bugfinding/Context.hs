@@ -21,13 +21,11 @@ module Crux.LLVM.Bugfinding.Context
   , functionName
   , argumentNames
   , argumentTypes
-  , argumentMemTypes
-  , argumentStorageTypes
   , llvmModule
   , moduleTranslation
   ) where
 
-import           Control.Lens ((^.), Simple, Lens, lens)
+import           Control.Lens (Simple, Lens, lens)
 import           Data.Functor.Const (Const(Const, getConst))
 import qualified Data.List as List
 import qualified Data.Map as Map
@@ -40,14 +38,10 @@ import           Text.LLVM (Module)
 import qualified Text.LLVM.AST as L
 
 import qualified Data.Parameterized.Context as Ctx
-import           Data.Parameterized.TraversableFC (forFC, fmapFC, TraversableFC(traverseFC))
+import           Data.Parameterized.TraversableFC (fmapFC)
 
 import qualified Lang.Crucible.Types as CrucibleTypes
-import           Lang.Crucible.LLVM.MemModel (toStorableType, StorageType)
-import           Lang.Crucible.LLVM.MemType (fdArgTypes, MemType)
 import           Lang.Crucible.LLVM.Translation (ModuleTranslation)
-import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
-import           Lang.Crucible.LLVM.Run (withPtrWidthOf)
 
 -- TODO(lb): Split into module-level and function-level?
 data Context arch argTypes =
@@ -55,8 +49,6 @@ data Context arch argTypes =
     { _functionName :: Text
     , _argumentNames :: Ctx.Assignment (Const (Maybe Text)) argTypes
     , _argumentTypes :: CrucibleTypes.CtxRepr argTypes
-    , _argumentMemTypes :: Ctx.Assignment (Const MemType) argTypes
-    , _argumentStorageTypes :: Ctx.Assignment (Const StorageType) argTypes
     , _llvmModule :: Module
     , _moduleTranslation :: ModuleTranslation arch
     }
@@ -70,12 +62,6 @@ argumentNames = lens _argumentNames (\s v -> s { _argumentNames = v })
 argumentTypes :: Simple Lens (Context arch argTypes) (CrucibleTypes.CtxRepr argTypes)
 argumentTypes = lens _argumentTypes (\s v -> s { _argumentTypes = v })
 
-argumentMemTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (Const MemType) argTypes)
-argumentMemTypes = lens _argumentMemTypes (\s v -> s { _argumentMemTypes = v })
-
-argumentStorageTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (Const StorageType) argTypes)
-argumentStorageTypes = lens _argumentStorageTypes (\s v -> s { _argumentStorageTypes = v })
-
 llvmModule :: Simple Lens (Context arch argTypes) Module
 llvmModule = lens _llvmModule (\s v -> s { _llvmModule = v })
 
@@ -85,12 +71,6 @@ moduleTranslation = lens _moduleTranslation (\s v -> s { _moduleTranslation = v 
 data ContextError
   = MissingEntrypoint Text
   -- ^ Couldn't find 'L.Define' of entrypoint
-  | BadLift Text
-  -- ^ Couldn't lift types in declaration to 'MemType'
-  | BadLiftArgs
-  -- ^ Wrong number of arguments after lifting declaration
-  | BadMemType MemType
-  -- ^ Couldn't lift a 'MemType' to a 'StorageType'
 
 -- | This function does some precomputation of ubiquitously used values, and
 -- some handling of what should generally be very rare errors.
@@ -107,25 +87,6 @@ makeContext entry argTypes llvmMod trans =
                        (L.modDefines llvmMod) of
          Nothing -> Left (MissingEntrypoint entry)
          Just d -> Right d
-     funDecl <-
-       let ?lc = trans ^. LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
-       in case LLVMTrans.liftDeclare (LLVMTrans.declareFromDefine def) of
-             Left err -> Left (BadLift (Text.pack err))
-             Right d -> Right d
-     argMemTypes <-
-       case maybeMapToContext
-              (Ctx.size argTypes)
-              (Map.fromList (zip [0..] (fdArgTypes funDecl))) of
-         Just types -> Right types
-         Nothing -> Left BadLiftArgs
-     argStorageTypes <-
-       withPtrWidthOf trans $
-         forFC
-           argMemTypes
-           (\(Const memType) ->
-              case toStorableType memType of
-                Just storeTy -> Right (Const storeTy)
-                Nothing -> Left (BadMemType memType))
      pure $
        Context
          { _functionName = entry
@@ -136,8 +97,6 @@ makeContext entry argTypes llvmMod trans =
                (mapToContext
                  (Ctx.size argTypes)
                  (fmap (First . Just) (debugInfoArgNames llvmMod def)))
-         , _argumentMemTypes = argMemTypes
-         , _argumentStorageTypes = argStorageTypes
          , _llvmModule = llvmMod
          , _moduleTranslation = trans
          }
@@ -151,16 +110,6 @@ mapToContext size mp =
   Ctx.generate
     size
     (\index -> Const (Map.findWithDefault mempty (Ctx.indexVal index) mp))
-
-maybeMapToContext ::
-  Ctx.Size items ->
-  Map Int a ->
-  Maybe (Ctx.Assignment (Const a) items)
-maybeMapToContext size mp =
-  traverseFC (fmap Const . getConst) $
-    Ctx.generate
-      size
-      (\index -> Const (Map.lookup (Ctx.indexVal index) mp))
 
 -- Stolen shamelessly from saw-script
 -- TODO: Does it work though?
