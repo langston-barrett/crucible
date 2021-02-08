@@ -42,13 +42,19 @@ data Cursor
   | Index !Word64 Cursor
   | Field !Word64 Cursor
 
-ppCursor :: Cursor -> Doc Void
-ppCursor =
+-- TODO: Use more type information?
+ppCursor ::
+  String {-^ Top level, e.g. the name of a variable -} ->
+  Cursor ->
+  Doc Void
+ppCursor top =
   \case
-    Here -> PP.pretty "<top>"
-    Dereference what -> PP.pretty "*" <> ppCursor what
-    Index idx cursor -> ppCursor cursor <> PP.pretty ("[" ++ show idx ++ "]")
-    Field idx cursor -> ppCursor cursor <> PP.pretty ("." ++ show idx)
+    Here -> PP.pretty top
+    Dereference (Field idx cursor) ->
+      ppCursor top cursor <> PP.pretty "->" <> PP.pretty (show idx)
+    Dereference what -> PP.pretty "*" <> ppCursor top what
+    Index idx cursor -> ppCursor top cursor <> PP.pretty ("[" ++ show idx ++ "]")
+    Field idx cursor -> ppCursor top cursor <> PP.pretty ("." ++ show idx)
 
 -- TODO(lb): Not sure why I have to specify the kind here?
 data Selector (argTypes :: Ctx CrucibleType)

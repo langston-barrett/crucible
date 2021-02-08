@@ -22,6 +22,7 @@ module Crux.LLVM.Bugfinding.Classify
   , classify
   ) where
 
+import           Control.Lens (to, (^.))
 import           Control.Monad.IO.Class (liftIO, MonadIO)
 import           Data.Text (Text)
 import qualified Data.Text as Text
@@ -44,8 +45,11 @@ import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
 import qualified Lang.Crucible.LLVM.Errors.MemoryError as LLVMErrors
 
 import           Crux.LLVM.Bugfinding.Constraints
+import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
+import Data.Parameterized.Classes (IxedF'(ixF'))
+import Data.Functor.Const (Const(getConst))
 
 data TruePositive
   -- TODO which
@@ -72,18 +76,19 @@ ppExplanation =
 -- true or false positive. If it is a false positive, deduce further
 -- preconditions.
 classify ::
-  forall m sym argTypes.
+  forall m sym arch argTypes.
   ( Crucible.IsSymInterface sym
   , MonadIO m
   , HasLog Text m
   ) =>
+  Context arch argTypes ->
   sym ->
   Crucible.RegMap sym argTypes {-^ Function arguments -} ->
   MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
   m (Explanation argTypes)
-classify sym (Crucible.RegMap args) annotations badBehavior =
+classify context sym (Crucible.RegMap args) annotations badBehavior =
   writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   case badBehavior of
     LLVMErrors.BBUndefinedBehavior _ -> error "Unimplemented"
@@ -100,7 +105,11 @@ classify sym (Crucible.RegMap args) annotations badBehavior =
                         [ "Conclusion: Read from an unmapped pointer in argument"
                         , "#" <> Text.pack (show (Ctx.indexVal idx))
                         , "at"
-                        , Text.pack (show (ppCursor cursor))
+                        , Text.pack
+                            (show
+                               (ppCursor
+                                  (context ^. argumentNames . ixF' idx . to getConst . to (maybe "<top>" Text.unpack))
+                                  cursor))
                         ]
                     return $
                       ExMissingPreconditions $

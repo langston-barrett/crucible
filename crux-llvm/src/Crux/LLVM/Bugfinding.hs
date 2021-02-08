@@ -132,7 +132,7 @@ simulateLLVM halloc context explanationRef preconds cfg llvmOpts =
                   Nothing -> pure ()
                   Just badBehavior ->
                     writeIORef explanationRef . Just =<<
-                      classify sym args argAnnotations badBehavior
+                      classify context sym args argAnnotations badBehavior
                 return mempty
 
        return (Crux.RunnableState initSt, explainFailure)
