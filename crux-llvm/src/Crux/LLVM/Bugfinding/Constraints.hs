@@ -54,7 +54,7 @@ data RelationalConstraint argTypes
 data Constraints argTypes
   = Constraints
       { argConstraints :: Ctx.Assignment (Const [ValueConstraint]) argTypes
-      , globalConstraints :: Map L.Symbol ValueConstraint
+      , globalConstraints :: Map L.Symbol [ValueConstraint]
       , relationalConstraints :: [RelationalConstraint argTypes]
       }
 
@@ -78,6 +78,16 @@ oneArgumentConstraint sz idx constraints =
            set (ixF idx) (Const constraints) (argConstraints empty)
        }
 
+
 -- | Union
 instance Semigroup (Constraints types) where
-  cs1 <> cs2 = error "Unimplemented"  -- TODO(lb)
+  cs1 <> cs2 =
+    Constraints
+      { argConstraints =
+          Ctx.zipWith
+            (\e1 e2 -> Const (getConst e1 <> getConst e2))
+            (argConstraints cs1)
+            (argConstraints cs2)
+      , globalConstraints = globalConstraints cs1 <> globalConstraints cs2
+      , relationalConstraints = relationalConstraints cs1 <> relationalConstraints cs2
+      }
