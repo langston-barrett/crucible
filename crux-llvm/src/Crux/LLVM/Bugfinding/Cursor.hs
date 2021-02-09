@@ -48,6 +48,7 @@ data Cursor
   | Dereference Cursor
   | Index !Word64 Cursor
   | Field !Word64 Cursor
+  deriving Eq
 
 -- TODO: Use more type information?
 ppCursor ::
@@ -67,6 +68,7 @@ ppCursor top =
 data Selector (argTypes :: Ctx CrucibleType)
   = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
   | SelectGlobal !L.Symbol Cursor
+  deriving Eq
 
 data TypeSeekError ty
   = ArrayIndexOutOfBounds !Word64 !Word64 ty

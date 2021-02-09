@@ -240,9 +240,10 @@ constrainOneArgument context sym constraints (Some idx) regEntry =
   -- TODO fold
   case constraints of
     [] -> pure regEntry
-    (ValueConstraint constraint cursor:rest) ->
+    (vc@(ValueConstraint constraint cursor):rest) ->
       do memType <-
            seekType cursor (context ^. argumentMemTypes . ixF' idx . to getConst)
+         writeLogM ("Satisfying constraint: " <> Text.pack (show (ppValueConstraint vc)))
          constrainOneArgument context sym rest (Some idx)
            =<< constrainValue (Proxy :: Proxy arch) sym constraint cursor memType regEntry
 

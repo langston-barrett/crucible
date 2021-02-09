@@ -7,7 +7,9 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE RankNTypes #-}
 
 module Crux.LLVM.Bugfinding.Constraints
   ( Constraint(..)
@@ -16,21 +18,31 @@ module Crux.LLVM.Bugfinding.Constraints
   , ValueConstraint(..)
   , Constraints(..)
   , emptyConstraints
+  , isEmpty
   , oneArgumentConstraint
+
+  -- * Pretty-printing
+  , ppValueConstraint
+  , ppConstraints
   ) where
 
 import           Control.Lens (set)
 import           Data.Functor.Const
 import           Data.Map (Map)
 import qualified Data.Map as Map
+import           Data.Void (Void)
+
+import           Prettyprinter (Doc)
+import qualified Prettyprinter as PP
 
 import           Data.Parameterized.Classes (IxedF(ixF))
 
 import qualified Text.LLVM.AST as L
 
 import qualified Data.Parameterized.Context as Ctx
+import           Data.Parameterized.TraversableFC (allFC, toListFC)
 
-import           Lang.Crucible.LLVM.DataLayout (Alignment)
+import           Lang.Crucible.LLVM.DataLayout (fromAlignment, Alignment)
 
 import           Crux.LLVM.Bugfinding.Cursor
 
@@ -44,18 +56,21 @@ data Constraint
   -- ^ This pointer has at least this alignment
   | SizeAtLeast !Int
   -- ^ The allocation backing this pointer has at least this size
+  deriving Eq
 
 data ValueConstraint
   = ValueConstraint
       { constraintBody :: Constraint
       , constraintCursor :: Cursor
       }
+  deriving Eq
 
 -- | A (possibly) \"relational\" constraint across several values.
 data RelationalConstraint argTypes
   = SizeOfAllocation (Selector argTypes) (Selector argTypes)
   -- ^ The first argument (a bitvector) is equal to the size of the allocation
   -- pointed to by the second
+  deriving Eq
 
 data Constraints argTypes
   = Constraints
@@ -71,6 +86,48 @@ emptyConstraints sz =
     , globalConstraints = Map.empty
     , relationalConstraints = []
     }
+
+isEmpty :: Constraints argTypes -> Bool
+isEmpty (Constraints argCs globCs relCs) =
+  and [ allFC ((== []) . getConst) argCs
+      , globCs == Map.empty
+      , relCs == []
+      ]
+
+ppConstraint :: Constraint -> Doc Void
+ppConstraint =
+  \case
+    Allocated -> PP.pretty "is allocated"
+    Initialized -> PP.pretty "is initialized"
+    Aligned alignment -> PP.pretty "is aligned to " <> PP.viaShow (fromAlignment alignment)
+    SizeAtLeast size -> PP.pretty "has size at least " <> PP.viaShow size
+
+ppValueConstraint' :: String -> ValueConstraint -> Doc Void
+ppValueConstraint' top (ValueConstraint body cursor) =
+  ppCursor top cursor <> PP.pretty ": " <> ppConstraint body
+
+ppValueConstraint :: ValueConstraint -> Doc Void
+ppValueConstraint = ppValueConstraint' "<top>"
+
+ppConstraints :: Constraints argTypes -> Doc Void
+ppConstraints (Constraints argCs globCs relCs) =
+  let ppArgC idx (Const constraints) =
+        PP.nest
+          2
+          (PP.vsep ( PP.pretty "Argument #" <> PP.viaShow (Ctx.indexVal idx)
+                   -- TODO: Use argument names
+                   : map ppValueConstraint constraints
+                   ))
+      -- ppGlobC symb constraint = PP.pretty "Constraint on global " <> _
+  in PP.vsep $ toListWithIndex ppArgC argCs
+  where
+    toListWithIndex :: (forall tp. Ctx.Index ctx tp -> f tp -> a)
+                    -> Ctx.Assignment f ctx
+                    -> [a]
+    toListWithIndex f assign =
+      toListFC getConst $
+        Ctx.generate (Ctx.size assign) (\idx -> Const (f idx (assign Ctx.! idx)))
+
 
 oneArgumentConstraint ::
   Ctx.Size argTypes ->

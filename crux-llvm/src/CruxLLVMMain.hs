@@ -18,7 +18,7 @@ import Crux.Log (OutputConfig(..), defaultOutputConfig)
 import Crux.Config.Common(CruxOptions(..))
 
 -- local
-import Crux.LLVM.Bugfinding (bugfindingLoop)
+import Crux.LLVM.Bugfinding (bugfindingMain)
 import Crux.LLVM.Config
 import Crux.LLVM.Compile
 import Crux.LLVM.Simulate
@@ -34,7 +34,7 @@ mainWithOutputConfig outCfg =
        genBitCode cruxOpts llvmOpts
        if bugfindingMode cruxOpts
          then
-           do bugfindingLoop cruxOpts llvmOpts
+           do bugfindingMain cruxOpts llvmOpts
          else
            do res <- Crux.runSimulator cruxOpts (simulateLLVM cruxOpts llvmOpts)
               makeCounterExamplesLLVM cruxOpts llvmOpts res

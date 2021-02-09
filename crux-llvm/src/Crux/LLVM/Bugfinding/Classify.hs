@@ -19,6 +19,7 @@ Stability    : provisional
 module Crux.LLVM.Bugfinding.Classify
   ( Explanation(..)
   , TruePositive(..)
+  , ppTruePositive
   , ppExplanation
   , classify
   ) where
@@ -64,15 +65,17 @@ data Explanation types
   = ExTruePositive TruePositive
   | ExMissingPreconditions (Constraints types)
 
+ppTruePositive :: TruePositive -> Text
+ppTruePositive =
+  \case
+    UninitializedStackVariable -> "Uninitialized stack variable"
+    Generic text -> text
+
 ppExplanation :: Explanation types -> Text
 ppExplanation =
   \case
-    ExTruePositive truePositive ->
-      case truePositive of
-        UninitializedStackVariable -> "Uninitialized stack variable"
-        Generic text -> text
-    ExMissingPreconditions constraints -> "Missing constraints"
-
+    ExTruePositive truePositive -> ppTruePositive truePositive
+    ExMissingPreconditions _constraints -> "Missing constraints" -- TODO
 
 summarizeOp :: LLVMErrors.MemoryOp sym w -> (Maybe String, LLVMPointer.LLVMPtr sym w)
 summarizeOp =
@@ -172,7 +175,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                 -- or something?
                 do writeLogM $
                       Text.unwords
-                        [ "Diagnosis: Read from an unmapped pointer in argument"
+                        [ "Diagnosis: Write to an unmapped pointer in argument"
                         , "#" <> Text.pack (show (Ctx.indexVal idx))
                         , "at"
                         , Text.pack (show (ppCursor (argName idx) cursor))

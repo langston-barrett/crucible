@@ -161,7 +161,7 @@ assume ::
   Constraint ->
   What4.Pred sym ->
   Setup arch sym argTypes ()
-assume constraint pred = tell [SetupAssumption constraint pred]
+assume constraint predicate = tell [SetupAssumption constraint predicate]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
