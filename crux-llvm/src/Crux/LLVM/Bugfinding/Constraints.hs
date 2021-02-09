@@ -119,6 +119,7 @@ ppConstraints (Constraints argCs globCs relCs) =
                    : map ppValueConstraint constraints
                    ))
       -- ppGlobC symb constraint = PP.pretty "Constraint on global " <> _
+  -- TODO: print globCs, relCs
   in PP.vsep $ toListWithIndex ppArgC argCs
   where
     toListWithIndex :: (forall tp. Ctx.Index ctx tp -> f tp -> a)
