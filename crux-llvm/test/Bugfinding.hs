@@ -31,7 +31,7 @@ findBugs file fn =
                                     , initLlvm { entryPoint = fn }
                                     )
                genBitCode cruxOpts llvmOpts
-               putStrLn (unwords [ "Reproduce with"
+               putStrLn (unwords [ "Reproduce with:\n"
                                  , "cabal v2-run exe:crux-llvm -- "
                                  , "--bugfinding"
                                  , "--entry-point"
@@ -48,14 +48,34 @@ isSafe file fn =
          AlwaysSafe -> pure ()
          _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe"])
 
+isSafeWithPreconditions :: FilePath -> String -> TT.TestTree
+isSafeWithPreconditions file fn =
+  TH.testCase (fn <> " is safe") $
+    do Some result <- findBugs file fn
+       case result of
+         SafeWithPreconditions _preconditions -> pure ()
+         _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe with preconditions"])
+
 tests :: TT.TestTree
 tests =
   TT.testGroup "bugfinding"
-    [ TH.testCase "writes_to_arg is safe with preconditions" $
-        do Some result <- findBugs "writes_to_arg.c" "writes_to_arg"
-           case result of
-             SafeWithPreconditions _preconditions -> pure ()
-             _ -> TH.assertFailure "blah"
-    , isSafe "add1.c" "add1"
+    [ isSafe "add1.c" "add1"
+    , isSafe "branch.c" "branch"
+    , isSafe "compare_to_null.c" "compare_to_null"
     , isSafe "print.c" "print"
+    , isSafe "read_global.c" "read_global"
+    , isSafe "write_global.c" "write_global"
+    , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
+    , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
+    , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
+    -- TODO: Unimplemented
+    -- , isSafeWithPreconditions "deref_arg.c" "deref_arg"
+    -- , isSafeWithPreconditions "deref_struct_field.c" "deref_struct_field"
+    -- , isSafeWithPreconditions "do_memcpy.c" "do_memcpy"
+    -- , isSafeWithPreconditions "do_memset.c" "do_memset"
+    -- , isSafeWithPreconditions "ptr_as_array.c" "ptr_as_array"
+    -- , isSafeWithPreconditions "writes_to_arg_ptr.c" "writes_to_arg_ptr"
+    -- , notSafe "uninitialized_stack.c" "uninitialized_stack"
+    -- , notSafe "oob_read_heap.c" "oob_read_heap"
+    -- , notSafe "oob_read_stack.c" "oob_read_stack"
     ]
