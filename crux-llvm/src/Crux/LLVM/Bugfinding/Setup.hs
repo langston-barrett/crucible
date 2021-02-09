@@ -146,10 +146,9 @@ generateMinimalValue _proxy sym typeRepr selector =
           CrucibleTypes.AnyRepr ->
             -- TODO(lb): Should be made more complex
             return $ Crucible.AnyValue CrucibleTypes.UnitRepr ()
-
-          LLVMMem.PtrRepr ->
+          LLVMMem.LLVMPointerRepr w ->
             do liftIO . LLVMMem.llvmPointer_bv sym =<<
-                 annotatedTerm sym (CrucibleTypes.BaseBVRepr ?ptrWidth) selector
+                 annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
           CrucibleTypes.VectorRepr _containedTypeRepr -> unimplemented
           CrucibleTypes.StructRepr _containedTypes -> unimplemented
           _ -> unimplemented -- TODO(lb)
