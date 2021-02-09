@@ -170,6 +170,8 @@ test-suite crux-llvm-test
   ghc-prof-options: -O2
 
   main-is: Test.hs
+  other-modules:
+    Bugfinding
 
   build-depends:
                 base             >= 4.7,
@@ -182,6 +184,7 @@ test-suite crux-llvm-test
                 directory,
                 filepath,
                 microlens,
+                parameterized-utils,
                 parsec,
                 process,
                 QuickCheck,

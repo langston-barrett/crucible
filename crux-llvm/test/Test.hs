@@ -30,6 +30,8 @@ import qualified Test.Tasty.Sugar as TS
 import qualified Crux.Log as C
 import qualified CruxLLVMMain as C
 
+import qualified Bugfinding as B
+
 
 cube :: TS.CUBE
 cube = TS.mkCUBE { TS.inputDir = "test-data/golden"
@@ -63,7 +65,9 @@ main = do let cubes = [ cube { TS.inputDir = dir, TS.rootName = rootName }
                             TT.defaultIngredients
           TT.defaultMainWithIngredients ingredients $
             TT.testGroup "crux-llvm"
-            [ TT.testGroup (showVC clangVer) $ tests ]
+            [ TT.testGroup (showVC clangVer) $ tests
+            , B.tests
+            ]
 
 
 -- lack of decipherable version is not fatal to running the tests

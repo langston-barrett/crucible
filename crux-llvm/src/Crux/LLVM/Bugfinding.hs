@@ -10,7 +10,11 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Crux.LLVM.Bugfinding (bugfindingMain) where
+module Crux.LLVM.Bugfinding
+  ( bugfindingMain
+  , translateAndLoop
+  , BugfindingResult(..)
+  ) where
 
 import System.Exit
   ( ExitCode(..) )
@@ -247,12 +251,13 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
      loop [] (emptyConstraints (Ctx.size (cfgArgTypes cfg)))
 
 
-bugfindingMain ::
+-- | Assumes the bitcode file has already been generated with @genBitCode@.
+translateAndLoop ::
   (?outputConfig ::  OutputConfig) =>
   CruxOptions ->
   LLVMOptions ->
-  IO ExitCode
-bugfindingMain cruxOpts llvmOpts =
+  IO (Some BugfindingResult)
+translateAndLoop cruxOpts llvmOpts =
   do llvmMod <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
      halloc <- newHandleAllocator
      Some trans <-
@@ -260,22 +265,31 @@ bugfindingMain cruxOpts llvmOpts =
            ?optLoopMerge = loopMerge llvmOpts
        in translateModule halloc llvmMod
      let entry = entryPoint llvmOpts
-     Some result <-
-       llvmPtrWidth (trans ^. transContext)
-         (\ptrW ->
-            withPtrWidth
-              ptrW
-              (do AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
-                  let context =
-                        case makeContext (Text.pack entry) (cfgArgTypes cfg) llvmMod trans of
-                          Left _ -> error "Error building context!"  -- TODO(lb)
-                          Right c -> c
-                  Some <$>
-                    bugfindingLoop
-                      context
-                      cfg
-                      cruxOpts
-                      (memOpts llvmOpts)
-                      halloc))
+     llvmPtrWidth (trans ^. transContext)
+       (\ptrW ->
+          withPtrWidth
+            ptrW
+            (do AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
+                let context =
+                      case makeContext (Text.pack entry) (cfgArgTypes cfg) llvmMod trans of
+                        Left _ -> error "Error building context!"  -- TODO(lb)
+                        Right c -> c
+                Some <$>
+                  bugfindingLoop
+                    context
+                    cfg
+                    cruxOpts
+                    (memOpts llvmOpts)
+                    halloc))
+
+
+-- | Assumes the bitcode file has already been generated with @genBitCode@.
+bugfindingMain ::
+  (?outputConfig ::  OutputConfig) =>
+  CruxOptions ->
+  LLVMOptions ->
+  IO ExitCode
+bugfindingMain cruxOpts llvmOpts =
+  do Some result <- translateAndLoop cruxOpts llvmOpts
      TextIO.putStrLn (printBugfindingResult result)
      return ExitSuccess
