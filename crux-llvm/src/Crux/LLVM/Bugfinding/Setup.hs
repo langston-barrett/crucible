@@ -153,11 +153,11 @@ generateMinimalValue _proxy sym typeRepr selector =
           do liftIO . LLVMMem.llvmPointer_bv sym =<<
                 annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
         CrucibleTypes.VectorRepr _containedTypeRepr ->
-          unin "Can't generate values of vector types"
+          unin "Generating values of vector types"
         CrucibleTypes.StructRepr _containedTypes ->
-          unin "Can't generate values of struct types"
+          unin "Generating values of struct types"
         _ ->
-          unin ("Can't generate values of this type: " ++ show typeRepr)
+          unin ("Generating values of this type: " ++ show typeRepr)
   where unin = unimplemented "generateMinimalValue"
 
 generateMinimalArgs ::
