@@ -139,7 +139,7 @@ generateMinimalValue ::
   CrucibleTypes.TypeRepr tp ->
   Selector argTypes ->
   Setup arch sym argTypes (Crucible.RegValue sym tp)
-generateMinimalValue _proxy sym typeRepr selector =
+generateMinimalValue proxy sym typeRepr selector =
   case CrucibleTypes.asBaseType typeRepr of
     CrucibleTypes.AsBaseType baseTypeRepr ->
       annotatedTerm sym baseTypeRepr selector
@@ -154,8 +154,12 @@ generateMinimalValue _proxy sym typeRepr selector =
                 annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
         CrucibleTypes.VectorRepr _containedTypeRepr ->
           unin "Generating values of vector types"
-        CrucibleTypes.StructRepr _containedTypes ->
-          unin "Generating values of struct types"
+        CrucibleTypes.StructRepr types ->
+          Ctx.generateM
+            (Ctx.size types)
+            (\idx ->
+               Crucible.RV <$>
+                 generateMinimalValue  proxy sym (types Ctx.! idx) selector)
         _ ->
           unin ("Generating values of this type: " ++ show typeRepr)
   where unin = unimplemented "generateMinimalValue"

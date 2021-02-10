@@ -95,6 +95,7 @@ tests =
     , isSafe "read_global.c" "read_global"
     , isSafe "write_global.c" "write_global"
     , isSafeWithPreconditions "deref_arg.c" "deref_arg"
+    , isSafeWithPreconditions "deref_struct_field.c" "deref_struct_field"
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
@@ -106,5 +107,4 @@ tests =
     , isUnclassified "sized_array_arg.c" "sized_array_arg"  -- goal: isSafe
     , isUnclassified "uninitialized_stack.c" "uninitialized_stack"  -- goal: notSafe
     , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafeWP
-    , unimplemented "deref_struct_field.c" "deref_struct_field"  -- goal: isSafeWP
     ]
