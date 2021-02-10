@@ -1,4 +1,7 @@
+{-# Language ImplicitParams #-}
+{-# Language LambdaCase #-}
 {-# Language OverloadedStrings #-}
+{-# Language ScopedTypeVariables #-}
 
 module Bugfinding (tests) where
 
@@ -17,6 +20,7 @@ import           Crux.LLVM.Config (LLVMOptions(entryPoint), llvmCruxConfig)
 
 -- Code being tested
 import           Crux.LLVM.Bugfinding (BugfindingResult(..), translateAndLoop)
+import           Crux.LLVM.Bugfinding.Errors.Unimplemented (catchUnimplemented)
 
 testDir :: FilePath
 testDir = "tests/bugfinding"
@@ -25,22 +29,25 @@ findBugs :: FilePath -> String -> IO (Some BugfindingResult)
 findBugs file fn =
   do withFile (testDir </> "output") WriteMode $ \h ->
        do let outCfg = Crux.OutputConfig False h h True
-          Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \(initCrux, initLlvm) ->
-            do (cruxOpts, llvmOpts) <-
-                 processLLVMOptions ( initCrux { Crux.inputFiles = [testDir </> file]
-                                               , Crux.loopBound = Just 8
-                                               }
-                                    , initLlvm { entryPoint = fn }
-                                    )
-               genBitCode cruxOpts llvmOpts
-               putStrLn (unwords [ "Reproduce with:\n"
-                                 , "cabal v2-run exe:crux-llvm -- "
-                                 , "--bugfinding"
-                                 , "--entry-point"
-                                 , fn
-                                 , testDir </> file
-                                 ])
-               translateAndLoop cruxOpts llvmOpts
+          (cruxOpts, llvmOpts) <-
+            Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \(initCrux, initLlvm) ->
+              do (cruxOpts, llvmOpts) <-
+                   processLLVMOptions ( initCrux { Crux.inputFiles = [testDir </> file]
+                                                 , Crux.loopBound = Just 8
+                                                 }
+                                      , initLlvm { entryPoint = fn }
+                                      )
+                 genBitCode cruxOpts llvmOpts
+                 pure (cruxOpts, llvmOpts)
+          putStrLn (unwords [ "Reproduce with:\n"
+                            , "cabal v2-run exe:crux-llvm -- "
+                            , "--bugfinding"
+                            , "--entry-point"
+                            , fn
+                            , testDir </> file
+                            ])
+          let ?outputConfig = outCfg
+          translateAndLoop cruxOpts llvmOpts
 
 isSafe :: FilePath -> String -> TT.TestTree
 isSafe file fn =
@@ -58,6 +65,14 @@ isSafeWithPreconditions file fn =
          SafeWithPreconditions _preconditions -> pure ()
          _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe with preconditions"])
 
+unimplemented :: FilePath -> String -> TT.TestTree
+unimplemented file fn =
+  TH.testCase (fn <> " exercises unimplemented functionality") $
+    catchUnimplemented (findBugs file fn) >>=
+      \case
+        Left _msg -> pure ()
+        Right _ -> TH.assertFailure (unwords ["Expected", fn, "to be unimplemented"])
+
 tests :: TT.TestTree
 tests =
   TT.testGroup "bugfinding"
@@ -70,10 +85,11 @@ tests =
     , isSafe "read_global.c" "read_global"
     , isSafe "write_global.c" "write_global"
     , isSafeWithPreconditions "deref_arg.c" "deref_arg"
-    , isSafeWithPreconditions "deref_struct_field.c" "deref_struct_field"
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
+    , unimplemented "sized_array_arg.c" "sized_array_arg"
+    -- , unimplemented "deref_struct_field.c" "deref_struct_field"
     -- TODO: Unimplemented
     -- , isSafeWithPreconditions "do_memcpy.c" "do_memcpy"
     -- , isSafeWithPreconditions "do_memset.c" "do_memset"

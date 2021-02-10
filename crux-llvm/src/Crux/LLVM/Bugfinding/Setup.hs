@@ -314,7 +314,7 @@ setupExecution ::
   sym ->
   Context arch argTypes ->
   Constraints argTypes ->
-  m (Either SetupError (SetupResult sym argTypes, Crucible.RegMap sym argTypes))
+  m (Either (SetupError argTypes) (SetupResult sym argTypes, Crucible.RegMap sym argTypes))
 setupExecution sym context preconds = do
   -- TODO(lb): More lazy here?
   let moduleTrans = context ^. moduleTranslation

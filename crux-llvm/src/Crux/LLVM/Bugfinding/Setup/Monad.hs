@@ -78,11 +78,12 @@ import Data.Void (Void)
 data TypedSelector argTypes tp =
   TypedSelector (Selector argTypes) (CrucibleTypes.BaseTypeRepr tp)
 
-data SetupError
+data SetupError argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
+  | SetupBadConstraintSelector (Selector argTypes) MemType Constraint
 
-ppSetupError :: SetupError -> Doc Void
+ppSetupError :: SetupError argTypes -> Doc Void
 ppSetupError _ = PP.pretty ("unimplemented" :: Text)
 
 data SetupAssumption sym
@@ -112,7 +113,7 @@ symbolCounter = lens _symbolCounter (\s v -> s { _symbolCounter = v })
 newtype Setup arch sym argTypes a =
   Setup
     (ExceptT
-      SetupError
+      (SetupError argTypes)
       (RWST (Context arch argTypes)
             [SetupAssumption sym]
             (SetupState sym argTypes)
@@ -120,7 +121,7 @@ newtype Setup arch sym argTypes a =
       a)
   deriving (Applicative, Functor, Monad, MonadIO)
 
-deriving instance MonadError SetupError (Setup arch sym argTypes)
+deriving instance MonadError (SetupError argTypes) (Setup arch sym argTypes)
 deriving instance MonadState (SetupState sym argTypes) (Setup arch sym argTypes)
 deriving instance MonadReader (Context arch argTypes) (Setup arch sym argTypes)
 deriving instance MonadWriter [SetupAssumption sym] (Setup arch sym argTypes)
@@ -140,7 +141,7 @@ runSetup ::
   Context arch argTypes ->
   LLVMMem.MemImpl sym ->
   Setup arch sym argTypes a ->
-  m (Either SetupError (SetupResult sym argTypes, a))
+  m (Either (SetupError argTypes) (SetupResult sym argTypes, a))
 runSetup context mem (Setup computation) = do
   result <-
     liftIO $

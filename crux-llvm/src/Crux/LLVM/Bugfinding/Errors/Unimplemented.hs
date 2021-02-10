@@ -7,13 +7,16 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE Trustworthy #-}
 
 module Crux.LLVM.Bugfinding.Errors.Unimplemented
   ( unimplemented
+  , catchUnimplemented
   ) where
 
+import Control.Exception (try)
 import Panic hiding (panic)
 import qualified Panic
 
@@ -40,3 +43,10 @@ unimplemented where_ what =
     , "is not yet implemented as a feature of crux-llvm bugfinding mode."
     , "If this feature would be useful to you, please report this error."
     ]
+
+catchUnimplemented :: forall a. IO a -> IO (Either String a)
+catchUnimplemented computation =
+  either
+    (\panic@(Panic Unimplemented _ _ _) -> Left (show panic))
+    pure
+    <$> try computation

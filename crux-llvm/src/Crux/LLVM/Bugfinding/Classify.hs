@@ -26,11 +26,13 @@ module Crux.LLVM.Bugfinding.Classify
 
 import           Control.Lens (to, (^.))
 import           Control.Monad.IO.Class (liftIO, MonadIO)
+import           Data.Functor.Const (Const(getConst))
 import           Data.Text (Text)
 import qualified Data.Text as Text
 
 import           Lumberjack (writeLogM, HasLog)
 
+import           Data.Parameterized.Classes (IxedF'(ixF'))
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
@@ -41,7 +43,6 @@ import qualified What4.Interface as What4
 import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
 
--- import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPointer
 import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
 import qualified Lang.Crucible.LLVM.Errors.MemoryError as LLVMErrors
@@ -50,9 +51,8 @@ import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as LLVMErrors
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
+import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
-import Data.Parameterized.Classes (IxedF'(ixF'))
-import Data.Functor.Const (Const(getConst))
 
 data TruePositive
   -- TODO which
@@ -222,5 +222,8 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
               Just (TypedSelector (SelectGlobal _symbol _cursor) _typeRepr) ->
                 error "Unimplemented: Global"
               -- TODO(lb): Something about globals, probably?
-              Nothing -> error ("Unimplemented:" ++ show (LLVMPointer.ppPtr ptr))
+              Nothing ->
+                unimplemented
+                  "classify"
+                  ("Uninitialized read from " ++ show (LLVMPointer.ppPtr ptr))
       _ -> pure $ ExTruePositive (Generic "Unknown error (assuming true positive)")
