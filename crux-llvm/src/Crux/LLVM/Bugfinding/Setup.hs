@@ -13,6 +13,7 @@ Stability    : provisional
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Crux.LLVM.Bugfinding.Setup
   ( setupExecution
@@ -21,7 +22,7 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, view, (^.), (.=))
+import           Control.Lens (to, view, (^.))
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Text (Text)
 
@@ -29,7 +30,6 @@ import           Lumberjack (HasLog, writeLogM)
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some (Some(..))
-import           Data.Parameterized.Map (MapF)
 
 import qualified What4.Interface as What4
 
@@ -60,6 +60,8 @@ import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
 import Lang.Crucible.LLVM.MemType (MemType(PtrType), SymType(MemType))
 import Data.Maybe (fromMaybe)
+import Control.Monad.Error.Class (MonadError(throwError))
+import Lang.Crucible.LLVM.TypeContext (asMemType)
 
 ppRegValue ::
   ( Crucible.IsSymInterface sym
@@ -206,33 +208,33 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
       case typeRepr of
         LLVMMem.PtrRepr ->
           Crucible.RegEntry typeRepr <$> malloc sym memType
-        _ -> error "Bad cursor" -- TODO(lb): Better error handling
+        _ -> throwError (SetupBadConstraintSelector selector memType constraint)
     Aligned alignment ->
       case typeRepr of
         LLVMMem.PtrRepr ->
           do assume constraint =<<
                liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
              pure regEntry
-        _ -> error "Bad cursor" -- TODO(lb): Better error handling
+        _ -> throwError (SetupBadConstraintSelector selector memType constraint)
     Initialized ->
-      case (typeRepr, memType) of
-        (LLVMMem.PtrRepr, PtrType (MemType pointedToType)) ->
-          let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
-          in LLVMTrans.llvmTypeAsRepr
-               pointedToType
-               (\tp ->  -- the Crucible type being pointed at
-                 do ptr <- malloc sym pointedToType
-                    pointedToVal <- generateMinimalValue (Proxy :: Proxy arch) sym tp selector
-                    storageType <- storableType pointedToType
-                    modifyMem $
-                      \mem ->
-                        liftIO $
-                          LLVMMem.doStore sym mem ptr tp storageType noAlignment pointedToVal
-                    pure (Crucible.RegEntry typeRepr ptr))
-        _ -> error "Bad cursor" -- TODO(lb): Better error handling
+      withTypeContext context $
+        case (typeRepr, memType) of
+          (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
+            LLVMTrans.llvmTypeAsRepr
+              pointedToType
+              (\tp ->  -- the Crucible type being pointed at
+                do ptr <- malloc sym pointedToType
+                   pointedToVal <- generateMinimalValue (Proxy :: Proxy arch) sym tp selector
+                   storageType <- storableType pointedToType
+                   modifyMem $
+                     \mem ->
+                       liftIO $
+                         LLVMMem.doStore sym mem ptr tp storageType noAlignment pointedToVal
+                   pure (Crucible.RegEntry typeRepr ptr))
+          _ -> throwError (SetupBadConstraintSelector selector memType constraint)
 
 constrainValue ::
-  forall proxy arch sym argTypes tp.
+  forall arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
@@ -321,9 +323,9 @@ setupExecution sym context preconds = do
   let llvmCtxt = moduleTrans ^. LLVMTrans.transContext
   -- TODO: More lazy?
   mem <-
-    let ?lc = llvmCtxt ^. LLVMTrans.llvmTypeCtx
-    in liftIO $
-         LLVMGlobals.populateAllGlobals sym (LLVMTrans.globalInitMap moduleTrans)
-           =<< LLVMGlobals.initializeAllMemory sym llvmCtxt (context ^. llvmModule)
+    withTypeContext context $
+      liftIO $
+        LLVMGlobals.populateAllGlobals sym (LLVMTrans.globalInitMap moduleTrans)
+          =<< LLVMGlobals.initializeAllMemory sym llvmCtxt (context ^. llvmModule)
   runSetup context mem (constrain context sym preconds =<<
                           generateMinimalArgs context sym)

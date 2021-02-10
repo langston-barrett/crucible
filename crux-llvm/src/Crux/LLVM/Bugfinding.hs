@@ -78,6 +78,7 @@ import Crux.LLVM.Bugfinding.Constraints (isEmpty, ppConstraints, emptyConstraint
 import Crux.LLVM.Bugfinding.Context
 import Crux.LLVM.Bugfinding.Errors.Panic (panic)
 import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
+import Crux.LLVM.Bugfinding.Setup.Monad (ppSetupError)
 
 -- TODO unsorted
 import qualified What4.Interface as What4
@@ -129,7 +130,7 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
          liftIO $ setupExecution sym context preconds
        (mem, argAnnotations, assumptions, args) <-
          case setupResult of
-           Left _err -> error "BLAH ERROR!"  -- TODO(lb)
+           Left err -> panic "setupExecution" [show (ppSetupError err)]
            Right (SetupResult mem anns assumptions, args) ->
              pure (mem, anns, assumptions, args)
 

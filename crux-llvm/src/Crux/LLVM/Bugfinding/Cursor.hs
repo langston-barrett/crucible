@@ -21,6 +21,7 @@ module Crux.LLVM.Bugfinding.Cursor
   , ppCursor
   , Selector(..)
   , TypeSeekError(..)
+  , ppTypeSeekError
   , seekLlvmType
   , seekMemType
   ) where
@@ -75,6 +76,37 @@ data TypeSeekError ty
   | FieldIndexOutOfBounds !Word64 !Word64 ty
   | MismatchedCursorAndType Cursor ty
   | UnsupportedType Cursor ty String
+
+ppTypeSeekError :: Show ty => TypeSeekError ty -> Doc Void
+ppTypeSeekError =
+  \case
+    ArrayIndexOutOfBounds index size ty ->
+      PP.nest 2 $
+        (PP.vsep [ PP.pretty "Out of bounds array index:"
+                 , PP.pretty "Index:" <> PP.viaShow index
+                 , PP.pretty "Array size:" <> PP.viaShow size
+                 , PP.pretty "Type:" <> PP.viaShow ty
+                 ])
+    FieldIndexOutOfBounds index size ty ->
+      PP.nest 2 $
+        (PP.vsep [ PP.pretty "Nonexistent struct field:"
+                 , PP.pretty "Index:" <> PP.viaShow index
+                 , PP.pretty "Fields:" <> PP.viaShow size
+                 , PP.pretty "Type:" <> PP.viaShow ty
+                 ])
+    MismatchedCursorAndType cursor ty ->
+      PP.nest 2 $
+        (PP.vsep [ PP.pretty "Mismatched cursor and type:"
+                 , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
+                 , PP.pretty "Type:" <> PP.viaShow ty
+                 ])
+    UnsupportedType cursor ty msg ->
+      PP.nest 2 $
+        (PP.vsep [ PP.pretty "Unsupported type:"
+                 , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
+                 , PP.pretty "Type:" <> PP.viaShow ty
+                 , PP.pretty "Message:" <> PP.viaShow msg
+                 ])
 
 seekLlvmType :: Cursor -> L.Type -> Either (TypeSeekError L.Type) L.Type
 seekLlvmType cursor llvmType =

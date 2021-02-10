@@ -13,6 +13,7 @@ Stability    : provisional
 
 module Crux.LLVM.Bugfinding.Constraints
   ( Constraint(..)
+  , ppConstraint
   , RelationalConstraint(..)
   , Selector(..)
   , ValueConstraint(..)

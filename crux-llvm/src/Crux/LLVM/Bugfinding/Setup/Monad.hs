@@ -11,6 +11,7 @@ Stability    : provisional
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PolyKinds #-}
@@ -19,7 +20,7 @@ Stability    : provisional
 
 module Crux.LLVM.Bugfinding.Setup.Monad
   ( Setup
-  , SetupError
+  , SetupError(..)
   , ppSetupError
   , SetupState
   , SetupAssumption(..)
@@ -54,18 +55,19 @@ import qualified Data.Parameterized.Map as MapF
 
 import qualified What4.Interface as What4
 
+import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Types as CrucibleTypes
 
+import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
+import           Crux.LLVM.Bugfinding.Context
+import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
+
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
-import           Crux.LLVM.Bugfinding.Cursor (TypeSeekError, Selector, Cursor, seekMemType)
-import           Crux.LLVM.Bugfinding.Context
-import           Crux.LLVM.Bugfinding.Constraints (Constraint)
-import qualified Lang.Crucible.Backend as Crucible
-import Lang.Crucible.LLVM.Extension (ArchWidth)
+import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, Cursor, seekMemType)
 import Lang.Crucible.LLVM.DataLayout (maxAlignment)
 import Data.BitVector.Sized (mkBV)
 import Lang.Crucible.LLVM.MemType (SymType, MemType, memTypeSize)
@@ -84,7 +86,19 @@ data SetupError argTypes
   | SetupBadConstraintSelector (Selector argTypes) MemType Constraint
 
 ppSetupError :: SetupError argTypes -> Doc Void
-ppSetupError _ = PP.pretty ("unimplemented" :: Text)
+ppSetupError =
+  \case
+    SetupTypeSeekError typeSeekError -> ppTypeSeekError typeSeekError
+    SetupTypeTranslationError memType ->
+      PP.pretty ("Couldn't translate MemType" :: Text) <> PP.viaShow memType
+    SetupBadConstraintSelector _selector memType constraint ->
+      PP.nest 2 $
+        PP.vsep
+          -- TODO print selector too
+          [ PP.pretty ("Can't apply this constraint at this selector" :: Text)
+          , "Type: " <> PP.viaShow memType
+          , "Constraint: " <> ppConstraint constraint
+          ]
 
 data SetupAssumption sym
   = SetupAssumption
@@ -190,8 +204,8 @@ seekType ::
   Setup arch sym argTypes MemType
 seekType cursor memType =
   do context <- ask
-     let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
-     either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
+     withTypeContext context $
+       either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
 
 storableType :: ArchOk arch => MemType -> Setup arch sym argTypes LLVMMem.StorageType
 storableType memType =
@@ -230,59 +244,3 @@ malloc sym memType =
               (maxAlignment dl) -- TODO is this OK?
      setupMem .= mem'
      pure ptr
-
-{-
-debugInfoArgNames :: LLVM.Module -> LLVM.Define -> Map Int Text
-debugInfoArgNames m d =
-    case Map.lookup "dbg" $ LLVM.defMetadata d of
-          Just (LLVM.ValMdRef s) -> scopeArgs s
-              _ -> Map.empty
-  where
-    scopeArgs :: Int -> Map Int Text
-    scopeArgs s = go $ LLVM.modUnnamedMd m
-      where go :: [LLVM.UnnamedMd] -> Map Int Text
-            go [] = Map.empty
-            go (LLVM.UnnamedMd
-                 { LLVM.umValues =
-                   LLVM.ValMdDebugInfo
-                     (LLVM.DebugInfoLocalVariable
-                       LLVM.DILocalVariable
-                       { LLVM.dilvScope = Just (LLVM.ValMdRef s')
-                       , LLVM.dilvArg = a
-                       , LLVM.dilvName = Just n
-                       })}:xs) =
-              if s == s' then Map.insert (fromIntegral a) (Text.pack n) $ go xs else go xs
-            go (_:xs) = go xs
-
-stmtDebugDeclares :: [LLVM.Stmt] -> Map Int Location
-stmtDebugDeclares [] = Map.empty
-stmtDebugDeclares
-  (LLVM.Result _
-    (LLVM.Call _ _
-      (LLVM.ValSymbol (LLVM.Symbol s))
-      [ _
-      , LLVM.Typed
-        { LLVM.typedValue =
-          LLVM.ValMd (LLVM.ValMdDebugInfo (LLVM.DebugInfoLocalVariable LLVM.DILocalVariable { LLVM.dilvArg = a }))
-        }
-      , _
-      ]) md:stmts)
-  | s == "llvm.dbg.declare" || s == "llvm.dbg.value"
-  , Just (LLVM.ValMdLoc LLVM.DebugLoc { LLVM.dlLine = line, LLVM.dlCol = col }) <- lookup "dbg" md
-  = Map.insert (fromIntegral a) (Location (fromIntegral line) . Just $ fromIntegral col) $ stmtDebugDeclares stmts
-stmtDebugDeclares
-  (LLVM.Effect
-    (LLVM.Call _ _
-      (LLVM.ValSymbol (LLVM.Symbol s))
-      [ _
-      , LLVM.Typed
-        { LLVM.typedValue =
-          LLVM.ValMd (LLVM.ValMdDebugInfo (LLVM.DebugInfoLocalVariable LLVM.DILocalVariable { LLVM.dilvArg = a }))
-        }
-      , _
-      ]) md:stmts)
-  | s == "llvm.dbg.declare" || s == "llvm.dbg.value"
-  , Just (LLVM.ValMdLoc LLVM.DebugLoc { LLVM.dlLine = line, LLVM.dlCol = col }) <- lookup "dbg" md
-  = Map.insert (fromIntegral a) (Location (fromIntegral line) . Just $ fromIntegral col) $ stmtDebugDeclares stmts
-stmtDebugDeclares (_:stmts) = stmtDebugDeclares stmts
--}

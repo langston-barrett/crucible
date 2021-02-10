@@ -25,6 +25,7 @@ module Crux.LLVM.Bugfinding.Context
   , argumentStorageTypes
   , llvmModule
   , moduleTranslation
+  , withTypeContext
   ) where
 
 import           Control.Lens ((^.), Simple, Lens, lens)
@@ -47,6 +48,7 @@ import           Lang.Crucible.LLVM.MemModel (toStorableType, StorageType)
 import           Lang.Crucible.LLVM.MemType (fdArgTypes, MemType)
 import           Lang.Crucible.LLVM.Translation (ModuleTranslation)
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
+import           Lang.Crucible.LLVM.TypeContext (TypeContext)
 import           Lang.Crucible.LLVM.Run (withPtrWidthOf)
 
 -- TODO(lb): Split into module-level and function-level?
@@ -81,6 +83,12 @@ llvmModule = lens _llvmModule (\s v -> s { _llvmModule = v })
 
 moduleTranslation :: Simple Lens (Context arch argTypes) (ModuleTranslation arch)
 moduleTranslation = lens _moduleTranslation (\s v -> s { _moduleTranslation = v })
+
+withTypeContext :: Context arch argTypes -> ((?lc :: TypeContext) => a) -> a
+withTypeContext context computation =
+  let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
+  in computation
+
 
 data ContextError
   = MissingEntrypoint Text
