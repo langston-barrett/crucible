@@ -18,6 +18,7 @@ Stability    : provisional
 
 module Crux.LLVM.Bugfinding.Classify
   ( Explanation(..)
+  , partitionExplanations
   , TruePositive(..)
   , ppTruePositive
   , ppExplanation
@@ -25,10 +26,13 @@ module Crux.LLVM.Bugfinding.Classify
   ) where
 
 import           Control.Lens (to, (^.))
-import           Control.Monad.IO.Class (liftIO, MonadIO)
+import           Control.Monad.IO.Class (MonadIO)
 import           Data.Functor.Const (Const(getConst))
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           Data.Void (Void)
+
+import           Prettyprinter (Doc)
 
 import           Lumberjack (writeLogM, HasLog)
 
@@ -53,29 +57,48 @@ import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
+import Lang.Crucible.LLVM.Errors (ppBB)
 
 data TruePositive
   -- TODO which
   = UninitializedStackVariable
-  | Generic Text
 
--- | An error is either a true positive, or a false positives due to some
--- missing preconditions.
+-- | An error is either a true positive, a false positive due to some missing
+-- preconditions, or unknown.
 data Explanation types
   = ExTruePositive TruePositive
   | ExMissingPreconditions (Constraints types)
+  | ExUnclassified (Doc Void)
+  -- ^ We don't (yet) know what to do about this error
+
+partitionExplanations ::
+  [Explanation types] -> ([TruePositive], [Constraints types], [Doc Void])
+partitionExplanations = go [] [] []
+  where go ts cs ds =
+          \case
+            [] -> (ts, cs, ds)
+            (ExTruePositive t:xs) ->
+              let (ts', cs', ds') = go ts cs ds xs
+              in (t:ts', cs', ds')
+            (ExMissingPreconditions c:xs) ->
+              let (ts', cs', ds') = go ts cs ds xs
+              in (ts', c:cs', ds')
+            (ExUnclassified d:xs) ->
+              let (ts', cs', ds') = go ts cs ds xs
+              in (ts', cs', d:ds')
 
 ppTruePositive :: TruePositive -> Text
 ppTruePositive =
   \case
     UninitializedStackVariable -> "Uninitialized stack variable"
-    Generic text -> text
 
 ppExplanation :: Explanation types -> Text
 ppExplanation =
   \case
     ExTruePositive truePositive -> ppTruePositive truePositive
-    ExMissingPreconditions _constraints -> "Missing constraints" -- TODO
+    ExMissingPreconditions constraints ->
+      "Missing preconditions:" <> Text.pack (show (ppConstraints constraints))
+    ExUnclassified doc -> "Unclassified/unknown error:\n" <> Text.pack (show doc)
 
 summarizeOp :: LLVMErrors.MemoryOp sym w -> (Maybe String, LLVMPointer.LLVMPtr sym w)
 summarizeOp =
@@ -115,6 +138,9 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
         What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)
     argName :: Ctx.Index argTypes tp -> String
     argName idx = context ^. argumentNames . ixF' idx . to getConst . to (maybe "<top>" Text.unpack)
+    unclass =
+      do writeLogM ("Couldn't classify error." :: Text)
+         pure $ ExUnclassified (ppBB badBehavior)
   in
     case badBehavior of
       LLVMErrors.BBUndefinedBehavior
@@ -140,7 +166,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        (Ctx.size args)
                        idx
                        [ValueConstraint (Aligned alignment) cursor]
-            Nothing -> error "Unimplemented: bad write align"
+            Nothing -> unclass
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
@@ -164,7 +190,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        (Ctx.size args)
                        idx
                        [ValueConstraint (Aligned alignment) cursor]
-            Nothing -> error "Unimplemented: bad read align"
+            Nothing -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
           (summarizeOp -> (_expl, ptr))
@@ -191,10 +217,8 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                          (Ctx.size args)
                          idx
                          [ValueConstraint Allocated cursor]
-              Just (TypedSelector (SelectGlobal _symbol _cursor) _typeRepr) ->
-                error "Unimplemented: Global"
               -- TODO(lb): Something about globals, probably?
-              Nothing -> error ("Unimplemented:" ++ show (LLVMPointer.ppPtr ptr))
+              Nothing -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
           _op
@@ -219,11 +243,6 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                          (Ctx.size args)
                          idx
                          [ValueConstraint Initialized cursor]
-              Just (TypedSelector (SelectGlobal _symbol _cursor) _typeRepr) ->
-                error "Unimplemented: Global"
               -- TODO(lb): Something about globals, probably?
-              Nothing ->
-                unimplemented
-                  "classify"
-                  ("Uninitialized read from " ++ show (LLVMPointer.ppPtr ptr))
-      _ -> pure $ ExTruePositive (Generic "Unknown error (assuming true positive)")
+              Nothing -> unclass
+      _ -> unclass

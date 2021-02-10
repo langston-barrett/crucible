@@ -19,7 +19,8 @@ import           Crux.LLVM.Compile (genBitCode)
 import           Crux.LLVM.Config (LLVMOptions(entryPoint), llvmCruxConfig)
 
 -- Code being tested
-import           Crux.LLVM.Bugfinding (BugfindingResult(..), translateAndLoop)
+import           Crux.LLVM.Bugfinding
+  (BugfindingResult(..), FunctionSummary(..), translateAndLoop)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (catchUnimplemented)
 
 testDir :: FilePath
@@ -53,7 +54,8 @@ isSafe :: FilePath -> String -> TT.TestTree
 isSafe file fn =
   TH.testCase (fn <> " is safe") $
     do Some result <- findBugs file fn
-       case result of
+       0 TH.@=? length (unclassifiedErrors result)
+       case summary result of
          AlwaysSafe -> pure ()
          _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe"])
 
@@ -61,9 +63,17 @@ isSafeWithPreconditions :: FilePath -> String -> TT.TestTree
 isSafeWithPreconditions file fn =
   TH.testCase (fn <> " is safe") $
     do Some result <- findBugs file fn
-       case result of
+       0 TH.@=? length (unclassifiedErrors result)
+       case summary result of
          SafeWithPreconditions _preconditions -> pure ()
          _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe with preconditions"])
+
+isUnclassified :: FilePath -> String -> TT.TestTree
+isUnclassified file fn =
+  TH.testCase (fn <> " is unclassified") $
+    do Some result <- findBugs file fn
+       0 < length (unclassifiedErrors result) TH.@?
+          (unwords ["Expected", fn, "to be safe with preconditions"])
 
 unimplemented :: FilePath -> String -> TT.TestTree
 unimplemented file fn =
@@ -88,14 +98,13 @@ tests =
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
-    , unimplemented "sized_array_arg.c" "sized_array_arg"
+    , isUnclassified "do_memcpy.c" "do_memcpy"  -- goal: isSafe
+    , isUnclassified "do_memset.c" "do_memset"  -- goal: isSafe
+    , isUnclassified "oob_read_heap.c" "oob_read_heap"  -- goal: notSafe
+    , isUnclassified "oob_read_stack.c" "oob_read_stack"  -- goal: notSafe
+    , isUnclassified "ptr_as_array.c" "ptr_as_array"  -- goal: isSafe
+    , isUnclassified "sized_array_arg.c" "sized_array_arg"  -- goal: isSafe
+    , isUnclassified "uninitialized_stack.c" "uninitialized_stack"  -- goal: notSafe
+    , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafe
     -- , unimplemented "deref_struct_field.c" "deref_struct_field"
-    -- TODO: Unimplemented
-    -- , isSafeWithPreconditions "do_memcpy.c" "do_memcpy"
-    -- , isSafeWithPreconditions "do_memset.c" "do_memset"
-    -- , isSafeWithPreconditions "ptr_as_array.c" "ptr_as_array"
-    -- , isSafeWithPreconditions "writes_to_arg_ptr.c" "writes_to_arg_ptr"
-    -- , notSafe "uninitialized_stack.c" "uninitialized_stack"
-    -- , notSafe "oob_read_heap.c" "oob_read_heap"
-    -- , notSafe "oob_read_stack.c" "oob_read_stack"
     ]

@@ -14,6 +14,7 @@ module Crux.LLVM.Bugfinding
   ( bugfindingMain
   , translateAndLoop
   , BugfindingResult(..)
+  , FunctionSummary(..)
   ) where
 
 import System.Exit
@@ -72,16 +73,20 @@ import Crux.LLVM.Config
 import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 
-import Crux.LLVM.Bugfinding.Classify (TruePositive, classify, Explanation(..), ppTruePositive)
+import Crux.LLVM.Bugfinding.Classify (partitionExplanations, TruePositive, classify, Explanation(..), ppTruePositive)
 import Crux.LLVM.Bugfinding.Constraints (isEmpty, ppConstraints, emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Context
 import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
 
+-- TODO unsorted
 import qualified What4.Interface as What4
 import qualified Data.Text as Text
 import qualified What4.ProgramLoc as What4
 import qualified What4.FunctionName as What4
 import Data.List.NonEmpty (NonEmpty((:|)))
+import Prettyprinter (Doc)
+import Data.Void (Void)
+import Data.Semigroup (Semigroup(sconcat))
 
 class MonadIO m => HasIOLog m
 
@@ -102,13 +107,12 @@ simulateLLVM ::
   ArchOk arch =>
   HandleAllocator ->
   Context arch argTypes ->
-  IORef [TruePositive] ->
-  IORef (Constraints argTypes) ->
+  IORef [Explanation argTypes] ->
   Constraints argTypes ->
   CFG (LLVM arch) blocks argTypes ret ->
   MemOptions ->
   Crux.SimulatorCallback
-simulateLLVM halloc context truePositiveRef constraintsRef preconds cfg memOptions =
+simulateLLVM halloc context explRef preconds cfg memOptions =
   Crux.SimulatorCallback $ \sym _maybeOnline ->
     do liftIO $ say "Crux" $ unwords ["Using pointer width:", show ?ptrWidth]
        let trans = context ^. moduleTranslation
@@ -160,23 +164,26 @@ simulateLLVM halloc context truePositiveRef constraintsRef preconds cfg memOptio
                   Nothing -> pure ()  -- TODO(lb)
                   Just badBehavior ->
                     classify context sym args argAnnotations badBehavior >>=
-                      \case
-                        ExTruePositive pos -> modifyIORef truePositiveRef (pos:)
-                        ExMissingPreconditions constraints ->
-                          modifyIORef constraintsRef (constraints <>)
+                      modifyIORef explRef . (:)
                 return mempty
 
        return (Crux.RunnableState initSt, explainFailure)
 
 -- | The outer loop of bugfinding mode
 
-data BugfindingResult argTypes
+data FunctionSummary argTypes
   = FoundBugs (NonEmpty TruePositive)
   | SafeWithPreconditions (Constraints argTypes)
   | AlwaysSafe
 
-printBugfindingResult :: BugfindingResult argTypes -> Text
-printBugfindingResult =
+data BugfindingResult argTypes
+  = BugfindingResult
+      { unclassifiedErrors :: [Doc Void]
+      , summary :: FunctionSummary argTypes
+      }
+
+printFunctionSummary :: FunctionSummary argTypes -> Text
+printFunctionSummary =
   \case
     FoundBugs bugs ->
       "There might be bugs in this function"
@@ -186,8 +193,8 @@ printBugfindingResult =
       <> Text.pack (show (ppConstraints preconditions))
     AlwaysSafe -> "This function is always safe."
 
-makeBugfindingResult :: Constraints argTypes -> [TruePositive] -> BugfindingResult argTypes
-makeBugfindingResult preconditions truePositives =
+makeFunctionSummary :: Constraints argTypes -> [TruePositive] -> FunctionSummary argTypes
+makeFunctionSummary preconditions truePositives =
   case (isEmpty preconditions, truePositives) of
     (True, []) -> AlwaysSafe
     (False, []) -> SafeWithPreconditions preconditions
@@ -206,8 +213,7 @@ bugfindingLoop ::
 bugfindingLoop context cfg cruxOpts memOptions halloc =
   do -- First translate the LLVM module into Crucible
      let emptyCs = emptyConstraints (Ctx.size (cfgArgTypes cfg))
-     truePositiveRef <- newIORef []
-     constraintsRef <- newIORef emptyCs
+     explRef <- newIORef []
 
      let runSim preconds =
            Crux.runSimulator
@@ -215,26 +221,31 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
              (simulateLLVM
                 halloc
                 context
-                truePositiveRef
-                constraintsRef
+                explRef
                 preconds
                 cfg
                 memOptions)
 
      -- Loop, learning preconditions and reporting errors
-     let loop truePositives preconditions =
-           do writeIORef truePositiveRef []
-              writeIORef constraintsRef emptyCs
+     let loop truePositives preconditions unclassified =
+           do writeIORef explRef []
               runSim preconditions
-              newTruePositives <- readIORef truePositiveRef
-              newConstraints <- readIORef constraintsRef
-              let result = makeBugfindingResult preconditions truePositives
-              case (isEmpty newConstraints, newTruePositives) of
-                (True, []) ->
+              (newTruePositives, newConstraints0, newUnclassified) <-
+                partitionExplanations <$> readIORef explRef
+              let newConstraints = sconcat (emptyCs :| newConstraints0)
+              let allTruePositives = truePositives <> newTruePositives
+              let allPreconditions = preconditions <> newConstraints
+              let allUnclassified = unclassified <> newUnclassified
+              let result =
+                    BugfindingResult
+                      allUnclassified
+                      (makeFunctionSummary allPreconditions allTruePositives)
+              case (isEmpty newConstraints, newTruePositives, newUnclassified) of
+                (True, [], []) ->
                   do say "Crux" "No errors!"
                      -- TODO(lb): Increase depth till max
                      pure result
-                (isEmpty_, _) ->
+                (isEmpty_, _, _) ->
                   do for_ newTruePositives
                           (\pos ->
                              do say "Crux" "TRUE (?) POSITIVE!"
@@ -244,11 +255,9 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
                      else
                        do say "Crux" "New preconditions:"
                           say "Crux" (show (ppConstraints newConstraints))
-                          loop
-                            (truePositives <> newTruePositives)
-                            (preconditions <> newConstraints)
+                          loop allTruePositives allPreconditions allUnclassified
 
-     loop [] (emptyConstraints (Ctx.size (cfgArgTypes cfg)))
+     loop [] (emptyConstraints (Ctx.size (cfgArgTypes cfg))) []
 
 
 -- | Assumes the bitcode file has already been generated with @genBitCode@.
@@ -291,5 +300,9 @@ bugfindingMain ::
   IO ExitCode
 bugfindingMain cruxOpts llvmOpts =
   do Some result <- translateAndLoop cruxOpts llvmOpts
-     TextIO.putStrLn (printBugfindingResult result)
+     TextIO.putStrLn $
+       if null (unclassifiedErrors result)
+       then printFunctionSummary (summary result)
+       else "Couldn't classify the following errors:\n" <>
+              foldMap (Text.pack . show) (unclassifiedErrors result)
      return ExitSuccess
