@@ -42,6 +42,8 @@ library
     Crux.LLVM.Bugfinding.Constraints
     Crux.LLVM.Bugfinding.Context
     Crux.LLVM.Bugfinding.Cursor
+    Crux.LLVM.Bugfinding.Errors.Panic
+    Crux.LLVM.Bugfinding.Errors.Unimplemented
     Crux.LLVM.Bugfinding.Setup
     Crux.LLVM.Bugfinding.Setup.Monad
     Crux.LLVM.Compile
@@ -67,6 +69,7 @@ library
     llvm-pretty-bc-parser,
     lumberjack,
     mtl,
+    panic,
     parameterized-utils,
     prettyprinter >= 1.7.0,
     process,
