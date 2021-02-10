@@ -25,12 +25,14 @@ module Crux.LLVM.Bugfinding.Setup.Monad
   , SetupAssumption(..)
   , SetupResult(..)
   , setupMem
+  , modifyMem
   , TypedSelector(..)
   , freshSymbol
   , assume
   , addAnnotation
   , runSetup
   , seekType
+  , storableType
   , malloc
   ) where
 
@@ -78,6 +80,7 @@ data TypedSelector argTypes tp =
 
 data SetupError
   = SetupTypeSeekError (TypeSeekError SymType)
+  | SetupTypeTranslationError MemType
 
 ppSetupError :: SetupError -> Doc Void
 ppSetupError _ = PP.pretty ("unimplemented" :: Text)
@@ -152,6 +155,14 @@ runSetup context mem (Setup computation) = do
               , result'
               )
 
+modifyMem ::
+  (LLVMMem.MemImpl sym -> Setup arch sym argTypes (LLVMMem.MemImpl sym)) ->
+  Setup arch sym argTypes ()
+modifyMem f =
+  do mem <- gets (view setupMem)
+     mem' <- f mem
+     setupMem .= mem'
+
 freshSymbol :: Setup arch sym argTypes What4.SolverSymbol
 freshSymbol =
   do counter <- symbolCounter <+= 1
@@ -181,6 +192,9 @@ seekType cursor memType =
      let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
      either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
 
+storableType :: ArchOk arch => MemType -> Setup arch sym argTypes LLVMMem.StorageType
+storableType memType =
+  maybe (throwError (SetupTypeTranslationError memType)) pure (LLVMMem.toStorableType memType)
 
 malloc ::
   ( Crucible.IsSymInterface sym

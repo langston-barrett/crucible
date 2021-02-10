@@ -21,7 +21,7 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, view, (^.))
+import           Control.Lens (to, view, (^.), (.=))
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Text (Text)
 
@@ -37,9 +37,11 @@ import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
 import qualified Lang.Crucible.Types as CrucibleTypes
 
+import           Lang.Crucible.LLVM.DataLayout (noAlignment)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.Globals as LLVMGlobals
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
+
 
 import           Crux.LLVM.Overrides (ArchOk)
 
@@ -55,7 +57,7 @@ import Data.Functor.Const (Const(getConst))
 import Control.Monad.State (gets)
 import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
-import Lang.Crucible.LLVM.MemType (MemType)
+import Lang.Crucible.LLVM.MemType (MemType(PtrType), SymType(MemType))
 import Data.Maybe (fromMaybe)
 
 ppRegValue ::
@@ -127,9 +129,9 @@ annotatedTerm sym typeRepr selector =
      pure expr
 
 generateMinimalValue ::
-  forall sym arch tp argTypes.
+  forall proxy sym arch tp argTypes.
   (Crucible.IsSymInterface sym, ArchOk arch) =>
-  Context arch argTypes ->
+  proxy arch ->
   sym ->
   CrucibleTypes.TypeRepr tp ->
   Selector argTypes ->
@@ -173,7 +175,7 @@ generateMinimalArgs context sym = do
           let typeRepr = argTypesRepr Ctx.! index
           in Crucible.RegEntry typeRepr <$>
                 generateMinimalValue
-                  context
+                  (Proxy :: Proxy arch)
                   sym
                   typeRepr
                   (SelectArgument (Some index) Here))
@@ -185,48 +187,69 @@ generateMinimalArgs context sym = do
 constrainHere ::
   forall proxy arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
+  , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
-  proxy arch ->
+  Context arch argTypes ->
   sym ->
+  Selector argTypes {-^ Top-level selector -} ->
   Constraint ->
   MemType ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainHere _proxy sym constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
+constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
   case constraint of
     Allocated ->
       case typeRepr of
         LLVMMem.PtrRepr ->
           Crucible.RegEntry typeRepr <$> malloc sym memType
-        _ -> error "Bad cursor"
+        _ -> error "Bad cursor" -- TODO(lb): Better error handling
     Aligned alignment ->
       case typeRepr of
         LLVMMem.PtrRepr ->
           do assume constraint =<<
                liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
              pure regEntry
-        _ -> error "Bad cursor"
+        _ -> error "Bad cursor" -- TODO(lb): Better error handling
+    Initialized ->
+      case (typeRepr, memType) of
+        (LLVMMem.PtrRepr, PtrType (MemType pointedToType)) ->
+          let ?lc = context ^. moduleTranslation . LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
+          in LLVMTrans.llvmTypeAsRepr
+               pointedToType
+               (\tp ->  -- the Crucible type being pointed at
+                 do ptr <- malloc sym pointedToType
+                    pointedToVal <- generateMinimalValue (Proxy :: Proxy arch) sym tp selector
+                    storageType <- storableType pointedToType
+                    modifyMem $
+                      \mem ->
+                        liftIO $
+                          LLVMMem.doStore sym mem ptr tp storageType noAlignment pointedToVal
+                    pure (Crucible.RegEntry typeRepr ptr))
+        _ -> error "Bad cursor" -- TODO(lb): Better error handling
 
 constrainValue ::
   forall proxy arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
+  , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
-  proxy arch ->
+  Context arch argTypes ->
   sym ->
   Constraint ->
+  Selector argTypes {-^ Parent selector for the cursor -} ->
   Cursor ->
   MemType {-^ The \"leaf\" 'MemType', passed directly to 'constrainHere' -} ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainValue proxy sym constraint cursor memType regEntry =
+constrainValue context sym constraint selector cursor memType regEntry =
   case cursor of
-    Here -> constrainHere proxy sym constraint memType regEntry
+    Here -> constrainHere context sym selector constraint memType regEntry
 
 constrainOneArgument ::
   forall arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
+  , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   Context arch argTypes ->
@@ -235,7 +258,7 @@ constrainOneArgument ::
   Some (Ctx.Index argTypes) ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainOneArgument context sym constraints (Some idx) regEntry =
+constrainOneArgument context sym constraints sidx@(Some idx) regEntry =
   -- TODO fold
   case constraints of
     [] -> pure regEntry
@@ -243,12 +266,20 @@ constrainOneArgument context sym constraints (Some idx) regEntry =
       do memType <-
            seekType cursor (context ^. argumentMemTypes . ixF' idx . to getConst)
          writeLogM ("Satisfying constraint: " <> Text.pack (show (ppValueConstraint vc)))
-         constrainOneArgument context sym rest (Some idx)
-           =<< constrainValue (Proxy :: Proxy arch) sym constraint cursor memType regEntry
+         constrainOneArgument context sym rest sidx
+           =<< constrainValue
+                 context
+                 sym
+                 constraint
+                 (SelectArgument sidx cursor)
+                 cursor
+                 memType
+                 regEntry
 
 constrain ::
   forall arch sym argTypes.
   ( Crucible.IsSymInterface sym
+  , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   Context arch argTypes ->

@@ -65,11 +65,11 @@ tests =
     , isSafe "print.c" "print"
     , isSafe "read_global.c" "read_global"
     , isSafe "write_global.c" "write_global"
+    , isSafeWithPreconditions "deref_arg.c" "deref_arg"
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
     -- TODO: Unimplemented
-    -- , isSafeWithPreconditions "deref_arg.c" "deref_arg"
     -- , isSafeWithPreconditions "deref_struct_field.c" "deref_struct_field"
     -- , isSafeWithPreconditions "do_memcpy.c" "do_memcpy"
     -- , isSafeWithPreconditions "do_memset.c" "do_memset"
