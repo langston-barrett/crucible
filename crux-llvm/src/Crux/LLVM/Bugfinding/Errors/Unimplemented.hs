@@ -7,11 +7,25 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE Trustworthy #-}
+
 module Crux.LLVM.Bugfinding.Errors.Unimplemented
   ( unimplemented
   ) where
 
-import Crux.LLVM.Bugfinding.Errors.Panic (HasCallStack, panic)
+import Panic hiding (panic)
+import qualified Panic
+
+data Unimplemented = Unimplemented
+
+instance PanicComponent Unimplemented where
+
+  panicComponentName _ = "crux-llvm bugfinding mode"
+  panicComponentIssues _ = "https://github.com/GaloisInc/crucible/issues"
+
+  {-# NOINLINE panicComponentRevision #-}
+  panicComponentRevision = $useGitRevision
 
 unimplemented ::
   HasCallStack =>
@@ -19,7 +33,8 @@ unimplemented ::
   String {- ^ What's the not-yet supported thing? -} ->
   a
 unimplemented where_ what =
-  panic
+  Panic.panic
+    Unimplemented
     where_
     [ what
     , "is not yet implemented as a feature of crux-llvm bugfinding mode."

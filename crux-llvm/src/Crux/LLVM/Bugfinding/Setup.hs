@@ -48,6 +48,7 @@ import           Crux.LLVM.Overrides (ArchOk)
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor
+import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad
 
 -- TODO unsorted
@@ -137,23 +138,25 @@ generateMinimalValue ::
   Selector argTypes ->
   Setup arch sym argTypes (Crucible.RegValue sym tp)
 generateMinimalValue _proxy sym typeRepr selector =
-  let unimplemented = error ("Unimplemented: " ++ show typeRepr) -- TODO(lb)
-  in
-    case CrucibleTypes.asBaseType typeRepr of
-      CrucibleTypes.AsBaseType baseTypeRepr ->
-        annotatedTerm sym baseTypeRepr selector
-      CrucibleTypes.NotBaseType ->
-        case typeRepr of
-          CrucibleTypes.UnitRepr -> return ()
-          CrucibleTypes.AnyRepr ->
-            -- TODO(lb): Should be made more complex
-            return $ Crucible.AnyValue CrucibleTypes.UnitRepr ()
-          LLVMMem.LLVMPointerRepr w ->
-            do liftIO . LLVMMem.llvmPointer_bv sym =<<
-                 annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
-          CrucibleTypes.VectorRepr _containedTypeRepr -> unimplemented
-          CrucibleTypes.StructRepr _containedTypes -> unimplemented
-          _ -> unimplemented -- TODO(lb)
+  case CrucibleTypes.asBaseType typeRepr of
+    CrucibleTypes.AsBaseType baseTypeRepr ->
+      annotatedTerm sym baseTypeRepr selector
+    CrucibleTypes.NotBaseType ->
+      case typeRepr of
+        CrucibleTypes.UnitRepr -> return ()
+        CrucibleTypes.AnyRepr ->
+          -- TODO(lb): Should be made more complex
+          return $ Crucible.AnyValue CrucibleTypes.UnitRepr ()
+        LLVMMem.LLVMPointerRepr w ->
+          do liftIO . LLVMMem.llvmPointer_bv sym =<<
+                annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
+        CrucibleTypes.VectorRepr _containedTypeRepr ->
+          unin "Can't generate values of vector types"
+        CrucibleTypes.StructRepr _containedTypes ->
+          unin "Can't generate values of struct types"
+        _ ->
+          unin ("Can't generate values of this type: " ++ show typeRepr)
+  where unin = unimplemented "generateMinimalValue"
 
 generateMinimalArgs ::
   forall arch sym argTypes.
@@ -185,7 +188,7 @@ generateMinimalArgs context sym = do
 
 
 constrainHere ::
-  forall proxy arch sym argTypes tp.
+  forall arch sym argTypes tp.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
