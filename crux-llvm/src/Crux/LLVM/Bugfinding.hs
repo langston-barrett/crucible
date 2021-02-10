@@ -76,6 +76,7 @@ import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 import Crux.LLVM.Bugfinding.Classify (partitionExplanations, TruePositive, classify, Explanation(..), ppTruePositive)
 import Crux.LLVM.Bugfinding.Constraints (isEmpty, ppConstraints, emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Context
+import Crux.LLVM.Bugfinding.Errors.Panic (panic)
 import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
 
 -- TODO unsorted
@@ -87,6 +88,7 @@ import Data.List.NonEmpty (NonEmpty((:|)))
 import Prettyprinter (Doc)
 import Data.Void (Void)
 import Data.Semigroup (Semigroup(sconcat))
+import Data.List (intercalate)
 
 class MonadIO m => HasIOLog m
 
@@ -127,7 +129,7 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
          liftIO $ setupExecution sym context preconds
        (mem, argAnnotations, assumptions, args) <-
          case setupResult of
-           Left _err -> error "BLAH ERROR!"
+           Left _err -> error "BLAH ERROR!"  -- TODO(lb)
            Right (SetupResult mem anns assumptions, args) ->
              pure (mem, anns, assumptions, args)
 
@@ -161,7 +163,9 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
              do bb <- readIORef bbMapRef
                 case flip Map.lookup bb . BoolAnn =<<
                        What4.getAnnotation sym (gl ^. Crucible.labeledPred) of
-                  Nothing -> pure ()  -- TODO(lb)
+                  Nothing -> pure ()
+                    -- TODO(lb)
+                    -- panic "simulateLLVM" ["Unexplained error!"]
                   Just badBehavior ->
                     classify context sym args argAnnotations badBehavior >>=
                       modifyIORef explRef . (:)
@@ -174,7 +178,7 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
 data FunctionSummary argTypes
   = FoundBugs (NonEmpty TruePositive)
   | SafeWithPreconditions (Constraints argTypes)
-  | AlwaysSafe
+  | AlwaysSafe -- TODO(lb): This isn't really true until we "deepen" arguments
 
 data BugfindingResult argTypes
   = BugfindingResult
@@ -300,9 +304,17 @@ bugfindingMain ::
   IO ExitCode
 bugfindingMain cruxOpts llvmOpts =
   do Some result <- translateAndLoop cruxOpts llvmOpts
-     TextIO.putStrLn $
+     say "Crux" $
        if null (unclassifiedErrors result)
-       then printFunctionSummary (summary result)
-       else "Couldn't classify the following errors:\n" <>
-              foldMap (Text.pack . show) (unclassifiedErrors result)
+       then Text.unpack (printFunctionSummary (summary result))
+       else unlines
+              [ unwords
+                  [ "Couldn't classify the following errors."
+                  , "They may be true bugs, or they may be due to generated inputs"
+                  , "that don't conform to the function's preconditions."
+                  ]
+              , intercalate
+                  "---------------------\n"
+                  (map show (unclassifiedErrors result))
+              ]
      return ExitSuccess
