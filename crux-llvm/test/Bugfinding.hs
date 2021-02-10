@@ -98,13 +98,13 @@ tests =
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
-    , isUnclassified "do_memcpy.c" "do_memcpy"  -- goal: isSafe
-    , isUnclassified "do_memset.c" "do_memset"  -- goal: isSafe
+    , isUnclassified "do_memcpy.c" "do_memcpy"  -- goal: isSafeWP
+    , isUnclassified "do_memset.c" "do_memset"  -- goal: isSafeWP
     , isUnclassified "oob_read_heap.c" "oob_read_heap"  -- goal: notSafe
     , isUnclassified "oob_read_stack.c" "oob_read_stack"  -- goal: notSafe
     , isUnclassified "ptr_as_array.c" "ptr_as_array"  -- goal: isSafe
     , isUnclassified "sized_array_arg.c" "sized_array_arg"  -- goal: isSafe
     , isUnclassified "uninitialized_stack.c" "uninitialized_stack"  -- goal: notSafe
-    , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafe
-    -- , unimplemented "deref_struct_field.c" "deref_struct_field"
+    , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafeWP
+    , unimplemented "deref_struct_field.c" "deref_struct_field"  -- goal: isSafeWP
     ]
