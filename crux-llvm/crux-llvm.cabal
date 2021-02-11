@@ -45,6 +45,7 @@ library
     Crux.LLVM.Bugfinding.Errors.Panic
     Crux.LLVM.Bugfinding.Errors.Unimplemented
     Crux.LLVM.Bugfinding.Setup
+    Crux.LLVM.Bugfinding.Setup.LocalMem
     Crux.LLVM.Bugfinding.Setup.Monad
     Crux.LLVM.Compile
     Crux.LLVM.Config

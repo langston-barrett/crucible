@@ -10,6 +10,7 @@ Stability    : provisional
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
@@ -62,6 +63,7 @@ import Lang.Crucible.LLVM.MemType (MemType(PtrType), SymType(MemType))
 import Data.Maybe (fromMaybe)
 import Control.Monad.Error.Class (MonadError(throwError))
 import Lang.Crucible.LLVM.TypeContext (asMemType)
+import Lang.Crucible.LLVM.Extension (ArchWidth)
 
 ppRegValue ::
   ( Crucible.IsSymInterface sym
@@ -153,6 +155,7 @@ generateMinimalValue proxy sym typeRepr selector =
           do liftIO . LLVMMem.llvmPointer_bv sym =<<
                 annotatedTerm sym (CrucibleTypes.BaseBVRepr w) selector
         CrucibleTypes.VectorRepr _containedTypeRepr ->
+          -- TODO(lb): These are fixed size. What size should we generate?
           unin "Generating values of vector types"
         CrucibleTypes.StructRepr types ->
           Ctx.generateM
@@ -160,8 +163,7 @@ generateMinimalValue proxy sym typeRepr selector =
             (\idx ->
                Crucible.RV <$>
                  generateMinimalValue  proxy sym (types Ctx.! idx) selector)
-        _ ->
-          unin ("Generating values of this type: " ++ show typeRepr)
+        _ -> unin ("Generating values of this type: " ++ show typeRepr)
   where unin = unimplemented "generateMinimalValue"
 
 generateMinimalArgs ::
@@ -188,10 +190,42 @@ generateMinimalArgs context sym = do
                   sym
                   typeRepr
                   (SelectArgument (Some index) Here))
-  mem <- gets (view setupMem)
+  mem <- gets setupMemImpl
   logRegMap context sym mem args
   return args
 
+-- | If this pointer already points to initialized memory, then just return the
+-- value. Otherwise, allocate some memory and initialize it with a fresh, minimal
+-- value.
+--
+-- TODO: Allow for array initialization
+initialize ::
+  forall arch sym argTypes.
+  ( Crucible.IsSymInterface sym
+  , LLVMMem.HasLLVMAnn sym
+  , ArchOk arch
+  ) =>
+  Context arch argTypes ->
+  sym ->
+  MemType ->
+  Selector argTypes {-^ Top-level selector -} ->
+  LLVMMem.LLVMPtr sym (ArchWidth arch) ->
+  Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch), Some (Crucible.RegEntry sym))
+initialize context sym pointedToType selector pointer =
+  load sym pointer >>=
+    \case
+      Just val -> pure (pointer, val)
+      Nothing ->
+        withTypeContext context $
+          LLVMTrans.llvmTypeAsRepr
+            pointedToType
+            (\tp ->  -- the Crucible type being pointed at
+              do ptr <- malloc sym pointedToType pointer
+                 pointedToVal <-
+                   generateMinimalValue (Proxy :: Proxy arch) sym tp selector
+                 ptr' <-
+                   store sym pointedToType (Crucible.RegEntry tp pointedToVal) ptr
+                 pure (ptr', Some (Crucible.RegEntry tp pointedToVal)))
 
 constrainHere ::
   forall arch sym argTypes tp.
@@ -211,7 +245,7 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
     Allocated ->
       case typeRepr of
         LLVMMem.PtrRepr ->
-          Crucible.RegEntry typeRepr <$> malloc sym memType
+          Crucible.RegEntry typeRepr <$> malloc sym memType regValue
         _ -> throwError (SetupBadConstraintSelector selector memType constraint)
     Aligned alignment ->
       case typeRepr of
@@ -224,17 +258,9 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
       withTypeContext context $
         case (typeRepr, memType) of
           (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
-            LLVMTrans.llvmTypeAsRepr
-              pointedToType
-              (\tp ->  -- the Crucible type being pointed at
-                do ptr <- malloc sym pointedToType
-                   pointedToVal <- generateMinimalValue (Proxy :: Proxy arch) sym tp selector
-                   storageType <- storableType pointedToType
-                   modifyMem $
-                     \mem ->
-                       liftIO $
-                         LLVMMem.doStore sym mem ptr tp storageType noAlignment pointedToVal
-                   pure (Crucible.RegEntry typeRepr ptr))
+            do (ptr, _freshVal) <-
+                 initialize context sym pointedToType selector regValue
+               pure $ Crucible.RegEntry typeRepr ptr
           _ -> throwError (SetupBadConstraintSelector selector memType constraint)
 
 constrainValue ::
@@ -251,9 +277,21 @@ constrainValue ::
   MemType {-^ The \"leaf\" 'MemType', passed directly to 'constrainHere' -} ->
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
-constrainValue context sym constraint selector cursor memType regEntry =
+constrainValue context sym constraint selector cursor memType regEntry@(Crucible.RegEntry typeRepr regValue) =
   case cursor of
     Here -> constrainHere context sym selector constraint memType regEntry
+    Dereference cursor' ->
+      case typeRepr of
+        LLVMMem.PtrRepr ->
+          do -- If there's already a value behind this pointer, constrain that.
+             -- Otherwise, allocate new memory, put a fresh value there, and constrain
+             -- that.
+             (ptr, Some pointedToValue) <-
+               initialize context sym memType selector regValue
+             constrainValue context sym constraint selector cursor' memType pointedToValue
+             pure $ Crucible.RegEntry typeRepr ptr
+        _ -> throwError (SetupBadConstraintSelector selector memType constraint)
+    _ -> unimplemented "constrainValue" "Non-top-level cursors"
 
 constrainOneArgument ::
   forall arch sym argTypes tp.
@@ -320,7 +358,7 @@ setupExecution ::
   sym ->
   Context arch argTypes ->
   Constraints argTypes ->
-  m (Either (SetupError argTypes) (SetupResult sym argTypes, Crucible.RegMap sym argTypes))
+  m (Either (SetupError argTypes) (SetupResult arch sym argTypes, Crucible.RegMap sym argTypes))
 setupExecution sym context preconds = do
   -- TODO(lb): More lazy here?
   let moduleTrans = context ^. moduleTranslation
