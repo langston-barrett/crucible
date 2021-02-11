@@ -31,9 +31,9 @@ module Crux.LLVM.Bugfinding.Setup.LocalMem
   , store
   ) where
 
-import           Control.Lens ((.~), Simple, Lens, lens, (^.))
-import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.State (put, get, MonadState)
+import           Control.Lens (Simple, Lens, lens, (^.))
+import           Control.Monad (join)
+import           Control.Monad.IO.Class (liftIO)
 import           Data.BitVector.Sized (mkBV)
 import qualified Data.Map as Map
 import           Data.Map (Map)
@@ -48,14 +48,12 @@ import qualified Lang.Crucible.Simulator as Crucible
 import           Lang.Crucible.LLVM.Bytes (bytesToInteger)
 import           Lang.Crucible.LLVM.DataLayout (noAlignment, DataLayout, maxAlignment)
 import           Lang.Crucible.LLVM.Extension (ArchWidth)
+import           Lang.Crucible.LLVM.MemModel (StorageType)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
+import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMMem
 import           Lang.Crucible.LLVM.MemType (MemType, memTypeSize)
 
 import           Crux.LLVM.Overrides (ArchOk)
-import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMMem
-import qualified Lang.Crucible.Types as CrucibleTypes
-import Lang.Crucible.LLVM.MemModel (StorageType)
-import Control.Monad (join)
 
 data LocalMem sym
   = LocalMem
@@ -125,23 +123,6 @@ malloc _proxy mem sym dl memType =
                           Nothing
                           (mem ^. localMem)
                      })
-
-malloc' ::
-  ( Crucible.IsSymInterface sym
-  , ArchOk arch
-  , MonadState (LocalMem sym) m
-  , MonadIO m
-  ) =>
-  proxy arch ->
-  sym ->
-  DataLayout ->
-  MemType ->
-  m (LLVMMem.LLVMPtr sym (ArchWidth arch))
-malloc' proxy sym dl memType =
-  do mem <- get
-     (ptr, mem') <- liftIO $ malloc proxy mem sym dl memType
-     put mem'
-     pure ptr
 
 maybeMalloc ::
   ( Crucible.IsSymInterface sym

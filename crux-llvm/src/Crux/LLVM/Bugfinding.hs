@@ -234,7 +234,7 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
      -- Loop, learning preconditions and reporting errors
      let loop truePositives preconditions unclassified =
            do writeIORef explRef []
-              runSim preconditions
+              void $ runSim preconditions
               (newTruePositives, newConstraints0, newUnclassified) <-
                 partitionExplanations <$> readIORef explRef
               let newConstraints = sconcat (emptyCs :| newConstraints0)

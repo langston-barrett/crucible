@@ -57,7 +57,7 @@ import qualified Lumberjack as LJ
 import           Data.Parameterized.Classes (OrdF)
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
-import           Data.Parameterized.Some (Some(Some))
+import           Data.Parameterized.Some (Some)
 
 import qualified What4.Interface as What4
 
@@ -77,13 +77,11 @@ import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
 import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, Cursor, seekMemType)
-import Lang.Crucible.LLVM.DataLayout (noAlignment, maxAlignment)
-import Lang.Crucible.LLVM.MemType (SymType, MemType, memTypeSize)
+import Lang.Crucible.LLVM.MemType (SymType, MemType)
 import Lang.Crucible.LLVM.TypeContext (TypeContext(llvmDataLayout))
 import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
-import Control.Lens.Getter (Getter)
 
 data TypedSelector argTypes tp =
   TypedSelector (Selector argTypes) (CrucibleTypes.BaseTypeRepr tp)
@@ -226,10 +224,10 @@ modifyMem f =
      setupMem .= mem'
      pure val
 
-modifyMem_ ::
+_modifyMem_ ::
   (LocalMem sym -> Setup arch sym argTypes (LocalMem sym)) ->
   Setup arch sym argTypes ()
-modifyMem_ f = modifyMem (fmap ((),) . f)
+_modifyMem_ f = modifyMem (fmap ((),) . f)
 
 malloc ::
   forall sym arch argTypes.
@@ -248,11 +246,11 @@ malloc sym memType ptr =
              LLVMTrans.transContext .
              LLVMTrans.llvmTypeCtx .
              to llvmDataLayout
-     ptr <-
+     ptr' <-
        modifyMem $
          \mem ->
            liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl memType
-     pure ptr
+     pure ptr'
 
 store ::
   forall arch sym argTypes tp.
@@ -273,7 +271,7 @@ store sym memType regEntry ptr =
            LocalMem.store (Proxy :: Proxy arch) mem sym storageType regEntry ptr
 
 load ::
-  forall arch sym argTypes tp.
+  forall arch sym argTypes.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch

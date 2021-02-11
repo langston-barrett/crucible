@@ -55,7 +55,6 @@ import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as LLVMErrors
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
-import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
 import Lang.Crucible.LLVM.Errors (ppBB)
 
@@ -145,7 +144,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
     case badBehavior of
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.WriteBadAlignment ptr alignment) ->
-          case (getPtrOffsetAnn (Crucible.unRV ptr)) of
+          case getPtrOffsetAnn (Crucible.unRV ptr) of
             Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
               do writeLogM $
                    Text.unwords
@@ -166,7 +165,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        (Ctx.size args)
                        idx
                        [ValueConstraint (Aligned alignment) cursor]
-            Nothing -> unclass
+            _ -> unclass
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
@@ -190,7 +189,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        (Ctx.size args)
                        idx
                        [ValueConstraint (Aligned alignment) cursor]
-            Nothing -> unclass
+            _ -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
           (summarizeOp -> (_expl, ptr))
@@ -218,7 +217,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                          idx
                          [ValueConstraint Allocated cursor]
               -- TODO(lb): Something about globals, probably?
-              Nothing -> unclass
+              _ -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
           _op
@@ -244,5 +243,5 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                          idx
                          [ValueConstraint Initialized cursor]
               -- TODO(lb): Something about globals, probably?
-              Nothing -> unclass
+              _ -> unclass
       _ -> unclass

@@ -111,7 +111,7 @@ ppValueConstraint :: ValueConstraint -> Doc Void
 ppValueConstraint = ppValueConstraint' "<top>"
 
 ppConstraints :: Constraints argTypes -> Doc Void
-ppConstraints (Constraints argCs globCs relCs) =
+ppConstraints (Constraints argCs _globCs _relCs) =
   let ppArgC idx (Const constraints) =
         PP.nest
           2

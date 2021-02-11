@@ -23,7 +23,8 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, view, (^.))
+import           Control.Lens (to, (^.))
+import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Text (Text)
 
@@ -38,7 +39,6 @@ import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
 import qualified Lang.Crucible.Types as CrucibleTypes
 
-import           Lang.Crucible.LLVM.DataLayout (noAlignment)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.Globals as LLVMGlobals
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
@@ -59,7 +59,7 @@ import Data.Functor.Const (Const(getConst))
 import Control.Monad.State (gets)
 import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
-import Lang.Crucible.LLVM.MemType (MemType(PtrType), SymType(MemType))
+import Lang.Crucible.LLVM.MemType (MemType(PtrType))
 import Data.Maybe (fromMaybe)
 import Control.Monad.Error.Class (MonadError(throwError))
 import Lang.Crucible.LLVM.TypeContext (asMemType)
@@ -262,6 +262,7 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
                  initialize context sym pointedToType selector regValue
                pure $ Crucible.RegEntry typeRepr ptr
           _ -> throwError (SetupBadConstraintSelector selector memType constraint)
+    _ -> unimplemented "constrainHere" ("Constraint:" ++ show (ppConstraint constraint))
 
 constrainValue ::
   forall arch sym argTypes tp.
@@ -288,7 +289,7 @@ constrainValue context sym constraint selector cursor memType regEntry@(Crucible
              -- that.
              (ptr, Some pointedToValue) <-
                initialize context sym memType selector regValue
-             constrainValue context sym constraint selector cursor' memType pointedToValue
+             void $ constrainValue context sym constraint selector cursor' memType pointedToValue
              pure $ Crucible.RegEntry typeRepr ptr
         _ -> throwError (SetupBadConstraintSelector selector memType constraint)
     _ -> unimplemented "constrainValue" "Non-top-level cursors"
