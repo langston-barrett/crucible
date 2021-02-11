@@ -111,7 +111,7 @@ ppValueConstraint :: ValueConstraint -> Doc Void
 ppValueConstraint = ppValueConstraint' "<top>"
 
 ppConstraints :: Constraints argTypes -> Doc Void
-ppConstraints (Constraints argCs _globCs _relCs) =
+ppConstraints (Constraints argCs globCs _relCs) =
   let ppArgC idx (Const constraints) =
         PP.nest
           2
@@ -119,9 +119,14 @@ ppConstraints (Constraints argCs _globCs _relCs) =
                    -- TODO: Use argument names
                    : map ppValueConstraint constraints
                    ))
-      -- ppGlobC symb constraint = PP.pretty "Constraint on global " <> _
-  -- TODO: print globCs, relCs
-  in PP.vsep $ toListWithIndex ppArgC argCs
+      ppGlobC (L.Symbol sym) constraints =
+        PP.nest
+          2
+          (PP.vsep ( PP.pretty "Global " <> PP.pretty sym
+                   : map ppValueConstraint constraints
+                   ))
+  -- TODO: print relCs
+  in PP.vsep $ toListWithIndex ppArgC argCs ++ map (uncurry ppGlobC) (Map.toList globCs)
   where
     toListWithIndex :: (forall tp. Ctx.Index ctx tp -> f tp -> a)
                     -> Ctx.Assignment f ctx
