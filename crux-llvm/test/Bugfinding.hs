@@ -5,6 +5,7 @@
 
 module Bugfinding (tests) where
 
+import qualified Data.Text as Text
 import System.FilePath ((</>))
 import System.IO (IOMode(WriteMode), withFile)
 
@@ -20,7 +21,7 @@ import           Crux.LLVM.Config (LLVMOptions(entryPoint), llvmCruxConfig)
 
 -- Code being tested
 import           Crux.LLVM.Bugfinding
-  (BugfindingResult(..), FunctionSummary(..), translateAndLoop)
+  (BugfindingResult(..), FunctionSummary(..), translateAndLoop, printFunctionSummary)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (catchUnimplemented)
 
 testDir :: FilePath
@@ -35,6 +36,7 @@ findBugs file fn =
               do (cruxOpts, llvmOpts) <-
                    processLLVMOptions ( initCrux { Crux.inputFiles = [testDir </> file]
                                                  , Crux.loopBound = Just 8
+                                                 , Crux.recursionBound = Just 8
                                                  }
                                       , initLlvm { entryPoint = fn }
                                       )
@@ -66,14 +68,21 @@ isSafeWithPreconditions file fn =
        0 TH.@=? length (unclassifiedErrors result)
        case summary result of
          SafeWithPreconditions _preconditions -> pure ()
-         _ -> TH.assertFailure (unwords ["Expected", fn, "to be safe with preconditions"])
+         _ -> TH.assertFailure
+                (unwords ["Expected", fn, "to be safe with preconditions"
+                         , "but the result was"
+                         , Text.unpack (printFunctionSummary (summary result))
+                         ])
 
 isUnclassified :: FilePath -> String -> TT.TestTree
 isUnclassified file fn =
   TH.testCase (fn <> " is unclassified") $
     do Some result <- findBugs file fn
        0 < length (unclassifiedErrors result) TH.@?
-          (unwords ["Expected", fn, "to be safe with preconditions"])
+           (unwords ["Expected", fn, "to be unclassified"
+                    , "but the result was"
+                    , Text.unpack (printFunctionSummary (summary result))
+                    ])
 
 unimplemented :: FilePath -> String -> TT.TestTree
 unimplemented file fn =
@@ -81,7 +90,12 @@ unimplemented file fn =
     catchUnimplemented (findBugs file fn) >>=
       \case
         Left _msg -> pure ()
-        Right _ -> TH.assertFailure (unwords ["Expected", fn, "to be unimplemented"])
+        Right (Some result) ->
+          TH.assertFailure
+            (unwords ["Expected", fn, "to be unimplemented"
+                     , "but the result was"
+                     , Text.unpack (printFunctionSummary (summary result))
+                     ])
 
 tests :: TT.TestTree
 tests =
@@ -89,6 +103,7 @@ tests =
     [ isSafe "add1.c" "add1"
     , isSafe "branch.c" "branch"
     , isSafe "compare_to_null.c" "compare_to_null"
+    , isSafe "factorial.c" "factorial"  -- TODO only up to the recursion bound?
     , isSafe "loop_arg_bound.c" "loop_arg_bound"
     , isSafe "loop_constant_bound_arg_start.c" "loop_constant_bound_arg_start"
     , isSafe "print.c" "print"
