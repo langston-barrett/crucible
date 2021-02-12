@@ -122,4 +122,6 @@ tests =
     , isUnclassified "sized_array_arg.c" "sized_array_arg"  -- goal: isSafe
     , isUnclassified "uninitialized_stack.c" "uninitialized_stack"  -- goal: notSafe
     , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafeWP
+    -- TODO: cxxbasic, call_function_pointer, add1_float, add1_double, nested_structs
+    -- TODO: tests from renovate?
     ]
