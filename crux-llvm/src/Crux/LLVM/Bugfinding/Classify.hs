@@ -153,6 +153,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                      , "#" <> Text.pack (show (Ctx.indexVal idx))
                      , "at"
                      , Text.pack (show (ppCursor (argName idx) cursor))
+                     , "(" <> Text.pack (show (LLVMPointer.ppPtr (Crucible.unRV ptr))) <> ")"
                      ]
                  writeLogM $
                    Text.unwords
@@ -177,6 +178,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                      , "#" <> Text.pack (show (Ctx.indexVal idx))
                      , "at"
                      , Text.pack (show (ppCursor (argName idx) cursor))
+                     , "(" <> Text.pack (show (LLVMPointer.ppPtr (Crucible.unRV ptr))) <> ")"
                      ]
                  writeLogM $
                    Text.unwords
@@ -204,6 +206,8 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                         , "#" <> Text.pack (show (Ctx.indexVal idx))
                         , "at"
                         , Text.pack (show (ppCursor (argName idx) cursor))
+                        , "(allocation: " <> Text.pack (show (What4.printSymExpr (LLVMPointer.llvmPointerBlock ptr)))  <> ")"
+                        , "(" <> Text.pack (show (LLVMPointer.ppPtr ptr)) <> ")"
                         ]
                    writeLogM $
                      Text.unwords
@@ -230,6 +234,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        , "#" <> Text.pack (show (Ctx.indexVal idx))
                        , "at"
                        , Text.pack (show (ppCursor (argName idx) cursor))
+                       , "(" <> Text.pack (show (LLVMPointer.ppPtr ptr)) <> ")"
                        ]
                    writeLogM $
                      Text.unwords
