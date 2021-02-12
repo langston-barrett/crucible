@@ -44,6 +44,7 @@ library
     Crux.LLVM.Bugfinding.Cursor
     Crux.LLVM.Bugfinding.Errors.Panic
     Crux.LLVM.Bugfinding.Errors.Unimplemented
+    Crux.LLVM.Bugfinding.FullType
     Crux.LLVM.Bugfinding.Setup
     Crux.LLVM.Bugfinding.Setup.LocalMem
     Crux.LLVM.Bugfinding.Setup.Monad
@@ -76,6 +77,7 @@ library
     process,
     template-haskell,
     text,
+    vector,
     what4
   ghc-options: -Wall -Wcompat -Werror=incomplete-patterns -Werror=missing-methods -Werror=overlapping-patterns
   ghc-prof-options: -O2
@@ -170,7 +172,7 @@ test-suite crux-llvm-test
   type: exitcode-stdio-1.0
   hs-source-dirs: test
 
-  ghc-options: -Wall -Wcompat -Werror=incomplete-patterns -Werror=missing-methods -Werror=overlapping-patterns -prof -fprof-auto
+  ghc-options: -Wall -Wcompat -Werror=incomplete-patterns -Werror=missing-methods -Werror=overlapping-patterns
   ghc-prof-options: -O2
 
   main-is: Test.hs

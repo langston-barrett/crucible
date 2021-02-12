@@ -51,6 +51,10 @@ import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 import           Lang.Crucible.LLVM.TypeContext (TypeContext)
 import           Lang.Crucible.LLVM.Run (withPtrWidthOf)
 
+import           Crux.LLVM.Overrides (ArchOk)
+
+import           Crux.LLVM.Bugfinding.FullType
+
 -- TODO(lb): Split into module-level and function-level?
 data Context arch argTypes =
   Context
@@ -59,6 +63,7 @@ data Context arch argTypes =
     , _argumentTypes :: CrucibleTypes.CtxRepr argTypes
     , _argumentMemTypes :: Ctx.Assignment (Const MemType) argTypes
     , _argumentStorageTypes :: Ctx.Assignment (Const StorageType) argTypes
+    , _argumentFullTypes :: Ctx.Assignment (FullTypeFromCrucible arch) argTypes
     , _llvmModule :: Module
     , _moduleTranslation :: ModuleTranslation arch
     }
@@ -99,11 +104,13 @@ data ContextError
   -- ^ Wrong number of arguments after lifting declaration
   | BadMemType MemType
   -- ^ Couldn't lift a 'MemType' to a 'StorageType'
+  | FullTypeTranslation
 
 -- | This function does some precomputation of ubiquitously used values, and
 -- some handling of what should generally be very rare errors.
 makeContext ::
   forall arch argTypes.
+  ArchOk arch =>
   Text ->
   CrucibleTypes.CtxRepr argTypes ->
   Module ->
@@ -134,6 +141,13 @@ makeContext entry argTypes llvmMod trans =
               case toStorableType memType of
                 Just storeTy -> Right (Const storeTy)
                 Nothing -> Left (BadMemType memType))
+
+     argFullTypes <-
+       let ?lc = trans ^. LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
+       in case assignmentToFullType trans argTypes argMemTypes of
+            Just fullTypes -> Right fullTypes
+            Nothing -> Left FullTypeTranslation
+
      pure $
        Context
          { _functionName = entry
@@ -146,6 +160,7 @@ makeContext entry argTypes llvmMod trans =
                  (fmap (First . Just) (debugInfoArgNames llvmMod def)))
          , _argumentMemTypes = argMemTypes
          , _argumentStorageTypes = argStorageTypes
+         , _argumentFullTypes = argFullTypes
          , _llvmModule = llvmMod
          , _moduleTranslation = trans
          }
