@@ -209,7 +209,7 @@ initialize ::
   Context arch argTypes ->
   sym ->
   MemType ->
-  Selector argTypes {-^ Top-level selector -} ->
+  Selector argTypes {-^ Selector for the pointer -} ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch), Some (Crucible.RegEntry sym))
 initialize context sym pointedToType selector pointer =
@@ -248,17 +248,17 @@ constrainHere ::
 constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
   do writeLogM ("Constraining value at: " <> Text.pack (show (ppCursor "<top>" (selector ^. selectorCursor))))
      writeLogM ("Constraint: " <> Text.pack (show (ppConstraint constraint)))
-     let showMe :: forall t ann. Crucible.RegEntry sym t -> Setup arch sym argTypes (Doc ann)
-         showMe regEnt =
+     let showMe :: forall t ann. Crucible.RegEntry sym t -> MemType -> Setup arch sym argTypes (Doc ann)
+         showMe regEnt memTy =
            do mem <- gets setupMemImpl
-              storableTy <- storableType memType
+              storableTy <- storableType memTy
               liftIO $ ppRegValue (Proxy :: Proxy arch) sym mem storableTy regEnt
      case constraint of
        Allocated ->
          case typeRepr of
            LLVMMem.PtrRepr ->
              do regEntry' <- Crucible.RegEntry typeRepr <$> malloc sym memType regValue
-                pretty <- showMe regEntry'
+                pretty <- showMe regEntry' memType
                 writeLogM ("Constrained value : " <> Text.pack (show pretty))
                 pure regEntry'
            _ -> throwError (SetupBadConstraintSelector selector memType constraint)
@@ -274,11 +274,10 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
            case (typeRepr, memType) of
              (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
                do (ptr, Some freshVal) <-
-                    -- TODO(lb): This selector is wrong?
                     initialize context sym pointedToType selector regValue
                   let regEntry' = Crucible.RegEntry typeRepr ptr
-                  prettyPtr <- showMe regEntry'
-                  prettyVal <- showMe freshVal
+                  prettyPtr <- showMe regEntry' memType
+                  prettyVal <- showMe freshVal pointedToType
                   writeLogM ("Initialized pointer: " <> Text.pack (show prettyPtr))
                   writeLogM ("Pointed-to value: " <> Text.pack (show prettyVal))
                   pure regEntry'
