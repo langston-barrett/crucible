@@ -174,6 +174,30 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
 
        return (Crux.RunnableState initSt, explainFailure)
 
+runSimulator ::
+  ( ?outputConfig ::  OutputConfig
+  , ArchOk arch
+  ) =>
+  Context arch argTypes ->
+  HandleAllocator ->
+  Constraints argTypes ->
+  CFG (LLVM arch) blocks argTypes ret ->
+  CruxOptions ->
+  MemOptions ->
+  IO [Explanation argTypes]
+runSimulator context halloc preconditions cfg cruxOpts memOptions =
+  do explRef <- newIORef []
+     Crux.runSimulator
+       cruxOpts
+       (simulateLLVM
+         halloc
+         context
+         explRef
+         preconditions
+         cfg
+         memOptions)
+     readIORef explRef
+
 -- | The outer loop of bugfinding mode
 
 data FunctionSummary argTypes
@@ -216,27 +240,14 @@ bugfindingLoop ::
   HandleAllocator ->
   IO (BugfindingResult argTypes)
 bugfindingLoop context cfg cruxOpts memOptions halloc =
-  do -- First translate the LLVM module into Crucible
-     let emptyCs = emptyConstraints (Ctx.size (cfgArgTypes cfg))
-     explRef <- newIORef []
-
+  do let emptyCs = emptyConstraints (Ctx.size (cfgArgTypes cfg))
      let runSim preconds =
-           Crux.runSimulator
-             cruxOpts
-             (simulateLLVM
-                halloc
-                context
-                explRef
-                preconds
-                cfg
-                memOptions)
+           runSimulator context halloc preconds cfg cruxOpts memOptions
 
      -- Loop, learning preconditions and reporting errors
      let loop truePositives preconditions unclassified =
-           do writeIORef explRef []
-              void $ runSim preconditions
-              (newTruePositives, newConstraints0, newUnclassified) <-
-                partitionExplanations <$> readIORef explRef
+           do (newTruePositives, newConstraints0, newUnclassified) <-
+                partitionExplanations <$> runSim preconditions
               let newConstraints = sconcat (emptyCs :| newConstraints0)
               let allTruePositives = truePositives <> newTruePositives
               let allPreconditions = preconditions <> newConstraints
