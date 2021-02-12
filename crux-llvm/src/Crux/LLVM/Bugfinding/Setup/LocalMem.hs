@@ -44,6 +44,7 @@ import qualified What4.Interface as What4
 
 import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
+import           Lang.Crucible.Types as CrucibleTypes
 
 import           Lang.Crucible.LLVM.Bytes (bytesToInteger)
 import           Lang.Crucible.LLVM.DataLayout (noAlignment, DataLayout, maxAlignment)
@@ -74,6 +75,21 @@ localMem = lens _localMem (\s v -> s { _localMem = v })
 globalMem :: Simple Lens (LocalMem sym) (LLVMMem.MemImpl sym)
 globalMem = lens _globalMem (\s v -> s { _globalMem = v })
 
+-- | Retrieve a pre-existing annotation for a pointer, or make a new one.
+getAnnotation ::
+  ( Crucible.IsSymInterface sym
+  ) =>
+  proxy arch ->
+  sym ->
+  LLVMMem.LLVMPtr sym (ArchWidth arch) ->
+  IO ( What4.SymAnnotation sym (CrucibleTypes.BaseBVType (ArchWidth arch))
+     , LLVMMem.LLVMPtr sym (ArchWidth arch)
+     )
+getAnnotation _proxy sym ptr =
+  case What4.getAnnotation sym (LLVMMem.llvmPointerOffset ptr) of
+    Just annotation -> pure (annotation, ptr)
+    Nothing -> liftIO $ LLVMMem.annotatePointerOffset sym ptr
+
 load ::
   ( Crucible.IsSymInterface sym
   , ArchOk arch
@@ -98,7 +114,7 @@ malloc ::
   DataLayout ->
   MemType ->
   IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem sym)
-malloc _proxy mem sym dl memType =
+malloc proxy mem sym dl memType =
   do (ptr, globalMem') <-
        liftIO $
          do sizeBv <-
@@ -114,8 +130,7 @@ malloc _proxy mem sym dl memType =
               (mem ^. globalMem)
               sizeBv
               (maxAlignment dl) -- TODO is this OK?
-     (annotation, ptr') <-
-        liftIO $ LLVMMem.annotatePointerOffset sym ptr
+     (annotation, ptr') <- getAnnotation proxy sym ptr
      pure (ptr', mem { _globalMem = globalMem'
                      , _localMem =
                         Map.insert
@@ -152,11 +167,8 @@ store ::
   Crucible.RegEntry sym tp ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem sym)
-store _proxy mem sym storageType regEntry@(Crucible.RegEntry typeRepr regValue) ptr =
-  do (annotation, ptr') <-
-       case What4.getAnnotation sym (LLVMMem.llvmPointerOffset ptr) of
-         Just annotation -> pure (annotation, ptr)
-         Nothing -> LLVMMem.annotatePointerOffset sym ptr
+store proxy mem sym storageType regEntry@(Crucible.RegEntry typeRepr regValue) ptr =
+  do (annotation, ptr') <- getAnnotation proxy sym ptr
      globalMem' <- LLVMMem.doStore sym (mem ^. globalMem) ptr' typeRepr storageType noAlignment regValue
      pure $
        ( ptr'
