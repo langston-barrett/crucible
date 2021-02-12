@@ -28,7 +28,7 @@ testDir = "tests/bugfinding"
 
 findBugs :: FilePath -> String -> IO (Some BugfindingResult)
 findBugs file fn =
-  do withFile (testDir </> "output") WriteMode $ \h ->
+  do withFile (testDir </> file <> ".output") WriteMode $ \h ->
        do let outCfg = Crux.OutputConfig False h h True
           (cruxOpts, llvmOpts) <-
             Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \(initCrux, initLlvm) ->

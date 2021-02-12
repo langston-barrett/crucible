@@ -150,6 +150,8 @@ oneArgumentConstraint sz idx constraints =
 
 
 -- | Union
+--
+-- TODO: Merge identical constraints?
 instance Semigroup (Constraints types) where
   cs1 <> cs2 =
     Constraints

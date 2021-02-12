@@ -154,7 +154,7 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
                runOverrideSim CrucibleTypes.UnitRepr $
                  do -- TODO(lb): Do this lazily
                     registerFunctions (context ^. llvmModule) trans
-                    liftIO $ writeLogM ("Running function on arguments..." :: Text)
+                    liftIO $ writeLogM ("Running " <> context ^. functionName <> " on arguments..." :: Text)
                     liftIO $ logRegMap context sym mem args
                     void $ callCFG cfg args
 

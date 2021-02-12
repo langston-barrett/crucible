@@ -23,9 +23,10 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, (^.))
+import           Control.Lens (to, (^.), (%~))
 import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Data.Function ((&))
 import           Data.Text (Text)
 
 import           Lumberjack (HasLog, writeLogM)
@@ -107,10 +108,8 @@ logRegMap context sym mem (Crucible.RegMap regmap) =
              ppRegValue (Proxy :: Proxy arch) sym mem storageType regEntry
          writeLogM $
            Text.unwords
-             [ "Argument"
-             , fromMaybe
-                 (Text.pack (show (Ctx.indexVal index)) <> ":")
-                 (context ^. argumentNames . ixF' index . to getConst)
+             [ "Argument #" <> Text.pack (show (Ctx.indexVal index))
+             , fromMaybe "" (context ^. argumentNames . ixF' index . to getConst) <> ":"
              , Text.pack (show arg)
              -- , "(type:"
              -- , Text.pack (show (Crucible.regType arg)) <> ")"
@@ -139,7 +138,7 @@ generateMinimalValue ::
   proxy arch ->
   sym ->
   CrucibleTypes.TypeRepr tp ->
-  Selector argTypes ->
+  Selector argTypes {-^ Path to this value -} ->
   Setup arch sym argTypes (Crucible.RegValue sym tp)
 generateMinimalValue proxy sym typeRepr selector =
   case CrucibleTypes.asBaseType typeRepr of
@@ -162,6 +161,7 @@ generateMinimalValue proxy sym typeRepr selector =
             (Ctx.size types)
             (\idx ->
                Crucible.RV <$>
+                 -- TODO(lb): This selector is wrong
                  generateMinimalValue  proxy sym (types Ctx.! idx) selector)
         _ -> unin ("Generating values of this type: " ++ show typeRepr)
   where unin = unimplemented "generateMinimalValue"
@@ -222,7 +222,11 @@ initialize context sym pointedToType selector pointer =
             (\tp ->  -- the Crucible type being pointed at
               do ptr <- malloc sym pointedToType pointer
                  pointedToVal <-
-                   generateMinimalValue (Proxy :: Proxy arch) sym tp selector
+                   generateMinimalValue
+                     (Proxy :: Proxy arch)
+                     sym
+                     tp
+                     (selector & selectorCursor %~ Dereference)
                  ptr' <-
                    store sym pointedToType (Crucible.RegEntry tp pointedToVal) ptr
                  pure (ptr', Some (Crucible.RegEntry tp pointedToVal)))
@@ -259,6 +263,7 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
         case (typeRepr, memType) of
           (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
             do (ptr, _freshVal) <-
+                 -- TODO(lb): This selector is wrong
                  initialize context sym pointedToType selector regValue
                pure $ Crucible.RegEntry typeRepr ptr
           _ -> throwError (SetupBadConstraintSelector selector memType constraint)
@@ -337,15 +342,16 @@ constrain ::
   Setup arch sym argTypes (Crucible.RegMap sym argTypes)
 constrain context sym preconds (Crucible.RegMap args) =
   do writeLogM ("Establishing preconditions..." :: Text)
-     writeLogM ("Modifying arguments..." :: Text)
      args' <-
        Ctx.traverseWithIndex
-         (\idx ->
-            constrainOneArgument
-              context
-              sym
-              (getConst (argConstraints preconds Ctx.! idx))
-              (Some idx))
+         (\idx regEntry ->
+            do writeLogM ("Modifying argument #" <> Text.pack (show (Ctx.indexVal idx)))
+               constrainOneArgument
+                 context
+                 sym
+                 (getConst (argConstraints preconds Ctx.! idx))
+                 (Some idx)
+                 regEntry)
          args
      return (Crucible.RegMap args')
 

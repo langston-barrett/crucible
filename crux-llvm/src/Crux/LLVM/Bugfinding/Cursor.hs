@@ -20,12 +20,14 @@ module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
   , ppCursor
   , Selector(..)
+  , selectorCursor
   , TypeSeekError(..)
   , ppTypeSeekError
   , seekLlvmType
   , seekMemType
   ) where
 
+import           Control.Lens (Simple, Lens, lens)
 import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 import           Data.Word (Word64)
@@ -70,6 +72,17 @@ data Selector (argTypes :: Ctx CrucibleType)
   = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
   | SelectGlobal !L.Symbol Cursor
   deriving Eq
+
+selectorCursor :: Simple Lens (Selector argTypes) Cursor
+selectorCursor =
+  lens
+    (\case
+      SelectArgument _ cursor -> cursor
+      SelectGlobal _ cursor -> cursor)
+    (\s v ->
+      case s of
+        SelectArgument arg _ -> SelectArgument arg v
+        SelectGlobal glob _ -> SelectGlobal glob v)
 
 data TypeSeekError ty
   = ArrayIndexOutOfBounds !Word64 !Word64 ty
