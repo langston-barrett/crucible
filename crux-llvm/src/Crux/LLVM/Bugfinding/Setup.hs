@@ -245,29 +245,44 @@ constrainHere ::
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
 constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
-  case constraint of
-    Allocated ->
-      case typeRepr of
-        LLVMMem.PtrRepr ->
-          Crucible.RegEntry typeRepr <$> malloc sym memType regValue
-        _ -> throwError (SetupBadConstraintSelector selector memType constraint)
-    Aligned alignment ->
-      case typeRepr of
-        LLVMMem.PtrRepr ->
-          do assume constraint =<<
-               liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
-             pure regEntry
-        _ -> throwError (SetupBadConstraintSelector selector memType constraint)
-    Initialized ->
-      withTypeContext context $
-        case (typeRepr, memType) of
-          (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
-            do (ptr, _freshVal) <-
-                 -- TODO(lb): This selector is wrong
-                 initialize context sym pointedToType selector regValue
-               pure $ Crucible.RegEntry typeRepr ptr
-          _ -> throwError (SetupBadConstraintSelector selector memType constraint)
-    _ -> unimplemented "constrainHere" ("Constraint:" ++ show (ppConstraint constraint))
+  do writeLogM ("Constraining value at: " <> Text.pack (show (ppCursor "<top>" (selector ^. selectorCursor))))
+     writeLogM ("Constraint: " <> Text.pack (show (ppConstraint constraint)))
+     let showMe :: forall t ann. Crucible.RegEntry sym t -> Setup arch sym argTypes (Doc ann)
+         showMe regEnt =
+           do mem <- gets setupMemImpl
+              storableTy <- storableType memType
+              liftIO $ ppRegValue (Proxy :: Proxy arch) sym mem storableTy regEnt
+     case constraint of
+       Allocated ->
+         case typeRepr of
+           LLVMMem.PtrRepr ->
+             do regEntry' <- Crucible.RegEntry typeRepr <$> malloc sym memType regValue
+                pretty <- showMe regEntry'
+                writeLogM ("Constrained value : " <> Text.pack (show pretty))
+                pure regEntry'
+           _ -> throwError (SetupBadConstraintSelector selector memType constraint)
+       Aligned alignment ->
+         case typeRepr of
+           LLVMMem.PtrRepr ->
+             do assume constraint =<<
+                  liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
+                pure regEntry
+           _ -> throwError (SetupBadConstraintSelector selector memType constraint)
+       Initialized ->
+         withTypeContext context $
+           case (typeRepr, memType) of
+             (LLVMMem.PtrRepr, PtrType (asMemType -> Right pointedToType)) ->
+               do (ptr, Some freshVal) <-
+                    -- TODO(lb): This selector is wrong?
+                    initialize context sym pointedToType selector regValue
+                  let regEntry' = Crucible.RegEntry typeRepr ptr
+                  prettyPtr <- showMe regEntry'
+                  prettyVal <- showMe freshVal
+                  writeLogM ("Initialized pointer: " <> Text.pack (show prettyPtr))
+                  writeLogM ("Pointed-to value: " <> Text.pack (show prettyVal))
+                  pure regEntry'
+             _ -> throwError (SetupBadConstraintSelector selector memType constraint)
+       _ -> unimplemented "constrainHere" ("Constraint:" ++ show (ppConstraint constraint))
 
 constrainValue ::
   forall arch sym argTypes tp.
