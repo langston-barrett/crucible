@@ -191,5 +191,5 @@ debugInfoArgNames m d =
                        , L.dilvArg = a
                        , L.dilvName = Just n
                        })}:xs) =
-              if s == s' then Map.insert (fromIntegral a) (Text.pack n) $ go xs else go xs
+              if s == s' then Map.insert (fromIntegral a - 1) (Text.pack n) $ go xs else go xs
             go (_:xs) = go xs
