@@ -28,6 +28,7 @@ module Crux.LLVM.Bugfinding.Classify
 import           Control.Lens (to, (^.))
 import           Control.Monad.IO.Class (MonadIO)
 import           Data.Functor.Const (Const(getConst))
+import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
 import           Data.Void (Void)
@@ -165,7 +166,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                      oneArgumentConstraint
                        (Ctx.size args)
                        idx
-                       [ValueConstraint (Aligned alignment) cursor]
+                       (Set.singleton (ValueConstraint (Aligned alignment) cursor))
             _ -> unclass
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
@@ -190,7 +191,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                      oneArgumentConstraint
                        (Ctx.size args)
                        idx
-                       [ValueConstraint (Aligned alignment) cursor]
+                       (Set.singleton (ValueConstraint (Aligned alignment) cursor))
             _ -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
@@ -219,7 +220,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        oneArgumentConstraint
                          (Ctx.size args)
                          idx
-                         [ValueConstraint Allocated cursor]
+                         (Set.singleton (ValueConstraint Allocated cursor))
               -- TODO(lb): Something about globals, probably?
               _ -> unclass
       LLVMErrors.BBMemoryError
@@ -246,7 +247,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                        oneArgumentConstraint
                          (Ctx.size args)
                          idx
-                         [ValueConstraint Initialized cursor]
+                         (Set.singleton (ValueConstraint Initialized cursor))
               -- TODO(lb): Something about globals, probably?
               _ -> unclass
       _ -> unclass

@@ -25,7 +25,7 @@ import Data.Foldable (for_)
 import qualified Data.Map.Strict as Map
 import Data.IORef
 import Control.Lens ((^.), view)
-import Control.Monad (void)
+import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text (Text)
 import qualified Data.Text.IO as TextIO
@@ -260,6 +260,8 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
                      else
                        do say "Crux" "New preconditions:"
                           say "Crux" (show (ppConstraints newConstraints))
+                          when (allPreconditions == preconditions) $
+                            panic "bugfindingLoop" ["Redundant constraints!"]
                           loop allTruePositives allPreconditions allUnclassified
 
      loop [] (emptyConstraints (Ctx.size (cfgArgTypes cfg))) []

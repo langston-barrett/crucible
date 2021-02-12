@@ -31,6 +31,8 @@ import           Control.Lens (set)
 import           Data.Functor.Const
 import           Data.Map (Map)
 import qualified Data.Map as Map
+import           Data.Set (Set)
+import qualified Data.Set as Set
 import           Data.Void (Void)
 
 import           Prettyprinter (Doc)
@@ -57,42 +59,64 @@ data Constraint
   -- ^ This pointer has at least this alignment
   | SizeAtLeast !Int
   -- ^ The allocation backing this pointer has at least this size
-  deriving Eq
+  deriving (Eq, Ord)
 
 data ValueConstraint
   = ValueConstraint
       { constraintBody :: Constraint
       , constraintCursor :: Cursor
       }
-  deriving Eq
+  deriving (Eq, Ord)
 
 -- | A (possibly) \"relational\" constraint across several values.
 data RelationalConstraint argTypes
   = SizeOfAllocation (Selector argTypes) (Selector argTypes)
   -- ^ The first argument (a bitvector) is equal to the size of the allocation
   -- pointed to by the second
-  deriving Eq
+  deriving (Eq, Ord)
 
 data Constraints argTypes
   = Constraints
-      { argConstraints :: Ctx.Assignment (Const [ValueConstraint]) argTypes
-      , globalConstraints :: Map L.Symbol [ValueConstraint]
-      , relationalConstraints :: [RelationalConstraint argTypes]
+      { argConstraints :: Ctx.Assignment (Const (Set ValueConstraint)) argTypes
+      , globalConstraints :: Map L.Symbol (Set ValueConstraint)
+      , relationalConstraints :: Set (RelationalConstraint argTypes)
+      }
+
+instance Eq (Constraints argTypes) where
+  cs1 == cs2 =
+    and [ toListFC getConst (argConstraints cs1) == toListFC getConst (argConstraints cs2)
+        , globalConstraints cs1 == globalConstraints cs2
+        , relationalConstraints cs1 == relationalConstraints cs2
+        ]
+
+-- | Union
+--
+-- TODO: Merge identical constraints?
+instance Semigroup (Constraints types) where
+  cs1 <> cs2 =
+    Constraints
+      { argConstraints =
+          Ctx.zipWith
+            (\e1 e2 -> Const (getConst e1 <> getConst e2))
+            (argConstraints cs1)
+            (argConstraints cs2)
+      , globalConstraints = globalConstraints cs1 <> globalConstraints cs2
+      , relationalConstraints = relationalConstraints cs1 <> relationalConstraints cs2
       }
 
 emptyConstraints :: Ctx.Size argTypes -> Constraints argTypes
 emptyConstraints sz =
   Constraints
-    { argConstraints = Ctx.generate sz (\_index -> Const [])
+    { argConstraints = Ctx.generate sz (\_index -> Const Set.empty)
     , globalConstraints = Map.empty
-    , relationalConstraints = []
+    , relationalConstraints = Set.empty
     }
 
 isEmpty :: Constraints argTypes -> Bool
 isEmpty (Constraints argCs globCs relCs) =
-  and [ allFC ((== []) . getConst) argCs
+  and [ allFC ((== Set.empty) . getConst) argCs
       , globCs == Map.empty
-      , relCs == []
+      , relCs == Set.empty
       ]
 
 ppConstraint :: Constraint -> Doc Void
@@ -117,13 +141,13 @@ ppConstraints (Constraints argCs globCs _relCs) =
           2
           (PP.vsep ( PP.pretty "Argument #" <> PP.viaShow (Ctx.indexVal idx)
                    -- TODO: Use argument names
-                   : map ppValueConstraint constraints
+                   : map ppValueConstraint (Set.toList constraints)
                    ))
       ppGlobC (L.Symbol sym) constraints =
         PP.nest
           2
           (PP.vsep ( PP.pretty "Global " <> PP.pretty sym
-                   : map ppValueConstraint constraints
+                   : map ppValueConstraint (Set.toList constraints)
                    ))
   -- TODO: print relCs
   in PP.vsep $ toListWithIndex ppArgC argCs ++ map (uncurry ppGlobC) (Map.toList globCs)
@@ -139,7 +163,7 @@ ppConstraints (Constraints argCs globCs _relCs) =
 oneArgumentConstraint ::
   Ctx.Size argTypes ->
   Ctx.Index argTypes tp ->
-  [ValueConstraint] ->
+  Set (ValueConstraint) ->
   Constraints argTypes
 oneArgumentConstraint sz idx constraints =
   let empty = emptyConstraints sz
@@ -147,19 +171,3 @@ oneArgumentConstraint sz idx constraints =
        { argConstraints =
            set (ixF idx) (Const constraints) (argConstraints empty)
        }
-
-
--- | Union
---
--- TODO: Merge identical constraints?
-instance Semigroup (Constraints types) where
-  cs1 <> cs2 =
-    Constraints
-      { argConstraints =
-          Ctx.zipWith
-            (\e1 e2 -> Const (getConst e1 <> getConst e2))
-            (argConstraints cs1)
-            (argConstraints cs2)
-      , globalConstraints = globalConstraints cs1 <> globalConstraints cs2
-      , relationalConstraints = relationalConstraints cs1 <> relationalConstraints cs2
-      }

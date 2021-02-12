@@ -27,6 +27,7 @@ import           Control.Lens (to, (^.), (%~))
 import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
+import qualified Data.Set as Set
 import           Data.Text (Text)
 
 import           Lumberjack (HasLog, writeLogM)
@@ -364,7 +365,7 @@ constrain context sym preconds (Crucible.RegMap args) =
                constrainOneArgument
                  context
                  sym
-                 (getConst (argConstraints preconds Ctx.! idx))
+                 (Set.toList (getConst (argConstraints preconds Ctx.! idx)))
                  (Some idx)
                  regEntry)
          args

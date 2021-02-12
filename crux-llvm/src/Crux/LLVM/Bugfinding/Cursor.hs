@@ -51,7 +51,7 @@ data Cursor
   | Dereference Cursor
   | Index !Word64 Cursor
   | Field !Word64 Cursor
-  deriving Eq
+  deriving (Eq, Ord)
 
 -- TODO: Use more type information?
 ppCursor ::
@@ -71,7 +71,7 @@ ppCursor top =
 data Selector (argTypes :: Ctx CrucibleType)
   = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
   | SelectGlobal !L.Symbol Cursor
-  deriving Eq
+  deriving (Eq, Ord)
 
 selectorCursor :: Simple Lens (Selector argTypes) Cursor
 selectorCursor =
