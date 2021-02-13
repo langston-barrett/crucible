@@ -21,13 +21,13 @@ import           Crux.LLVM.Config (LLVMOptions(entryPoint), llvmCruxConfig)
 
 -- Code being tested
 import           Crux.LLVM.Bugfinding
-  (BugfindingResult(..), FunctionSummary(..), translateAndLoop, printFunctionSummary)
+  (SomeBugfindingResult(..), BugfindingResult(..), FunctionSummary(..), translateAndLoop, printFunctionSummary)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (catchUnimplemented)
 
 testDir :: FilePath
 testDir = "tests/bugfinding"
 
-findBugs :: FilePath -> String -> IO (Some BugfindingResult)
+findBugs :: FilePath -> String -> IO (SomeBugfindingResult)
 findBugs file fn =
   do withFile (testDir </> file <> ".output") WriteMode $ \h ->
        do let outCfg = Crux.OutputConfig False h h True
@@ -55,7 +55,7 @@ findBugs file fn =
 isSafe :: FilePath -> String -> TT.TestTree
 isSafe file fn =
   TH.testCase (fn <> " is safe") $
-    do Some result <- findBugs file fn
+    do SomeBugfindingResult result <- findBugs file fn
        0 TH.@=? length (unclassifiedErrors result)
        case summary result of
          AlwaysSafe -> pure ()
@@ -64,7 +64,7 @@ isSafe file fn =
 isSafeWithPreconditions :: FilePath -> String -> TT.TestTree
 isSafeWithPreconditions file fn =
   TH.testCase (fn <> " is safe") $
-    do Some result <- findBugs file fn
+    do SomeBugfindingResult result <- findBugs file fn
        0 TH.@=? length (unclassifiedErrors result)
        case summary result of
          SafeWithPreconditions _preconditions -> pure ()
@@ -77,7 +77,7 @@ isSafeWithPreconditions file fn =
 isUnclassified :: FilePath -> String -> TT.TestTree
 isUnclassified file fn =
   TH.testCase (fn <> " is unclassified") $
-    do Some result <- findBugs file fn
+    do SomeBugfindingResult result <- findBugs file fn
        0 < length (unclassifiedErrors result) TH.@?
            (unwords ["Expected", fn, "to be unclassified"
                     , "but the result was"
@@ -90,7 +90,7 @@ unimplemented file fn =
     catchUnimplemented (findBugs file fn) >>=
       \case
         Left _msg -> pure ()
-        Right (Some result) ->
+        Right (SomeBugfindingResult result) ->
           TH.assertFailure
             (unwords ["Expected", fn, "to be unimplemented"
                      , "but the result was"
