@@ -320,19 +320,53 @@ toFullType proxy memType typeRepr =
 
 data IntConstraint = IntConstraint
 
+-- Describe the structure of values and constraints on them
 data ValueSpec (ty :: FullType arch) where
   VSMinimal :: ValueSpec ty
   VSInt :: [IntConstraint] -> ValueSpec ('FTInt n)
-  VSAnyPtr :: ValueSpec ('FTPtr ty)
-  VSAllocPtr :: ValueSpec ('FTPtr ty)
+  VSAnyPtr :: ValueSpec ('FTPtr ty) -- TODO just VSMinimal
+  VSAllocatedPtr :: ValueSpec ('FTPtr ty)
   VSInitializedPtr :: ValueSpec ty -> ValueSpec ('FTPtr ty)
   VSStruct ::
     Ctx.Assignment ValueSpec fields ->
     ValueSpec ('FTStruct fields)
   VSArray :: Vector n (ValueSpec ty) -> ValueSpec ('FTArray n ty)
 
+-- Should a Cursor say what type it points *to*?
 data Cursor (ty :: FullType arch) where
   Here :: Cursor ty
   Dereference :: Cursor ty -> Cursor ('FTPtr ty)
   Index :: (i <= n) => NatRepr i -> Cursor ty -> Cursor ('FTArray n ty)
   Field :: Ctx.Index fields ty -> Cursor ty -> Cursor ('FTStruct fields)
+
+-- addConstraint :: Constraint ty -> Cursor ty -> ValueSpec ty -> ValueSpec ty
+-- addConstraint _ _ = _
+
+-- gen :: Assignment ValueSpec argTypes -> (Mem, RegMap)
+-- gen _ _ = _
+
+-- setup ::
+--   Mem ->
+--   Assignment ValueSpec fts ->
+--   ( RegMap (Map ToCrucibleType fts)
+--   , MemImpl sym
+--   , Map (Annotation sym) (Some Selector)
+--   )
+
+-- minimal :: FullTypeRepr ft -> RegValue (ToCrucibleType ft)
+-- minimal :: FullTypeRepr ft -> ValueSpec ft
+
+-- classify ::
+--   Map (Annotation sym) ->
+--   BadBehavior ->
+--   [exists ft. (Selector ft, Constraint ft)]
+
+-- modify ::
+--   [exists ft. (Selector ft, Constraint ft)] ->
+--   Map Symbol (Some ValueSpec) ->
+--   Assignment ValueSpec fts ->
+--   ( Map Symbol (Some ValueSpec)
+--   , Assignment ValueSpec fts
+--   )
+
+
