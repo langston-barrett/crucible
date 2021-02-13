@@ -83,15 +83,15 @@ import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
 
-data TypedSelector argTypes tp =
-  TypedSelector (Selector argTypes) (CrucibleTypes.BaseTypeRepr tp)
+data TypedSelector arch argTypes tp =
+  TypedSelector (Selector arch argTypes) (CrucibleTypes.BaseTypeRepr tp)
 
-data SetupError argTypes
+data SetupError arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
-  | SetupBadConstraintSelector (Selector argTypes) MemType Constraint
+  | SetupBadConstraintSelector (Selector arch argTypes) MemType Constraint
 
-ppSetupError :: SetupError argTypes -> Doc Void
+ppSetupError :: SetupError arch argTypes -> Doc Void
 ppSetupError =
   \case
     SetupTypeSeekError typeSeekError -> ppTypeSeekError typeSeekError
@@ -115,7 +115,7 @@ data SetupAssumption sym
 data SetupState arch sym argTypes =
   SetupState
     { _setupMem :: LocalMem sym
-    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
+    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
       -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
       -- ^ Counter for generating unique/fresh symbols
@@ -130,7 +130,7 @@ setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 setupMemImpl :: SetupState arch sym argTypes -> (LLVMMem.MemImpl sym)
 setupMemImpl = view (setupMem . globalMem)
 
-setupAnnotations :: Simple Lens (SetupState arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector argTypes))
+setupAnnotations :: Simple Lens (SetupState arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes))
 setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 
 symbolCounter :: Simple Lens (SetupState arch sym argTypes) Int
@@ -139,7 +139,7 @@ symbolCounter = lens _symbolCounter (\s v -> s { _symbolCounter = v })
 newtype Setup arch sym argTypes a =
   Setup
     (ExceptT
-      (SetupError argTypes)
+      (SetupError arch argTypes)
       (RWST (Context arch argTypes)
             [SetupAssumption sym]
             (SetupState arch sym argTypes)
@@ -147,7 +147,7 @@ newtype Setup arch sym argTypes a =
       a)
   deriving (Applicative, Functor, Monad, MonadIO)
 
-deriving instance MonadError (SetupError argTypes) (Setup arch sym argTypes)
+deriving instance MonadError (SetupError arch argTypes) (Setup arch sym argTypes)
 deriving instance MonadState (SetupState arch sym argTypes) (Setup arch sym argTypes)
 deriving instance MonadReader (Context arch argTypes) (Setup arch sym argTypes)
 deriving instance MonadWriter [SetupAssumption sym] (Setup arch sym argTypes)
@@ -158,7 +158,7 @@ instance LJ.HasLog Text (Setup arch sym argTypes) where
 data SetupResult arch sym argTypes =
   SetupResult
     { resultMem :: LLVMMem.MemImpl sym
-    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
+    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
     , resultAssumptions :: [SetupAssumption sym]
     }
 
@@ -167,7 +167,7 @@ runSetup ::
   Context arch argTypes ->
   LLVMMem.MemImpl sym ->
   Setup arch sym argTypes a ->
-  m (Either (SetupError argTypes) (SetupResult arch sym argTypes, a))
+  m (Either (SetupError arch argTypes) (SetupResult arch sym argTypes, a))
 runSetup context mem (Setup computation) = do
   result <-
     liftIO $
@@ -196,7 +196,7 @@ assume constraint predicate = tell [SetupAssumption constraint predicate]
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
   What4.SymAnnotation sym tp ->
-  Selector argTypes ->
+  Selector arch argTypes ->
   CrucibleTypes.BaseTypeRepr tp ->
   Setup arch sym argTypes ()
 addAnnotation ann selector typeRepr =

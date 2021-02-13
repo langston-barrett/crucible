@@ -14,7 +14,9 @@ module Crux.LLVM.Bugfinding
   ( bugfindingMain
   , translateAndLoop
   , BugfindingResult(..)
+  , SomeBugfindingResult(..)
   , FunctionSummary(..)
+  , printFunctionSummary
   ) where
 
 import System.Exit
@@ -29,6 +31,7 @@ import Control.Monad (void, when)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Text (Text)
 import qualified Data.Text.IO as TextIO
+import           Data.Type.Equality ((:~:)(Refl))
 
 import System.FilePath( (</>) )
 
@@ -77,6 +80,7 @@ import Crux.LLVM.Bugfinding.Classify (partitionExplanations, TruePositive, class
 import Crux.LLVM.Bugfinding.Constraints (isEmpty, ppConstraints, emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Context
 import Crux.LLVM.Bugfinding.Errors.Panic (panic)
+import Crux.LLVM.Bugfinding.FullType (MapToCrucibleType)
 import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
 import Crux.LLVM.Bugfinding.Setup.Monad (ppSetupError)
 
@@ -110,9 +114,9 @@ simulateLLVM ::
   ArchOk arch =>
   HandleAllocator ->
   Context arch argTypes ->
-  IORef [Explanation argTypes] ->
-  Constraints argTypes ->
-  CFG (LLVM arch) blocks argTypes ret ->
+  IORef [Explanation arch argTypes] ->
+  Constraints arch argTypes ->
+  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
   MemOptions ->
   Crux.SimulatorCallback
 simulateLLVM halloc context explRef preconds cfg memOptions =
@@ -180,11 +184,11 @@ runSimulator ::
   ) =>
   Context arch argTypes ->
   HandleAllocator ->
-  Constraints argTypes ->
-  CFG (LLVM arch) blocks argTypes ret ->
+  Constraints arch argTypes ->
+  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
   CruxOptions ->
   MemOptions ->
-  IO [Explanation argTypes]
+  IO [Explanation arch argTypes]
 runSimulator context halloc preconditions cfg cruxOpts memOptions =
   do explRef <- newIORef []
      Crux.runSimulator
@@ -200,18 +204,21 @@ runSimulator context halloc preconditions cfg cruxOpts memOptions =
 
 -- | The outer loop of bugfinding mode
 
-data FunctionSummary argTypes
+data FunctionSummary arch argTypes
   = FoundBugs (NonEmpty TruePositive)
-  | SafeWithPreconditions (Constraints argTypes)
+  | SafeWithPreconditions (Constraints arch argTypes)
   | AlwaysSafe -- TODO(lb): This isn't really true until we "deepen" arguments
 
-data BugfindingResult argTypes
+data SomeBugfindingResult =
+  forall arch argTypes. SomeBugfindingResult (BugfindingResult arch argTypes)
+
+data BugfindingResult arch argTypes
   = BugfindingResult
       { unclassifiedErrors :: [Doc Void]
-      , summary :: FunctionSummary argTypes
+      , summary :: FunctionSummary arch argTypes
       }
 
-printFunctionSummary :: FunctionSummary argTypes -> Text
+printFunctionSummary :: FunctionSummary arch argTypes -> Text
 printFunctionSummary =
   \case
     FoundBugs bugs ->
@@ -222,7 +229,7 @@ printFunctionSummary =
       <> Text.pack (show (ppConstraints preconditions))
     AlwaysSafe -> "This function is always safe."
 
-makeFunctionSummary :: Constraints argTypes -> [TruePositive] -> FunctionSummary argTypes
+makeFunctionSummary :: Constraints arch argTypes -> [TruePositive] -> FunctionSummary arch argTypes
 makeFunctionSummary preconditions truePositives =
   case (isEmpty preconditions, truePositives) of
     (True, []) -> AlwaysSafe
@@ -234,13 +241,13 @@ bugfindingLoop ::
   , ArchOk arch
   ) =>
   Context arch argTypes ->
-  CFG (LLVM arch) blocks argTypes ret ->
+  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
   CruxOptions ->
   MemOptions ->
   HandleAllocator ->
-  IO (BugfindingResult argTypes)
+  IO (BugfindingResult arch argTypes)
 bugfindingLoop context cfg cruxOpts memOptions halloc =
-  do let emptyCs = emptyConstraints (Ctx.size (cfgArgTypes cfg))
+  do let emptyCs = emptyConstraints (Ctx.size (context ^. argumentFullTypes))
      let runSim preconds =
            runSimulator context halloc preconds cfg cruxOpts memOptions
 
@@ -275,7 +282,7 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
                             panic "bugfindingLoop" ["Redundant constraints!"]
                           loop allTruePositives allPreconditions allUnclassified
 
-     loop [] (emptyConstraints (Ctx.size (cfgArgTypes cfg))) []
+     loop [] (emptyConstraints (Ctx.size (context ^. argumentFullTypes))) []
 
 
 -- | Assumes the bitcode file has already been generated with @genBitCode@.
@@ -283,7 +290,7 @@ translateAndLoop ::
   (?outputConfig ::  OutputConfig) =>
   CruxOptions ->
   LLVMOptions ->
-  IO (Some BugfindingResult)
+  IO SomeBugfindingResult
 translateAndLoop cruxOpts llvmOpts =
   do llvmMod <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
      halloc <- newHandleAllocator
@@ -297,17 +304,16 @@ translateAndLoop cruxOpts llvmOpts =
           withPtrWidth
             ptrW
             (do AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
-                let context =
-                      case makeContext (Text.pack entry) (cfgArgTypes cfg) llvmMod trans of
-                        Left _ -> error "Error building context!"  -- TODO(lb)
-                        Right c -> c
-                Some <$>
-                  bugfindingLoop
-                    context
-                    cfg
-                    cruxOpts
-                    (memOpts llvmOpts)
-                    halloc))
+                case makeContext (Text.pack entry) (cfgArgTypes cfg) llvmMod trans of
+                  Left _ -> error "Error building context!"  -- TODO(lb)
+                  Right (SomeContext context Refl) ->
+                    SomeBugfindingResult <$>
+                      bugfindingLoop
+                        context
+                        cfg
+                        cruxOpts
+                        (memOpts llvmOpts)
+                        halloc))
 
 
 -- | Assumes the bitcode file has already been generated with @genBitCode@.
@@ -317,7 +323,7 @@ bugfindingMain ::
   LLVMOptions ->
   IO ExitCode
 bugfindingMain cruxOpts llvmOpts =
-  do Some result <- translateAndLoop cruxOpts llvmOpts
+  do SomeBugfindingResult result <- translateAndLoop cruxOpts llvmOpts
      say "Crux" $
        if null (unclassifiedErrors result)
        then Text.unpack (printFunctionSummary (summary result))

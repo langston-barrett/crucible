@@ -59,6 +59,7 @@ import           Crux.LLVM.Overrides (ArchOk)
 data LocalMem sym
   = LocalMem
       { _localMem :: Map (Some (What4.SymAnnotation sym)) (Maybe (Some (Crucible.RegEntry sym)))
+      -- The keys are always BaseBV annotations, but those aren't Ord
       , _globalMem :: LLVMMem.MemImpl sym
       }
 

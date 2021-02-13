@@ -22,13 +22,15 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupAssumption(SetupAssumption)
   , SetupResult(SetupResult)
   ) where
-
+ 
 import           Control.Lens (to, (^.), (%~))
 import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
+import           Data.Functor.Const (Const(Const))
 import qualified Data.Set as Set
 import           Data.Text (Text)
+import           Data.Type.Equality ((:~:)(Refl))
 
 import           Lumberjack (HasLog, writeLogM)
 
@@ -51,6 +53,7 @@ import           Crux.LLVM.Overrides (ArchOk)
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor
+import           Crux.LLVM.Bugfinding.FullType (MapToCrucibleType, SomeIndex(..), translateIndex, generateM)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad
 
@@ -97,25 +100,26 @@ logRegMap ::
   Context arch argTypes ->
   sym ->
   LLVMMem.MemImpl sym ->
-  Crucible.RegMap sym argTypes ->
+  Crucible.RegMap sym (MapToCrucibleType argTypes) ->
   m ()
 logRegMap context sym mem (Crucible.RegMap regmap) =
   Ctx.traverseWithIndex_
-    (\index regEntry ->
-      do let storageType =
-               context ^. argumentStorageTypes . ixF' index . to getConst
-         arg <-
-           liftIO $
-             ppRegValue (Proxy :: Proxy arch) sym mem storageType regEntry
-         writeLogM $
-           Text.unwords
-             [ "Argument #" <> Text.pack (show (Ctx.indexVal index))
-             , fromMaybe "" (context ^. argumentNames . ixF' index . to getConst) <> ":"
-             , Text.pack (show arg)
-             -- , "(type:"
-             -- , Text.pack (show (Crucible.regType arg)) <> ")"
-             ])
-    regmap
+    (\index (Const storageType) ->
+       case translateIndex (Ctx.size (context ^. argumentStorageTypes)) index of
+         SomeIndex idx Refl ->
+           do let regEntry = regmap Ctx.! idx
+              arg <-
+                liftIO $
+                  ppRegValue (Proxy :: Proxy arch) sym mem storageType regEntry
+              writeLogM $
+                Text.unwords
+                  [ "Argument #" <> Text.pack (show (Ctx.indexVal index))
+                  , fromMaybe "" (context ^. argumentNames . ixF' index . to getConst) <> ":"
+                  , Text.pack (show arg)
+                  -- , "(type:"
+                  -- , Text.pack (show (Crucible.regType arg)) <> ")"
+                  ])
+    (context ^. argumentStorageTypes)
 
 
 annotatedTerm ::
@@ -123,7 +127,7 @@ annotatedTerm ::
   (Crucible.IsSymInterface sym) =>
   sym ->
   CrucibleTypes.BaseTypeRepr tp ->
-  Selector argTypes ->
+  Selector arch argTypes ->
   Setup arch sym argTypes (What4.SymExpr sym tp)
 annotatedTerm sym typeRepr selector =
   do symbol <- freshSymbol
@@ -139,7 +143,7 @@ generateMinimalValue ::
   proxy arch ->
   sym ->
   CrucibleTypes.TypeRepr tp ->
-  Selector argTypes {-^ Path to this value -} ->
+  Selector arch argTypes {-^ Path to this value -} ->
   Setup arch sym argTypes (Crucible.RegValue sym tp)
 generateMinimalValue proxy sym typeRepr selector =
   case CrucibleTypes.asBaseType typeRepr of
@@ -174,23 +178,27 @@ generateMinimalArgs ::
   ) =>
   Context arch argTypes ->
   sym ->
-  Setup arch sym argTypes (Crucible.RegMap sym argTypes)
+  Setup arch sym argTypes (Crucible.RegMap sym (MapToCrucibleType argTypes))
 generateMinimalArgs context sym = do
   writeLogM $ "Generating minimal arguments for " <>
                 context ^. functionName
-  let argTypesRepr = context ^. argumentTypes
+  let argTypesRepr = context ^. argumentCrucibleTypes
   args <-
     Crucible.RegMap <$>
-      Ctx.generateM
-        (Ctx.size argTypesRepr)
-        (\index ->
-          let typeRepr = argTypesRepr Ctx.! index
-          in Crucible.RegEntry typeRepr <$>
-                generateMinimalValue
-                  (Proxy :: Proxy arch)
-                  sym
-                  typeRepr
-                  (SelectArgument (Some index) Here))
+      generateM
+        (Ctx.size (context ^. argumentFullTypes))
+        (\index index' Refl ->
+           case translateIndex (Ctx.size (context ^. argumentFullTypes)) index of
+             SomeIndex index' Refl ->
+              let typeRepr = argTypesRepr Ctx.! index'
+              in Crucible.RegEntry typeRepr <$>
+                    generateMinimalValue
+                      (Proxy :: Proxy arch)
+                      sym
+                      typeRepr
+                      (SelectArgument (Some index) Here))
+                  -- (case translateIndex (Ctx.size (context ^. argumentFullTypes)) index of
+                  --    SomeIndex index' Refl -> SelectArgument (Some index) Here))
   mem <- gets setupMemImpl
   logRegMap context sym mem args
   return args
@@ -209,7 +217,7 @@ initialize ::
   Context arch argTypes ->
   sym ->
   MemType ->
-  Selector argTypes {-^ Selector for the pointer -} ->
+  Selector arch argTypes {-^ Selector for the pointer -} ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch), Some (Crucible.RegEntry sym))
 initialize context sym pointedToType selector pointer =
@@ -227,6 +235,7 @@ initialize context sym pointedToType selector pointer =
                      (Proxy :: Proxy arch)
                      sym
                      tp
+                     -- (selector & selectorCursor %~ id)
                      (selector & selectorCursor %~ Dereference)
                  ptr' <-
                    store sym pointedToType (Crucible.RegEntry tp pointedToVal) ptr
@@ -240,7 +249,7 @@ constrainHere ::
   ) =>
   Context arch argTypes ->
   sym ->
-  Selector argTypes {-^ Top-level selector -} ->
+  Selector arch argTypes {-^ Top-level selector -} ->
   Constraint ->
   MemType ->
   Crucible.RegEntry sym tp ->
@@ -259,7 +268,7 @@ constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntr
            LLVMMem.PtrRepr ->
              do regEntry' <- Crucible.RegEntry typeRepr <$> malloc sym memType regValue
                 pretty <- showMe regEntry' memType
-                writeLogM ("Constrained value : " <> Text.pack (show pretty))
+                writeLogM ("Constrained value: " <> Text.pack (show pretty))
                 pure regEntry'
            _ -> throwError (SetupBadConstraintSelector selector memType constraint)
        Aligned alignment ->
@@ -293,7 +302,7 @@ constrainValue ::
   Context arch argTypes ->
   sym ->
   Constraint ->
-  Selector argTypes {-^ Parent selector for the cursor -} ->
+  Selector arch argTypes {-^ Parent selector for the cursor -} ->
   Cursor ->
   MemType {-^ The \"leaf\" 'MemType', passed directly to 'constrainHere' -} ->
   Crucible.RegEntry sym tp ->
@@ -352,22 +361,22 @@ constrain ::
   ) =>
   Context arch argTypes ->
   sym ->
-  Constraints argTypes ->
-  Crucible.RegMap sym argTypes ->
-  Setup arch sym argTypes (Crucible.RegMap sym argTypes)
+  Constraints arch argTypes ->
+  Crucible.RegMap sym (MapToCrucibleType argTypes) ->
+  Setup arch sym argTypes (Crucible.RegMap sym (MapToCrucibleType argTypes))
 constrain context sym preconds (Crucible.RegMap args) =
   do writeLogM ("Establishing preconditions..." :: Text)
      args' <-
-       Ctx.traverseWithIndex
-         (\idx regEntry ->
+       generateM
+         (Ctx.size (context ^. argumentStorageTypes))
+         (\idx idx' Refl ->
             do writeLogM ("Modifying argument #" <> Text.pack (show (Ctx.indexVal idx)))
                constrainOneArgument
                  context
                  sym
                  (Set.toList (getConst (argConstraints preconds Ctx.! idx)))
                  (Some idx)
-                 regEntry)
-         args
+                 (args Ctx.! idx'))
      return (Crucible.RegMap args')
 
 setupExecution ::
@@ -379,8 +388,11 @@ setupExecution ::
   ) =>
   sym ->
   Context arch argTypes ->
-  Constraints argTypes ->
-  m (Either (SetupError argTypes) (SetupResult arch sym argTypes, Crucible.RegMap sym argTypes))
+  Constraints arch argTypes ->
+  m (Either (SetupError arch argTypes)
+            ( SetupResult arch sym argTypes
+            , Crucible.RegMap sym (MapToCrucibleType argTypes)
+            ))
 setupExecution sym context preconds = do
   -- TODO(lb): More lazy here?
   let moduleTrans = context ^. moduleTranslation

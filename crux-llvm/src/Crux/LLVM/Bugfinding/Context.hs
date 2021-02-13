@@ -8,19 +8,23 @@ Stability    : provisional
 -}
 
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Crux.LLVM.Bugfinding.Context
   ( Context(..)
+  , SomeContext(..)
   , ContextError(..)
   , makeContext
   , functionName
   , argumentNames
-  , argumentTypes
+  , argumentCrucibleTypes
+  , argumentFullTypes
   , argumentMemTypes
   , argumentStorageTypes
   , llvmModule
@@ -36,6 +40,7 @@ import           Data.Map (Map)
 import           Data.Monoid (getFirst, First(First))
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           Data.Type.Equality ((:~:)(Refl))
 
 import           Text.LLVM (Module)
 import qualified Text.LLVM.AST as L
@@ -55,15 +60,19 @@ import           Crux.LLVM.Overrides (ArchOk)
 
 import           Crux.LLVM.Bugfinding.FullType
 
+data SomeContext arch argTypes'
+  = forall argTypes.
+      SomeContext (Context arch argTypes) (MapToCrucibleType argTypes :~: argTypes')
+
 -- TODO(lb): Split into module-level and function-level?
 data Context arch argTypes =
   Context
     { _functionName :: Text
     , _argumentNames :: Ctx.Assignment (Const (Maybe Text)) argTypes
-    , _argumentTypes :: CrucibleTypes.CtxRepr argTypes
+    , _argumentFullTypes :: Ctx.Assignment (FullTypeRepr arch) argTypes
+    , _argumentCrucibleTypes :: CrucibleTypes.CtxRepr (MapToCrucibleType argTypes)
     , _argumentMemTypes :: Ctx.Assignment (Const MemType) argTypes
     , _argumentStorageTypes :: Ctx.Assignment (Const StorageType) argTypes
-    , _argumentFullTypes :: Ctx.Assignment (FullTypeFromCrucible arch) argTypes
     , _llvmModule :: Module
     , _moduleTranslation :: ModuleTranslation arch
     }
@@ -74,8 +83,11 @@ functionName = lens _functionName (\s v -> s { _functionName = v })
 argumentNames :: Simple Lens (Context arch argTypes) (Ctx.Assignment (Const (Maybe Text)) argTypes)
 argumentNames = lens _argumentNames (\s v -> s { _argumentNames = v })
 
-argumentTypes :: Simple Lens (Context arch argTypes) (CrucibleTypes.CtxRepr argTypes)
-argumentTypes = lens _argumentTypes (\s v -> s { _argumentTypes = v })
+argumentCrucibleTypes :: Simple Lens (Context arch argTypes) (CrucibleTypes.CtxRepr (MapToCrucibleType argTypes))
+argumentCrucibleTypes = lens _argumentCrucibleTypes (\s v -> s { _argumentCrucibleTypes = v })
+
+argumentFullTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (FullTypeRepr arch) argTypes)
+argumentFullTypes = lens _argumentFullTypes (\s v -> s { _argumentFullTypes = v })
 
 argumentMemTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (Const MemType) argTypes)
 argumentMemTypes = lens _argumentMemTypes (\s v -> s { _argumentMemTypes = v })
@@ -115,7 +127,7 @@ makeContext ::
   CrucibleTypes.CtxRepr argTypes ->
   Module ->
   ModuleTranslation arch ->
-  Either ContextError (Context arch argTypes)
+  Either ContextError (SomeContext arch argTypes)
 makeContext entry argTypes llvmMod trans =
   do def <-
        case List.find ((== L.Symbol (Text.unpack entry)) . L.defName)
@@ -133,37 +145,43 @@ makeContext entry argTypes llvmMod trans =
               (Map.fromList (zip [0..] (fdArgTypes funDecl))) of
          Just types -> Right types
          Nothing -> Left BadLiftArgs
-     argStorageTypes <-
-       withPtrWidthOf trans $
-         forFC
-           argMemTypes
-           (\(Const memType) ->
-              case toStorableType memType of
-                Just storeTy -> Right (Const storeTy)
-                Nothing -> Left (BadMemType memType))
-
-     argFullTypes <-
+     (SomeAssign argFullTypes Refl) <-
        let ?lc = trans ^. LLVMTrans.transContext . LLVMTrans.llvmTypeCtx
        in case assignmentToFullType trans argTypes argMemTypes of
             Just fullTypes -> Right fullTypes
             Nothing -> Left FullTypeTranslation
-
+     argMemTypes' <-
+       case maybeMapToContext
+              (Ctx.size argFullTypes)
+              (Map.fromList (zip [0..] (fdArgTypes funDecl))) of
+         Just types -> Right types
+         Nothing -> Left BadLiftArgs
+     argStorageTypes <-
+       withPtrWidthOf trans $
+         forFC
+           argMemTypes'
+           (\(Const memType) ->
+              case toStorableType memType of
+                Just storeTy -> Right (Const storeTy)
+                Nothing -> Left (BadMemType memType))
      pure $
-       Context
-         { _functionName = entry
-         , _argumentTypes = argTypes
-         , _argumentNames =
-             fmapFC
-               (Const . getFirst . getConst)
-               (mapToContext
-                 (Ctx.size argTypes)
-                 (fmap (First . Just) (debugInfoArgNames llvmMod def)))
-         , _argumentMemTypes = argMemTypes
-         , _argumentStorageTypes = argStorageTypes
-         , _argumentFullTypes = argFullTypes
-         , _llvmModule = llvmMod
-         , _moduleTranslation = trans
-         }
+       SomeContext
+         (Context
+           { _functionName = entry
+           , _argumentCrucibleTypes = argTypes
+           , _argumentNames =
+               fmapFC
+                 (Const . getFirst . getConst)
+                 (mapToContext
+                   (Ctx.size argFullTypes)
+                   (fmap (First . Just) (debugInfoArgNames llvmMod def)))
+           , _argumentMemTypes = argMemTypes'
+           , _argumentStorageTypes = argStorageTypes
+           , _argumentFullTypes = argFullTypes
+           , _llvmModule = llvmMod
+           , _moduleTranslation = trans
+           })
+         Refl
 
 mapToContext ::
   Monoid a =>

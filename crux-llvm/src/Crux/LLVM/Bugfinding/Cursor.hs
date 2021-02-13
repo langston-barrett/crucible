@@ -15,6 +15,7 @@ global variable). It's used for describing function preconditions, such as
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE PolyKinds #-}
 
 module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
@@ -45,6 +46,7 @@ import           Lang.Crucible.LLVM.MemType (MemType, SymType)
 import qualified Lang.Crucible.LLVM.MemType as MemType
 import           Lang.Crucible.LLVM.TypeContext (TypeContext, asMemType)
 
+import           Crux.LLVM.Bugfinding.FullType (FullType)
 
 data Cursor
   = Here
@@ -68,12 +70,12 @@ ppCursor top =
     Field idx cursor -> ppCursor top cursor <> PP.pretty ("." ++ show idx)
 
 -- TODO(lb): Not sure why I have to specify the kind here?
-data Selector (argTypes :: Ctx CrucibleType)
+data Selector arch (argTypes :: Ctx (FullType arch))
   = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
   | SelectGlobal !L.Symbol Cursor
   deriving (Eq, Ord)
 
-selectorCursor :: Simple Lens (Selector argTypes) Cursor
+selectorCursor :: Simple Lens (Selector arch argTypes) Cursor
 selectorCursor =
   lens
     (\case

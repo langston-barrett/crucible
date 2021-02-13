@@ -56,6 +56,7 @@ import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as LLVMErrors
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
+import           Crux.LLVM.Bugfinding.FullType (MapToCrucibleType)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
 import Lang.Crucible.LLVM.Errors (ppBB)
 
@@ -65,14 +66,14 @@ data TruePositive
 
 -- | An error is either a true positive, a false positive due to some missing
 -- preconditions, or unknown.
-data Explanation types
+data Explanation arch types
   = ExTruePositive TruePositive
-  | ExMissingPreconditions (Constraints types)
+  | ExMissingPreconditions (Constraints arch types)
   | ExUnclassified (Doc Void)
   -- ^ We don't (yet) know what to do about this error
 
 partitionExplanations ::
-  [Explanation types] -> ([TruePositive], [Constraints types], [Doc Void])
+  [Explanation arch types] -> ([TruePositive], [Constraints arch types], [Doc Void])
 partitionExplanations = go [] [] []
   where go ts cs ds =
           \case
@@ -92,7 +93,7 @@ ppTruePositive =
   \case
     UninitializedStackVariable -> "Uninitialized stack variable"
 
-ppExplanation :: Explanation types -> Text
+ppExplanation :: Explanation arch types -> Text
 ppExplanation =
   \case
     ExTruePositive truePositive -> ppTruePositive truePositive
@@ -122,17 +123,17 @@ classify ::
   ) =>
   Context arch argTypes ->
   sym ->
-  Crucible.RegMap sym argTypes {-^ Function arguments -} ->
-  MapF (What4.SymAnnotation sym) (TypedSelector argTypes)
+  Crucible.RegMap sym (MapToCrucibleType argTypes) {-^ Function arguments -} ->
+  MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
-  m (Explanation argTypes)
+  m (Explanation arch argTypes)
 classify context sym (Crucible.RegMap args) annotations badBehavior =
   writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   let
     getPtrOffsetAnn ::
       LLVMPointer.LLVMPtr sym w ->
-      Maybe (TypedSelector argTypes (What4.BaseBVType w))
+      Maybe (TypedSelector arch argTypes (What4.BaseBVType w))
     getPtrOffsetAnn ptr =
       flip MapF.lookup annotations =<<
         What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)
@@ -164,7 +165,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                  return $
                    ExMissingPreconditions $
                      oneArgumentConstraint
-                       (Ctx.size args)
+                       (Ctx.size (context ^. argumentFullTypes))
                        idx
                        (Set.singleton (ValueConstraint (Aligned alignment) cursor))
             _ -> unclass
@@ -189,7 +190,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                  return $
                    ExMissingPreconditions $
                      oneArgumentConstraint
-                       (Ctx.size args)
+                       (Ctx.size (context ^. argumentFullTypes))
                        idx
                        (Set.singleton (ValueConstraint (Aligned alignment) cursor))
             _ -> unclass
@@ -218,7 +219,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                    return $
                      ExMissingPreconditions $
                        oneArgumentConstraint
-                         (Ctx.size args)
+                         (Ctx.size (context ^. argumentFullTypes))
                          idx
                          (Set.singleton (ValueConstraint Allocated cursor))
               -- TODO(lb): Something about globals, probably?
@@ -245,7 +246,7 @@ classify context sym (Crucible.RegMap args) annotations badBehavior =
                    return $
                      ExMissingPreconditions $
                        oneArgumentConstraint
-                         (Ctx.size args)
+                         (Ctx.size (context ^. argumentFullTypes))
                          idx
                          (Set.singleton (ValueConstraint Initialized cursor))
               -- TODO(lb): Something about globals, probably?
