@@ -9,6 +9,7 @@
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -23,6 +24,7 @@ import qualified Data.Text as Text
 import           Data.Traversable (for)
 import           Data.Type.Equality ((:~:)(Refl))
 import qualified Data.Vector as Vec
+import           Unsafe.Coerce (unsafeCoerce)
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Context (Ctx)
@@ -32,6 +34,7 @@ import           Data.Parameterized.NatRepr
 import           Data.Parameterized.SymbolRepr
 import           Data.Parameterized.Some (Some(Some), viewSome)
 import           Data.Parameterized.Vector (Vector)
+import qualified Data.Parameterized.TH.GADT as U
 
 import qualified Text.LLVM.AST as L
 
@@ -105,7 +108,9 @@ data PartTypeRepr arch (ft :: FullType arch) where
     MemType.StructInfo ->
     Ctx.Assignment (PartTypeRepr arch) fields ->
     PartTypeRepr arch ('FTStruct fields)
-  PTAliasRepr :: L.Ident -> PartTypeRepr arch ft
+  -- The Const is so that we can get type variables in scope in the TestEquality
+  -- instance, see below.
+  PTAliasRepr :: Const L.Ident ft -> PartTypeRepr arch ft
 
 data FullTypeFromCrucible arch tp =
   forall ft. FullTypeFromCrucible (ToCrucibleType ft :~: tp) (FullTypeRepr arch ft)
@@ -260,7 +265,7 @@ toPartType proxy =
     PtrType (MemType memType) ->
       do Some pointedTo <- toPartType proxy memType
          Just (Some (PTPtrRepr pointedTo))
-    PtrType (Alias ident) -> Just (Some (PTAliasRepr ident))
+    PtrType (Alias ident) -> Just (Some (PTAliasRepr (Const ident)))
     mt@(PtrType _) -> unimplemented "toFullType" ("Translating " ++ show mt)
     IntType n ->
       case mkNatRepr n of
@@ -370,3 +375,32 @@ data Cursor (ty :: FullType arch) where
 --   )
 
 
+-- expand :: Assignment ValueSpec fts -> Assignment ValueSpec fts
+-- choose :: [Some Selector] -> Some Selector
+-- expandable :: ValueSpec ft -> [Some Cursor]
+
+
+$(return [])
+
+instance TestEquality (FullTypeRepr arch) where
+  testEquality = $(U.structuralTypeEquality [t|FullTypeRepr|]
+                   [ (U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType, [|testEquality|])
+                   , (U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
+                   , (U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
+                   , (U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType, [|testEquality|])
+                   ]
+                  )
+
+-- NOTE(lb): We just assume (via unsafeCoerce) that types with the same L.Ident
+-- are the same. Only valid when one L.Module is in use.
+instance TestEquality (PartTypeRepr arch) where
+  testEquality = $(U.structuralTypeEquality [t|PartTypeRepr|]
+                   [ (U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType, [|testEquality|])
+                   , (U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
+                   , (U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType, [|testEquality|])
+                   , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
+                     , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                             if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
+                     )
+                   ]
+                  )
