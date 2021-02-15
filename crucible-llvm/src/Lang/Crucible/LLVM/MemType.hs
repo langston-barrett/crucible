@@ -94,7 +94,7 @@ data SymType
   | OpaqueType
     -- | A type not supported by the symbolic simulator.
   | UnsupportedType L.Type
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show SymType where
   show = show . ppSymType
@@ -123,7 +123,7 @@ data MemType
   | VecType Natural MemType
   | StructType StructInfo
   | MetadataType
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 instance Show MemType where
   show = show . ppMemType
@@ -186,7 +186,7 @@ data FunDecl = FunDecl { fdRetType  :: !RetType
                        , fdArgTypes :: ![MemType]
                        , fdVarArgs  :: !Bool
                        }
- deriving( Eq )
+ deriving (Eq, Ord)
 
 -- | Return the number of bits that represent the given memtype, which
 --   must be either integer types, floating point types or vectors of
@@ -275,25 +275,14 @@ data StructInfo = StructInfo
   , structAlign  :: !Alignment
   , siFields     :: !(V.Vector FieldInfo)
   }
-  deriving (Show)
-
-instance Eq StructInfo where
- si1 == si2 =
-   siIsPacked si1 == siIsPacked si2
-   &&
-   structSize si1 == structSize si2
-   &&
-   structAlign si1 == structAlign si2
-   &&
-   siFields si1 == siFields si2
-
+  deriving (Eq, Ord, Show)
 
 data FieldInfo = FieldInfo
   { fiOffset    :: !Offset  -- ^ Byte offset of field relative to start of struct.
   , fiType      :: !MemType -- ^ Type of field.
   , fiPadding   :: !Bytes   -- ^ Number of bytes of padding at end of field.
   }
-  deriving (Eq, Show)
+  deriving (Eq, Ord, Show)
 
 
 -- | Constructs a function for obtaining target-specific size/alignment
