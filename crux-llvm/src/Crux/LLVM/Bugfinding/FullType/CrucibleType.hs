@@ -62,11 +62,11 @@ toCrucibleType ::
   CrucibleTypes.TypeRepr (ToCrucibleType ft)
 toCrucibleType =
   \case
-    FTIntRepr natRepr -> LLVMMem.LLVMPointerRepr natRepr
-    FTPtrRepr _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
-    FTArrayRepr _natRepr fullTypeRepr ->
+    FTIntRepr _ natRepr -> LLVMMem.LLVMPointerRepr natRepr
+    FTPtrRepr _ _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
+    FTArrayRepr _ _natRepr fullTypeRepr ->
       CrucibleTypes.VectorRepr (toCrucibleType fullTypeRepr)
-    FTFullStructRepr _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
+    FTFullStructRepr _ _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
 
 toPartType ::
   forall proxy arch.
@@ -78,12 +78,12 @@ toPartType proxy =
   \case
     PtrType (MemType memType) ->
       do Some pointedTo <- toPartType proxy memType
-         Just (Some (FTPtrRepr pointedTo))
+         Just (Some (FTPtrRepr PartRepr pointedTo))
     PtrType (Alias ident) -> Just (Some (FTAliasRepr (Const ident)))
     mt@(PtrType _) -> unimplemented "toFullType" ("Translating " ++ show mt)
     IntType n ->
       case mkNatRepr n of
-        Some w | Just LeqProof <- isPosNat w -> Just (Some (FTIntRepr w))
+        Some w | Just LeqProof <- isPosNat w -> Just (Some (FTIntRepr PartRepr w))
         _ -> panic "toPartType" ["Invalid integer width " ++ show n]
     StructType structInfo ->
       do let structInfoFields = MemType.siFields structInfo
@@ -119,10 +119,10 @@ toFullType proxy memType typeRepr =
           case (memType, testEquality ?ptrWidth w) of
             (PtrType _symType, Just Refl) ->
               do Some contained <- toPartType proxy memType
-                 Just (Some (FTPtrRepr contained))
+                 Just (Some (FTPtrRepr FullRepr contained))
             (IntType _w, _) ->
               -- TODO assert about _w
-              Just (Some (FTIntRepr w))
+              Just (Some (FTIntRepr FullRepr w))
             _ -> badCombo
         CrucibleTypes.VectorRepr containedTypeRepr ->
           case memType of
@@ -130,7 +130,7 @@ toFullType proxy memType typeRepr =
               do Some contained <-
                    toFullType proxy memType' containedTypeRepr
                  Some natRepr <- pure $ mkNatRepr n
-                 Just (Some (FTArrayRepr natRepr contained))
+                 Just (Some (FTArrayRepr FullRepr natRepr contained))
             _ -> badCombo
         CrucibleTypes.StructRepr
           (fieldTypes :: Ctx.Assignment CrucibleTypes.TypeRepr fields) ->
@@ -141,7 +141,7 @@ toFullType proxy memType typeRepr =
                      Ctx.generate
                        (Ctx.size fieldTypes)
                        (\idx -> Const (MemType.fiType (MemType.siFields structInfo Vec.! Ctx.indexVal idx)))
-                 Just (Some (FTFullStructRepr structInfo fieldTypes fullFieldTypes))
+                 Just (Some (FTFullStructRepr FullRepr structInfo fieldTypes fullFieldTypes))
             _ -> badCombo
         _ -> unimplemented "toFullType" (show typeRepr)
   where
