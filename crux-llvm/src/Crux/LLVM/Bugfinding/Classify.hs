@@ -147,7 +147,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.WriteBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector (Selector (Left (Some idx)) cursor) _typeRepr) ->
+            Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Read from a pointer with insufficient"
@@ -172,7 +172,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector (Selector (Left (Some idx)) cursor) _typeRepr) ->
+            Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Wrote to a pointer with insufficient"
@@ -199,7 +199,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
           (summarizeOp -> (_expl, ptr))
           LLVMErrors.UnwritableRegion) ->
             case getPtrOffsetAnn ptr of
-              Just (TypedSelector (Selector (Left (Some idx)) cursor) _typeRepr) ->
+              Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
                 -- TODO: Double check that it really was unmapped not read-only
                 -- or something?
                 do writeLogM $
@@ -229,7 +229,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
           _op
           (LLVMErrors.NoSatisfyingWrite _storageType ptr)) ->
             case getPtrOffsetAnn ptr of
-              Just (TypedSelector (Selector (Left (Some idx)) cursor) _typeRepr) ->
+              Just (TypedSelector (SelectArgument (Some idx) cursor) _typeRepr) ->
                 do writeLogM $
                      Text.unwords
                        [ "Diagnosis: Read from an uninitialized pointer in argument"

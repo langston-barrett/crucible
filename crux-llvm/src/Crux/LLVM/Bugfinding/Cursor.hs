@@ -20,8 +20,7 @@ module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
   , ppCursor
   , Selector(..)
-  , selectWhich
-  , selectWhere
+  , selectorCursor
   , TypeSeekError(..)
   , ppTypeSeekError
   , seekLlvmType
@@ -69,17 +68,20 @@ ppCursor top =
 
 -- TODO(lb): Not sure why I have to specify the kind here?
 data Selector arch (argTypes :: Ctx (FullType arch))
-  = Selector
-      { _selectWhich :: Either (Some (Ctx.Index argTypes)) L.Symbol
-      , _selectWhere :: Cursor
-      }
+  = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
+  | SelectGlobal !L.Symbol Cursor
   deriving (Eq, Ord)
 
-selectWhich :: Simple Lens (Selector arch argTypes) (Either (Some (Ctx.Index argTypes)) L.Symbol)
-selectWhich = lens _selectWhich (\s v -> s { _selectWhich = v })
-
-selectWhere :: Simple Lens (Selector arch argTypes) Cursor
-selectWhere = lens _selectWhere (\s v -> s { _selectWhere = v })
+selectorCursor :: Simple Lens (Selector arch argTypes) Cursor
+selectorCursor =
+  lens
+    (\case
+      SelectArgument _ cursor -> cursor
+      SelectGlobal _ cursor -> cursor)
+    (\s v ->
+      case s of
+        SelectArgument arg _ -> SelectArgument arg v
+        SelectGlobal glob _ -> SelectGlobal glob v)
 
 data TypeSeekError ty
   = ArrayIndexOutOfBounds !Word64 !Word64 ty

@@ -195,7 +195,7 @@ generateMinimalArgs context sym = do
                       (Proxy :: Proxy arch)
                       sym
                       typeRepr
-                      (Selector (Left (Some index)) Here))
+                      (SelectArgument (Some index) Here))
                   -- (case translateIndex (Ctx.size (context ^. argumentFullTypes)) index of
                   --    SomeIndex index' Refl -> SelectArgument (Some index) Here))
   mem <- gets setupMemImpl
@@ -235,7 +235,7 @@ initialize context sym pointedToType selector pointer =
                      sym
                      tp
                      -- (selector & selectorCursor %~ id)
-                     (selector & selectWhere %~ Dereference)
+                     (selector & selectorCursor %~ Dereference)
                  ptr' <-
                    store sym pointedToType (Crucible.RegEntry tp pointedToVal) ptr
                  pure (ptr', Some (Crucible.RegEntry tp pointedToVal)))
@@ -254,7 +254,7 @@ constrainHere ::
   Crucible.RegEntry sym tp ->
   Setup arch sym argTypes (Crucible.RegEntry sym tp)
 constrainHere context sym selector constraint memType regEntry@(Crucible.RegEntry typeRepr regValue) =
-  do writeLogM ("Constraining value at: " <> Text.pack (show (ppCursor "<top>" (selector ^. selectWhere))))
+  do writeLogM ("Constraining value at: " <> Text.pack (show (ppCursor "<top>" (selector ^. selectorCursor))))
      writeLogM ("Constraint: " <> Text.pack (show (ppConstraint constraint)))
      let showMe :: forall t ann. Crucible.RegEntry sym t -> MemType -> Setup arch sym argTypes (Doc ann)
          showMe regEnt memTy =
@@ -347,7 +347,7 @@ constrainOneArgument context sym constraints sidx@(Some idx) regEntry =
                  context
                  sym
                  constraint
-                 (Selector (Left sidx) cursor)
+                 (SelectArgument sidx cursor)
                  cursor
                  memType
                  regEntry
