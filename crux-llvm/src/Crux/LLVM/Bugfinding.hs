@@ -191,15 +191,16 @@ runSimulator ::
   IO [Explanation arch argTypes]
 runSimulator context halloc preconditions cfg cruxOpts memOptions =
   do explRef <- newIORef []
-     Crux.runSimulator
-       cruxOpts
-       (simulateLLVM
-         halloc
-         context
-         explRef
-         preconditions
-         cfg
-         memOptions)
+     void $
+      Crux.runSimulator
+        cruxOpts
+        (simulateLLVM
+          halloc
+          context
+          explRef
+          preconditions
+          cfg
+          memOptions)
      readIORef explRef
 
 -- | The outer loop of bugfinding mode

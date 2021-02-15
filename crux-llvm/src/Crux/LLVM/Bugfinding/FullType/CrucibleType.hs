@@ -60,7 +60,7 @@ toCrucibleType =
   \case
     FTIntRepr natRepr -> LLVMMem.LLVMPointerRepr natRepr
     FTPtrRepr _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
-    FTArrayRepr natRepr fullTypeRepr ->
+    FTArrayRepr _natRepr fullTypeRepr ->
       CrucibleTypes.VectorRepr (toCrucibleType fullTypeRepr)
     FTStructRepr _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
 
@@ -108,7 +108,7 @@ toFullType ::
   Maybe (Some (FullTypeRepr arch))
 toFullType proxy memType typeRepr =
   case CrucibleTypes.asBaseType typeRepr of
-    CrucibleTypes.AsBaseType baseTypeRepr -> unimplemented "toFullType" "Base types"
+    CrucibleTypes.AsBaseType _baseTypeRepr -> unimplemented "toFullType" "Base types"
     CrucibleTypes.NotBaseType ->
       case typeRepr of
         LLVMMem.LLVMPointerRepr w ->
@@ -172,9 +172,6 @@ assignmentToFullType' proxy crucibleTypes memTypes =
             toFullType proxy (getConst (memTypes Ctx.! idx)) typeRepr
           Refl <- testEquality typeRepr (toCrucibleType fullTypeRepr)
           Just (FullTypeFromCrucible Refl fullTypeRepr))
-
-data CrucibleFromFullType ft =
-  CrucibleFromFullType (CrucibleTypes.TypeRepr (ToCrucibleType ft))
 
 data SomeAssign arch crucibleTypes
   = forall fullTypes.

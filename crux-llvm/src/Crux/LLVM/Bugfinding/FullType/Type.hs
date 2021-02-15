@@ -28,23 +28,12 @@ module Crux.LLVM.Bugfinding.FullType.Type
   ) where
 
 import           GHC.TypeLits (Nat)
-import           Data.Functor.Const (Const(Const, getConst))
-import           Data.Functor.Compose (Compose(Compose))
-import           Data.Proxy (Proxy(Proxy))
-import qualified Data.Text as Text
-import           Data.Traversable (for)
-import           Data.Type.Equality ((:~:)(Refl))
-import qualified Data.Vector as Vec
+import           Data.Functor.Const (Const(Const))
 import           Unsafe.Coerce (unsafeCoerce)
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Context (Ctx)
-import           Data.Parameterized.TraversableF (fmapF)
-import           Data.Parameterized.TraversableFC (fmapFC)
 import           Data.Parameterized.NatRepr
-import           Data.Parameterized.SymbolRepr
-import           Data.Parameterized.Some (Some(Some), viewSome)
-import           Data.Parameterized.Vector (Vector)
 import qualified Data.Parameterized.TH.GADT as U
 
 import qualified Text.LLVM.AST as L
@@ -52,15 +41,7 @@ import qualified Text.LLVM.AST as L
 import qualified Lang.Crucible.Types as CrucibleTypes hiding ((::>))
 
 import           Lang.Crucible.LLVM.Extension (ArchWidth)
-import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
-import           Lang.Crucible.LLVM.MemType (MemType(..), SymType(..))
 import qualified Lang.Crucible.LLVM.MemType as MemType
-import           Lang.Crucible.LLVM.TypeContext (TypeContext, asMemType)
-
-import           Crux.LLVM.Overrides (ArchOk)
-import           Crux.LLVM.Bugfinding.Errors.Panic (panic)
-import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
-
 
 -- | Type level only
 --
@@ -81,17 +62,17 @@ type family MapToCrucibleType (ctx :: Ctx (FullType arch)) :: Ctx CrucibleTypes.
   MapToCrucibleType (xs 'Ctx.::> x) = MapToCrucibleType xs Ctx.::> ToCrucibleType x
 
 type family ToCrucibleType (ft :: FullType arch) :: CrucibleTypes.CrucibleType where
-  ToCrucibleType (FTInt n) =
+  ToCrucibleType ('FTInt n) =
     CrucibleTypes.IntrinsicType
       "LLVM_pointer"
       (Ctx.EmptyCtx Ctx.::> CrucibleTypes.BVType n)
-  ToCrucibleType (FTPtr _ft :: FullType arch) =
+  ToCrucibleType ('FTPtr _ft :: FullType arch) =
     CrucibleTypes.IntrinsicType
       "LLVM_pointer"
       (Ctx.EmptyCtx Ctx.::> CrucibleTypes.BVType (ArchWidth arch))
-  ToCrucibleType (FTArray _n ft) =
+  ToCrucibleType ('FTArray _n ft) =
     CrucibleTypes.VectorType (ToCrucibleType ft)
-  ToCrucibleType (FTStruct ctx) =
+  ToCrucibleType ('FTStruct ctx) =
     CrucibleTypes.StructType (MapToCrucibleType ctx)
 
 -- | A 'FullTypeRepr' has enough information to recover a
@@ -123,26 +104,26 @@ data PartTypeRepr arch (ft :: FullType arch) where
   -- instance, see below.
   PTAliasRepr :: Const L.Ident ft -> PartTypeRepr arch ft
 
-data IntConstraint = IntConstraint
+-- data IntConstraint = IntConstraint
 
--- Describe the structure of values and constraints on them
-data ValueSpec (ty :: FullType arch) where
-  VSMinimal :: ValueSpec ty
-  VSInt :: [IntConstraint] -> ValueSpec ('FTInt n)
-  VSAnyPtr :: ValueSpec ('FTPtr ty) -- TODO just VSMinimal
-  VSAllocatedPtr :: ValueSpec ('FTPtr ty)
-  VSInitializedPtr :: ValueSpec ty -> ValueSpec ('FTPtr ty)
-  VSStruct ::
-    Ctx.Assignment ValueSpec fields ->
-    ValueSpec ('FTStruct fields)
-  VSArray :: Vector n (ValueSpec ty) -> ValueSpec ('FTArray n ty)
+-- -- Describe the structure of values and constraints on them
+-- data ValueSpec (ty :: FullType arch) where
+--   VSMinimal :: ValueSpec ty
+--   VSInt :: [IntConstraint] -> ValueSpec ('FTInt n)
+--   VSAnyPtr :: ValueSpec ('FTPtr ty) -- TODO just VSMinimal
+--   VSAllocatedPtr :: ValueSpec ('FTPtr ty)
+--   VSInitializedPtr :: ValueSpec ty -> ValueSpec ('FTPtr ty)
+--   VSStruct ::
+--     Ctx.Assignment ValueSpec fields ->
+--     ValueSpec ('FTStruct fields)
+--   VSArray :: Vector n (ValueSpec ty) -> ValueSpec ('FTArray n ty)
 
--- Should a Cursor say what type it points *to*?
-data Cursor (ty :: FullType arch) where
-  Here :: Cursor ty
-  Dereference :: Cursor ty -> Cursor ('FTPtr ty)
-  Index :: (i <= n) => NatRepr i -> Cursor ty -> Cursor ('FTArray n ty)
-  Field :: Ctx.Index fields ty -> Cursor ty -> Cursor ('FTStruct fields)
+-- -- Should a Cursor say what type it points *to*?
+-- data Cursor (ty :: FullType arch) where
+--   Here :: Cursor ty
+--   Dereference :: Cursor ty -> Cursor ('FTPtr ty)
+--   Index :: (i <= n) => NatRepr i -> Cursor ty -> Cursor ('FTArray n ty)
+--   Field :: Ctx.Index fields ty -> Cursor ty -> Cursor ('FTStruct fields)
 
 -- addConstraint :: Constraint ty -> Cursor ty -> ValueSpec ty -> ValueSpec ty
 -- addConstraint _ _ = _

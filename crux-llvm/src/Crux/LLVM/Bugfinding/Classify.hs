@@ -128,7 +128,7 @@ classify ::
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
   m (Explanation arch argTypes)
-classify context sym (Crucible.RegMap args) annotations badBehavior =
+classify context sym (Crucible.RegMap _args) annotations badBehavior =
   writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   let
     getPtrOffsetAnn ::

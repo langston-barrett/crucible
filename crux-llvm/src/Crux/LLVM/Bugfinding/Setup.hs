@@ -22,12 +22,12 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupAssumption(SetupAssumption)
   , SetupResult(SetupResult)
   ) where
- 
+
 import           Control.Lens (to, (^.), (%~))
 import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
-import           Data.Functor.Const (Const(Const))
+import           Data.Functor.Const (Const(Const, getConst))
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import           Data.Type.Equality ((:~:)(Refl))
@@ -60,7 +60,6 @@ import           Crux.LLVM.Bugfinding.Setup.Monad
 -- TODO unsorted
 import Data.Proxy (Proxy(Proxy))
 import qualified Data.Text as Text
-import Data.Functor.Const (Const(getConst))
 import Control.Monad.State (gets)
 import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
@@ -187,7 +186,7 @@ generateMinimalArgs context sym = do
     Crucible.RegMap <$>
       generateM
         (Ctx.size (context ^. argumentFullTypes))
-        (\index index' Refl ->
+        (\index _index' Refl ->
            case translateIndex (Ctx.size (context ^. argumentFullTypes)) index of
              SomeIndex index' Refl ->
               let typeRepr = argTypesRepr Ctx.! index'

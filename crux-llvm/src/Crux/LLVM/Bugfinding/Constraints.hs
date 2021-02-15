@@ -163,7 +163,7 @@ ppConstraints (Constraints argCs globCs _relCs) =
 oneArgumentConstraint ::
   Ctx.Size argTypes ->
   Ctx.Index argTypes ft ->
-  Set (ValueConstraint) ->
+  Set ValueConstraint ->
   Constraints arch argTypes
 oneArgumentConstraint sz idx constraints =
   let empty = emptyConstraints sz

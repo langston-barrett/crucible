@@ -13,7 +13,6 @@ global variable). It's used for describing function preconditions, such as
 
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE ImplicitParams #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PolyKinds #-}
 
@@ -39,8 +38,6 @@ import qualified Text.LLVM.AST as L
 import           Data.Parameterized.Ctx (Ctx)
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some (Some)
-
-import           Lang.Crucible.Types (CrucibleType)
 
 import           Lang.Crucible.LLVM.MemType (MemType, SymType)
 import qualified Lang.Crucible.LLVM.MemType as MemType
@@ -97,31 +94,31 @@ ppTypeSeekError =
   \case
     ArrayIndexOutOfBounds index size ty ->
       PP.nest 2 $
-        (PP.vsep [ PP.pretty "Out of bounds array index:"
-                 , PP.pretty "Index:" <> PP.viaShow index
-                 , PP.pretty "Array size:" <> PP.viaShow size
-                 , PP.pretty "Type:" <> PP.viaShow ty
-                 ])
+        PP.vsep [ PP.pretty "Out of bounds array index:"
+                , PP.pretty "Index:" <> PP.viaShow index
+                , PP.pretty "Array size:" <> PP.viaShow size
+                , PP.pretty "Type:" <> PP.viaShow ty
+                ]
     FieldIndexOutOfBounds index size ty ->
       PP.nest 2 $
-        (PP.vsep [ PP.pretty "Nonexistent struct field:"
-                 , PP.pretty "Index:" <> PP.viaShow index
-                 , PP.pretty "Fields:" <> PP.viaShow size
-                 , PP.pretty "Type:" <> PP.viaShow ty
-                 ])
+        PP.vsep [ PP.pretty "Nonexistent struct field:"
+                , PP.pretty "Index:" <> PP.viaShow index
+                , PP.pretty "Fields:" <> PP.viaShow size
+                , PP.pretty "Type:" <> PP.viaShow ty
+                ]
     MismatchedCursorAndType cursor ty ->
       PP.nest 2 $
-        (PP.vsep [ PP.pretty "Mismatched cursor and type:"
-                 , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
-                 , PP.pretty "Type:" <> PP.viaShow ty
-                 ])
+        PP.vsep [ PP.pretty "Mismatched cursor and type:"
+                , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
+                , PP.pretty "Type:" <> PP.viaShow ty
+                ]
     UnsupportedType cursor ty msg ->
       PP.nest 2 $
-        (PP.vsep [ PP.pretty "Unsupported type:"
-                 , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
-                 , PP.pretty "Type:" <> PP.viaShow ty
-                 , PP.pretty "Message:" <> PP.viaShow msg
-                 ])
+        PP.vsep [ PP.pretty "Unsupported type:"
+                , PP.pretty "Cursor:" <> ppCursor "<top>" cursor
+                , PP.pretty "Type:" <> PP.viaShow ty
+                , PP.pretty "Message:" <> PP.viaShow msg
+                ]
 
 seekLlvmType :: Cursor -> L.Type -> Either (TypeSeekError L.Type) L.Type
 seekLlvmType cursor llvmType =
