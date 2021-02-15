@@ -14,16 +14,14 @@ struct nestedtypes {
   } nested_2;
 };
 
-void nested_structs(int i, struct nestedtypes *nested) {
-  struct nestedtypes foo = {};
-
+void nested_structs(int i, struct nestedtypes *foo) {
   if (i) {
-    foo.nested_1.field_3 = i ? 1 : 0;
-    foo.nested_2.field_6 = 100.0 + (i * i + 1);
+    foo->nested_1.field_3 = i ? 1 : 0;
+    foo->nested_2.field_6 = 100.0 + (i * i + 1);
   } else {
-    foo.nested_1.field_3 = 0xBB;
-    foo.nested_2.field_6 = (i + 1) * 3.14;
+    foo->nested_1.field_3 = 0xBB;
+    foo->nested_2.field_6 = (i + 1) * 3.14;
   }
 
-  printf("field_3:%x field_6:%f\n", foo.nested_1.field_3, foo.nested_2.field_6);
+  printf("field_3:%x field_6:%f\n", foo->nested_1.field_3, foo->nested_2.field_6);
 }

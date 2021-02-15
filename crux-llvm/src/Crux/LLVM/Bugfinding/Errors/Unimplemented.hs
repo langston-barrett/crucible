@@ -14,9 +14,10 @@ Stability    : provisional
 module Crux.LLVM.Bugfinding.Errors.Unimplemented
   ( unimplemented
   , catchUnimplemented
+  , assertUnimplemented
   ) where
 
-import Control.Exception (try)
+import Control.Exception (SomeException, try, displayException)
 import Panic hiding (panic)
 import qualified Panic
 
@@ -50,3 +51,10 @@ catchUnimplemented computation =
     (\panic@(Panic Unimplemented _ _ _) -> Left (show panic))
     pure
     <$> try computation
+
+assertUnimplemented :: forall a. IO a -> IO (Either String String)
+assertUnimplemented computation =
+  either
+    (\(exc :: SomeException) -> Left (displayException exc))
+    (either Right (\_ -> Left "No exception was raised!"))
+  <$> try (catchUnimplemented computation)
