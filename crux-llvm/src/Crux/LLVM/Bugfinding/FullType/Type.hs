@@ -25,15 +25,19 @@ module Crux.LLVM.Bugfinding.FullType.Type
   , PartTypeRepr(..)
   , MapToCrucibleType
   , ToCrucibleType
+  , MapToBaseType
+  , ToBaseType
   ) where
 
 import           GHC.TypeLits (Nat)
 import           Data.Functor.Const (Const(Const))
+import           Data.Type.Equality (TestEquality(testEquality), (:~:)(Refl))
 import           Unsafe.Coerce (unsafeCoerce)
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Context (Ctx)
-import           Data.Parameterized.NatRepr
+import           Data.Parameterized.Classes (OrdF(compareF), OrderingF(LTF, GTF, EQF))
+import           Data.Parameterized.NatRepr (NatRepr, type (<=))
 import qualified Data.Parameterized.TH.GADT as U
 
 import qualified Text.LLVM.AST as L
@@ -74,6 +78,17 @@ type family ToCrucibleType (ft :: FullType arch) :: CrucibleTypes.CrucibleType w
     CrucibleTypes.VectorType (ToCrucibleType ft)
   ToCrucibleType ('FTStruct ctx) =
     CrucibleTypes.StructType (MapToCrucibleType ctx)
+
+type family MapToBaseType (ctx :: Ctx (FullType arch)) :: Ctx CrucibleTypes.BaseType where
+  MapToBaseType 'Ctx.EmptyCtx   = Ctx.EmptyCtx
+  MapToBaseType (xs 'Ctx.::> x) = MapToBaseType xs Ctx.::> ToBaseType x
+
+-- | The type of annotated What4 values that correspond to each 'FullType'
+type family ToBaseType (ft :: FullType arch) :: CrucibleTypes.BaseType where
+  ToBaseType ('FTInt n) = CrucibleTypes.BaseBVType n
+  ToBaseType ('FTPtr _ft :: FullType arch) = CrucibleTypes.BaseBVType (ArchWidth arch)
+  ToBaseType ('FTStruct ctx) = CrucibleTypes.BaseStructType (MapToBaseType ctx)
+  -- TODO(lb): BaseArrayType for Vector? It's not a BaseType in Crucible
 
 -- | A 'FullTypeRepr' has enough information to recover a
 -- 'CrucibleTypes.CrucibleType'.
@@ -164,24 +179,82 @@ data PartTypeRepr arch (ft :: FullType arch) where
 $(return [])
 
 instance TestEquality (FullTypeRepr arch) where
-  testEquality = $(U.structuralTypeEquality [t|FullTypeRepr|]
-                   [ (U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType, [|testEquality|])
-                   , (U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
-                   , (U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
-                   , (U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType, [|testEquality|])
-                   ]
-                  )
+  testEquality =
+    $(U.structuralTypeEquality [t|FullTypeRepr|]
+      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
+        , [|testEquality|]
+        )
+      ]
+    )
 
--- NOTE(lb): We just assume (via unsafeCoerce) that types with the same L.Ident
+-- TODO(lb): We just assume (via unsafeCoerce) that types with the same L.Ident
 -- are the same. Only valid when one L.Module is in use.
 instance TestEquality (PartTypeRepr arch) where
-  testEquality = $(U.structuralTypeEquality [t|PartTypeRepr|]
-                   [ (U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType, [|testEquality|])
-                   , (U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType, [|testEquality|])
-                   , (U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType, [|testEquality|])
-                   , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
-                     , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
-                             if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
-                     )
-                   ]
-                  )
+  testEquality =
+    $(U.structuralTypeEquality [t|PartTypeRepr|]
+      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
+        , [|testEquality|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
+        , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
+        )
+      ]
+    )
+
+instance OrdF (FullTypeRepr arch) where
+  compareF =
+    $(U.structuralTypeOrd [t|FullTypeRepr|]
+      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
+        , [|compareF|]
+        )
+      ]
+    )
+
+-- | See note on 'TestEquality' instance.
+instance OrdF (PartTypeRepr arch) where
+  compareF =
+    $(U.structuralTypeOrd [t|PartTypeRepr|]
+      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
+        , [|compareF|]
+        )
+      , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
+        , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                case compare ident1 ident2 of
+                  LT -> unsafeCoerce LTF :: OrderingF ft1 ft2
+                  GT -> unsafeCoerce GTF :: OrderingF ft1 ft2
+                  EQ -> unsafeCoerce EQF :: OrderingF ft1 ft2
+          |]
+        )
+      ]
+    )
