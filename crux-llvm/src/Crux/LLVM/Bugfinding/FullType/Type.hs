@@ -8,6 +8,7 @@ Stability        : provisional
 -}
 
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
@@ -19,10 +20,14 @@ Stability        : provisional
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- These come from TH-generated code
+{-# OPTIONS_GHC -Wno-overlapping-patterns #-}
+{-# OPTIONS_GHC -Wno-inaccessible-code #-}
+
 module Crux.LLVM.Bugfinding.FullType.Type
   ( type FullType(..)
+  , type Full(..)
   , FullTypeRepr(..)
-  , PartTypeRepr(..)
   , MapToCrucibleType
   , ToCrucibleType
   , MapToBaseType
@@ -90,34 +95,32 @@ type family ToBaseType (ft :: FullType arch) :: CrucibleTypes.BaseType where
   ToBaseType ('FTStruct ctx) = CrucibleTypes.BaseStructType (MapToBaseType ctx)
   -- TODO(lb): BaseArrayType for Vector? It's not a BaseType in Crucible
 
+data Full
+  = Full
+  | Part
+
 -- | A 'FullTypeRepr' has enough information to recover a
 -- 'CrucibleTypes.CrucibleType'.
-data FullTypeRepr arch (ft :: FullType arch) where
-  FTIntRepr :: (1 <= w) => NatRepr w -> FullTypeRepr arch ('FTInt w)
-  FTPtrRepr :: PartTypeRepr arch ft -> FullTypeRepr arch ('FTPtr ft)
-  FTArrayRepr :: NatRepr n -> FullTypeRepr arch ft -> FullTypeRepr arch ('FTArray n ft)
-  FTStructRepr ::
+--
+-- The parameter @full@ indicates whether this type is under a 'FTPtrRepr'. If
+-- @full@ is @True@, then the type doesn't have enough information to recover a
+-- 'CrucibleTypes.CrucibleType'.
+data FullTypeRepr (full :: Full) arch (ft :: FullType arch) where
+  FTIntRepr :: (1 <= w) => NatRepr w -> FullTypeRepr full arch ('FTInt w)
+  FTPtrRepr :: FullTypeRepr 'Part arch ft -> FullTypeRepr full arch ('FTPtr ft)
+  FTArrayRepr :: NatRepr n -> FullTypeRepr full arch ft -> FullTypeRepr full arch ('FTArray n ft)
+  FTFullStructRepr ::
     MemType.StructInfo ->
     Ctx.Assignment CrucibleTypes.TypeRepr (MapToCrucibleType fields) ->
-    Ctx.Assignment (FullTypeRepr arch) fields ->
-    FullTypeRepr arch ('FTStruct fields)
-
--- | A 'PartTypeRepr' doesn't have enough information to recover a
--- 'CrucibleTypes.CrucibleType', and so must appear under a pointer in a
--- 'FullTypeRepr'.
-data PartTypeRepr arch (ft :: FullType arch) where
-  -- PTFullTypeRepr :: FullTypeRepr ft -> PartTypeRepr ft
-  -- TODO(?) duplication
-  PTIntRepr :: (1 <= w) => NatRepr w -> PartTypeRepr arch ('FTInt w)
-  PTPtrRepr :: PartTypeRepr arch ft -> PartTypeRepr arch ('FTPtr ft)
-  PTArrayRepr :: NatRepr n -> PartTypeRepr arch ft -> PartTypeRepr arch ('FTArray n ft)
-  PTStructRepr ::
+    Ctx.Assignment (FullTypeRepr full arch) fields ->
+    FullTypeRepr full arch ('FTStruct fields)
+  FTPartStructRepr ::
     MemType.StructInfo ->
-    Ctx.Assignment (PartTypeRepr arch) fields ->
-    PartTypeRepr arch ('FTStruct fields)
+    Ctx.Assignment (FullTypeRepr 'Part arch) fields ->
+    FullTypeRepr 'Part arch ('FTStruct fields)
   -- The Const is so that we can get type variables in scope in the TestEquality
   -- instance, see below.
-  PTAliasRepr :: Const L.Ident ft -> PartTypeRepr arch ft
+  FTAliasRepr :: Const L.Ident ft -> FullTypeRepr 'Part arch ft
 
 -- data IntConstraint = IntConstraint
 
@@ -178,83 +181,89 @@ data PartTypeRepr arch (ft :: FullType arch) where
 
 $(return [])
 
-instance TestEquality (FullTypeRepr arch) where
-  testEquality =
-    $(U.structuralTypeEquality [t|FullTypeRepr|]
-      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
-        , [|testEquality|]
-        )
-      ]
-    )
-
 -- TODO(lb): We just assume (via unsafeCoerce) that types with the same L.Ident
 -- are the same. Only valid when one L.Module is in use.
-instance TestEquality (PartTypeRepr arch) where
+instance TestEquality (FullTypeRepr 'Full arch) where
   testEquality =
-    $(U.structuralTypeEquality [t|PartTypeRepr|]
-      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
-        , [|testEquality|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
-        , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
-                if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
-        )
-      ]
-    )
-
-instance OrdF (FullTypeRepr arch) where
-  compareF =
-    $(U.structuralTypeOrd [t|FullTypeRepr|]
-      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|FullTypeRepr|]) U.AnyType) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
-        , [|compareF|]
-        )
-      ]
-    )
+    $(U.structuralTypeEquality [t|FullTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (U.ConType [t|NatRepr|])
+            , [|testEquality|]
+            )
+          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
+            , [|testEquality|]
+            )
+          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|testEquality|]
+            )
+          , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
+            , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                    if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
+            )
+          ]))
 
 -- | See note on 'TestEquality' instance.
-instance OrdF (PartTypeRepr arch) where
+instance OrdF (FullTypeRepr 'Full arch) where
   compareF =
-    $(U.structuralTypeOrd [t|PartTypeRepr|]
-      [ ( U.TypeApp (U.ConType [t|NatRepr|]) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|PartTypeRepr|]) U.AnyType) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Ctx.Assignment|]) U.AnyType) U.AnyType
-        , [|compareF|]
-        )
-      , ( U.TypeApp (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|])) U.AnyType
-        , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
-                case compare ident1 ident2 of
-                  LT -> unsafeCoerce LTF :: OrderingF ft1 ft2
-                  GT -> unsafeCoerce GTF :: OrderingF ft1 ft2
-                  EQ -> unsafeCoerce EQF :: OrderingF ft1 ft2
-          |]
-        )
-      ]
-    )
+    $(U.structuralTypeOrd [t|FullTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (U.ConType [t|NatRepr|])
+            , [|compareF|]
+            )
+          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|compareF|]
+            )
+          , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
+            , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                    case compare ident1 ident2 of
+                      LT -> unsafeCoerce LTF :: OrderingF ft1 ft2
+                      GT -> unsafeCoerce GTF :: OrderingF ft1 ft2
+                      EQ -> unsafeCoerce EQF :: OrderingF ft1 ft2
+              |]
+            )
+          ]))
+
+instance TestEquality (FullTypeRepr 'Part arch) where
+  testEquality =
+    $(U.structuralTypeEquality [t|FullTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (U.ConType [t|NatRepr|])
+            , [|testEquality|]
+            )
+          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
+            , [|testEquality|]
+            )
+          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|testEquality|]
+            )
+          , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
+            , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                    if ident1 == ident2 then (Just (unsafeCoerce Refl :: ft1 :~: ft2)) else Nothing |]
+            )
+          ]))
+
+instance OrdF (FullTypeRepr 'Part arch) where
+  compareF =
+    $(U.structuralTypeOrd [t|FullTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (U.ConType [t|NatRepr|])
+            , [|compareF|]
+            )
+          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|compareF|]
+            )
+          , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
+            , [| \(Const ident1 :: Const L.Ident ft1) (Const ident2 :: Const L.Ident ft2) ->
+                    case compare ident1 ident2 of
+                      LT -> unsafeCoerce LTF :: OrderingF ft1 ft2
+                      GT -> unsafeCoerce GTF :: OrderingF ft1 ft2
+                      EQ -> unsafeCoerce EQF :: OrderingF ft1 ft2
+              |]
+            )
+          ]))

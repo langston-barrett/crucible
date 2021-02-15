@@ -69,7 +69,7 @@ data Context arch argTypes =
   Context
     { _functionName :: Text
     , _argumentNames :: Ctx.Assignment (Const (Maybe Text)) argTypes
-    , _argumentFullTypes :: Ctx.Assignment (FullTypeRepr arch) argTypes
+    , _argumentFullTypes :: Ctx.Assignment (FullTypeRepr 'Full arch) argTypes
     , _argumentCrucibleTypes :: CrucibleTypes.CtxRepr (MapToCrucibleType argTypes)
     , _argumentMemTypes :: Ctx.Assignment (Const MemType) argTypes
     , _argumentStorageTypes :: Ctx.Assignment (Const StorageType) argTypes
@@ -86,7 +86,7 @@ argumentNames = lens _argumentNames (\s v -> s { _argumentNames = v })
 argumentCrucibleTypes :: Simple Lens (Context arch argTypes) (CrucibleTypes.CtxRepr (MapToCrucibleType argTypes))
 argumentCrucibleTypes = lens _argumentCrucibleTypes (\s v -> s { _argumentCrucibleTypes = v })
 
-argumentFullTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (FullTypeRepr arch) argTypes)
+argumentFullTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (FullTypeRepr 'Full arch) argTypes)
 argumentFullTypes = lens _argumentFullTypes (\s v -> s { _argumentFullTypes = v })
 
 argumentMemTypes :: Simple Lens (Context arch argTypes) (Ctx.Assignment (Const MemType) argTypes)

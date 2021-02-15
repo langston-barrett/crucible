@@ -58,7 +58,7 @@ import           Crux.LLVM.Bugfinding.FullType.Type
 -- | c.f. @llvmTypeToRepr@
 toCrucibleType ::
   ArchOk arch =>
-  FullTypeRepr arch ft ->
+  FullTypeRepr 'Full arch ft ->
   CrucibleTypes.TypeRepr (ToCrucibleType ft)
 toCrucibleType =
   \case
@@ -66,24 +66,24 @@ toCrucibleType =
     FTPtrRepr _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
     FTArrayRepr _natRepr fullTypeRepr ->
       CrucibleTypes.VectorRepr (toCrucibleType fullTypeRepr)
-    FTStructRepr _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
+    FTFullStructRepr _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
 
 toPartType ::
   forall proxy arch.
   ArchOk arch =>
   proxy arch ->
   MemType ->
-  Maybe (Some (PartTypeRepr arch))
+  Maybe (Some (FullTypeRepr 'Part arch))
 toPartType proxy =
   \case
     PtrType (MemType memType) ->
       do Some pointedTo <- toPartType proxy memType
-         Just (Some (PTPtrRepr pointedTo))
-    PtrType (Alias ident) -> Just (Some (PTAliasRepr (Const ident)))
+         Just (Some (FTPtrRepr pointedTo))
+    PtrType (Alias ident) -> Just (Some (FTAliasRepr (Const ident)))
     mt@(PtrType _) -> unimplemented "toFullType" ("Translating " ++ show mt)
     IntType n ->
       case mkNatRepr n of
-        Some w | Just LeqProof <- isPosNat w -> Just (Some (PTIntRepr w))
+        Some w | Just LeqProof <- isPosNat w -> Just (Some (FTIntRepr w))
         _ -> panic "toPartType" ["Invalid integer width " ++ show n]
     StructType structInfo ->
       do let structInfoFields = MemType.siFields structInfo
@@ -91,8 +91,8 @@ toPartType proxy =
            Ctx.generateSomeM
              (length structInfoFields)
              (\idx -> toPartType proxy (MemType.fiType (structInfoFields Vec.! idx))
-               :: Maybe (Some (PartTypeRepr arch)))
-         Just (Some (PTStructRepr structInfo fields))
+               :: Maybe (Some (FullTypeRepr 'Part arch)))
+         Just (Some (FTPartStructRepr structInfo fields))
     _ -> unimplemented "toFullType" "Translating this type"
 
 -- NOTE(lb): I *believe* that it's impossible to translate a MemType+TypeRepr
@@ -109,7 +109,7 @@ toFullType ::
   proxy arch ->
   MemType ->
   CrucibleTypes.TypeRepr tp ->
-  Maybe (Some (FullTypeRepr arch))
+  Maybe (Some (FullTypeRepr 'Full arch))
 toFullType proxy memType typeRepr =
   case CrucibleTypes.asBaseType typeRepr of
     CrucibleTypes.AsBaseType _baseTypeRepr -> unimplemented "toFullType" "Base types"
@@ -141,7 +141,7 @@ toFullType proxy memType typeRepr =
                      Ctx.generate
                        (Ctx.size fieldTypes)
                        (\idx -> Const (MemType.fiType (MemType.siFields structInfo Vec.! Ctx.indexVal idx)))
-                 Just (Some (FTStructRepr structInfo fieldTypes fullFieldTypes))
+                 Just (Some (FTFullStructRepr structInfo fieldTypes fullFieldTypes))
             _ -> badCombo
         _ -> unimplemented "toFullType" (show typeRepr)
   where
@@ -154,7 +154,7 @@ toFullType proxy memType typeRepr =
 data SomeAssign arch crucibleTypes
   = forall fullTypes.
     SomeAssign
-      { saFullTypes :: Ctx.Assignment (FullTypeRepr arch) fullTypes
+      { saFullTypes :: Ctx.Assignment (FullTypeRepr 'Full arch) fullTypes
       , saProof :: MapToCrucibleType fullTypes :~: crucibleTypes
       }
 
@@ -183,14 +183,14 @@ assignmentToFullType proxy crucibleTypes memTypes =
 testCompatibility ::
   forall arch ft tp.
   ArchOk arch =>
-  FullTypeRepr arch (ft :: FullType arch) ->
+  FullTypeRepr 'Full arch (ft :: FullType arch) ->
   CrucibleTypes.TypeRepr tp ->
   Maybe (ToCrucibleType ft :~: tp)
 testCompatibility fullTypeRepr = testEquality (toCrucibleType fullTypeRepr)
 
 testCompatibilityAssign ::
   ArchOk arch =>
-  Ctx.Assignment (FullTypeRepr arch) ctx1 ->
+  Ctx.Assignment (FullTypeRepr 'Full arch) ctx1 ->
   Ctx.Assignment CrucibleTypes.TypeRepr ctx2 ->
   Maybe (MapToCrucibleType ctx1 :~: ctx2)
 testCompatibilityAssign ftAssign ctAssign =
@@ -207,8 +207,8 @@ testCompatibilityAssign ftAssign ctAssign =
 -- Assignments
 --
 
-data FullTypeFromCrucible arch tp =
-  forall ft. FullTypeFromCrucible (ToCrucibleType ft :~: tp) (FullTypeRepr arch ft)
+data FullTypeFromCrucible full arch tp =
+  forall ft. FullTypeFromCrucible (ToCrucibleType ft :~: tp) (FullTypeRepr full arch ft)
 
 assignmentToFullType' ::
   forall proxy arch crucibleTypes.
@@ -218,7 +218,7 @@ assignmentToFullType' ::
   proxy arch ->
   Ctx.Assignment CrucibleTypes.TypeRepr crucibleTypes ->
   Ctx.Assignment (Const MemType) crucibleTypes ->
-  Maybe (Ctx.Assignment (FullTypeFromCrucible arch) crucibleTypes)
+  Maybe (Ctx.Assignment (FullTypeFromCrucible 'Full arch) crucibleTypes)
 assignmentToFullType' proxy crucibleTypes memTypes =
   Ctx.generateM
     (Ctx.size crucibleTypes)
