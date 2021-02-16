@@ -7,6 +7,7 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -73,6 +74,7 @@ import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (LocalMem, makeLocalMem, globalMem)
 import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
+import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), FullTypeRepr, ToCrucibleType)
 
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
@@ -114,7 +116,7 @@ data SetupAssumption sym
 
 data SetupState arch sym argTypes =
   SetupState
-    { _setupMem :: LocalMem sym
+    { _setupMem :: LocalMem arch sym
     , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
       -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
@@ -124,7 +126,7 @@ data SetupState arch sym argTypes =
 makeSetupState :: LLVMMem.MemImpl sym -> SetupState arch sym argTypes
 makeSetupState mem = SetupState (makeLocalMem mem) MapF.empty 0
 
-setupMem :: Simple Lens (SetupState arch sym argTypes) (LocalMem sym)
+setupMem :: Simple Lens (SetupState arch sym argTypes) (LocalMem arch sym)
 setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 
 setupMemImpl :: SetupState arch sym argTypes -> (LLVMMem.MemImpl sym)
@@ -216,7 +218,7 @@ storableType memType =
   maybe (throwError (SetupTypeTranslationError memType)) pure (LLVMMem.toStorableType memType)
 
 modifyMem ::
-  (LocalMem sym -> Setup arch sym argTypes (a, LocalMem sym)) ->
+  (LocalMem arch sym -> Setup arch sym argTypes (a, LocalMem arch sym)) ->
   Setup arch sym argTypes a
 modifyMem f =
   do mem <- gets (view setupMem)
@@ -225,20 +227,21 @@ modifyMem f =
      pure val
 
 _modifyMem_ ::
-  (LocalMem sym -> Setup arch sym argTypes (LocalMem sym)) ->
+  (LocalMem arch sym -> Setup arch sym argTypes (LocalMem arch sym)) ->
   Setup arch sym argTypes ()
 _modifyMem_ f = modifyMem (fmap ((),) . f)
 
 malloc ::
-  forall sym arch argTypes.
+  forall sym arch argTypes full ft.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
   sym ->
+  FullTypeRepr full arch (FTPtr ft) ->
   MemType ->
   (LLVMMem.LLVMPtr sym (ArchWidth arch)) ->
   Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
-malloc sym memType ptr =
+malloc sym fullTypeRepr memType ptr =
   do context <- ask
      let dl =
            context ^.
@@ -249,36 +252,38 @@ malloc sym memType ptr =
      ptr' <-
        modifyMem $
          \mem ->
-           liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl memType
+           liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl fullTypeRepr memType
      pure ptr'
 
 store ::
-  forall arch sym argTypes tp.
+  forall arch sym argTypes full ft.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   sym ->
+  FullTypeRepr full arch ft ->
   MemType ->
-  Crucible.RegEntry sym tp ->
+  Crucible.RegEntry sym (ToCrucibleType ft) ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
-store sym memType regEntry ptr =
+store sym fullTypeRepr memType regEntry ptr =
   do storageType <- storableType memType
      modifyMem $
        \mem ->
          liftIO $
-           LocalMem.store (Proxy :: Proxy arch) mem sym storageType regEntry ptr
+           LocalMem.store (Proxy :: Proxy arch) mem sym fullTypeRepr storageType regEntry ptr
 
 load ::
-  forall arch sym argTypes.
+  forall arch sym argTypes full ft.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   sym ->
+  FullTypeRepr full arch ft ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  Setup arch sym argTypes (Maybe (Some (Crucible.RegEntry sym)))
-load sym ptr =
+  Setup arch sym argTypes (Maybe (LocalMem.TypedRegEntry arch sym ft))
+load sym fullTypeRepr ptr =
   do mem <- gets (view setupMem)
-     pure $ LocalMem.load (Proxy :: Proxy arch) mem sym ptr
+     pure $ LocalMem.load (Proxy :: Proxy arch) mem sym fullTypeRepr ptr

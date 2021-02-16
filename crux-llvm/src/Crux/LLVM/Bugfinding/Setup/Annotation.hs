@@ -7,6 +7,7 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -27,19 +28,19 @@ import qualified Data.Parameterized.TH.GADT as U
 
 import qualified What4.Interface as What4
 
-import           Crux.LLVM.Bugfinding.FullType (FullTypeRepr, FullRepr, ToBaseType, toFullRepr)
+import           Crux.LLVM.Bugfinding.FullType (FullType(FTPtr), FullTypeRepr, FullRepr, ToBaseType, toFullRepr)
 
 data Annotation arch sym ft =
   forall full.
   Annotation
-    { symAnnotation :: What4.SymAnnotation sym (ToBaseType ft)
+    { symAnnotation :: What4.SymAnnotation sym (ToBaseType ('FTPtr ft))
     , annfullRepr :: FullRepr full
-    , annFullTypeRepr :: FullTypeRepr full arch ft
+    , annFullTypeRepr :: FullTypeRepr full arch ('FTPtr ft)
     }
 
 makeAnnotation ::
-  FullTypeRepr full arch ft ->
-  What4.SymAnnotation sym (ToBaseType ft) ->
+  FullTypeRepr full arch ('FTPtr ft) ->
+  What4.SymAnnotation sym (ToBaseType ('FTPtr ft)) ->
   Annotation arch sym ft
 makeAnnotation ftRepr ann = Annotation ann (toFullRepr ftRepr) ftRepr
 
