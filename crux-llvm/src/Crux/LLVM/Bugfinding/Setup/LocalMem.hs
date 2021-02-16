@@ -67,7 +67,7 @@ import           Crux.LLVM.Bugfinding.FullType (FullType(FTPtr), FullTypeRepr(FT
 import           Crux.LLVM.Bugfinding.Setup.Annotation (Annotation, makeAnnotation)
 
 data TypedRegEntry arch sym ft =
-  forall full tp. TypedRegEntry (FullTypeRepr full arch ft) (Crucible.RegEntry sym tp)
+  forall full. TypedRegEntry (FullTypeRepr full arch ft) (Crucible.RegEntry sym (ToCrucibleType ft))
 
 data LocalMem arch sym
   = LocalMem

@@ -237,7 +237,7 @@ malloc ::
   , ArchOk arch
   ) =>
   sym ->
-  FullTypeRepr full arch (FTPtr ft) ->
+  FullTypeRepr full arch ft ->
   MemType ->
   (LLVMMem.LLVMPtr sym (ArchWidth arch)) ->
   Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))

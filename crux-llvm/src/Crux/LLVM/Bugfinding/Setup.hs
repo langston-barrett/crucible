@@ -53,9 +53,11 @@ import           Crux.LLVM.Overrides (ArchOk)
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Cursor
-import           Crux.LLVM.Bugfinding.FullType (MapToCrucibleType, SomeIndex(..), translateIndex, generateM)
+import           Crux.LLVM.Bugfinding.FullType.CrucibleType (SomeIndex(..), translateIndex, generateM)
+import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), ToCrucibleType, MapToCrucibleType, FullTypeRepr(FTPtrRepr))
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad
+import           Crux.LLVM.Bugfinding.Setup.LocalMem (TypedRegEntry(..))
 
 -- TODO unsorted
 import Data.Proxy (Proxy(Proxy))
@@ -208,7 +210,7 @@ generateMinimalArgs context sym = do
 --
 -- TODO: Allow for array initialization
 initialize ::
-  forall arch sym argTypes.
+  forall arch sym argTypes full ft.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
@@ -216,29 +218,31 @@ initialize ::
   Context arch argTypes ->
   sym ->
   MemType ->
+  FullTypeRepr full arch ('FTPtr ft) {-^ Type of pointer -} ->
   Selector arch argTypes {-^ Selector for the pointer -} ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch), Some (Crucible.RegEntry sym))
-initialize context sym pointedToType selector pointer =
-  load sym pointer >>=
+  Setup arch sym argTypes ( LLVMMem.LLVMPtr sym (ArchWidth arch)
+                          , Crucible.RegEntry sym (ToCrucibleType ft)
+                          )
+initialize context sym pointedToType ftPtr@(FTPtrRepr _ _ ftPointedTo) selector pointer =
+  load sym ftPointedTo pointer >>=
     \case
-      Just val -> pure (pointer, val)
+      Just (TypedRegEntry _fullTypeRepr' regEntry) -> pure (pointer, regEntry)
       Nothing ->
         withTypeContext context $
           LLVMTrans.llvmTypeAsRepr
             pointedToType
             (\tp ->  -- the Crucible type being pointed at
-              do ptr <- malloc sym pointedToType pointer
+              do ptr <- malloc sym ftPointedTo pointedToType pointer
                  pointedToVal <-
                    generateMinimalValue
                      (Proxy :: Proxy arch)
                      sym
                      tp
-                     -- (selector & selectorCursor %~ id)
                      (selector & selectorCursor %~ Dereference)
                  ptr' <-
-                   store sym pointedToType (Crucible.RegEntry tp pointedToVal) ptr
-                 pure (ptr', Some (Crucible.RegEntry tp pointedToVal)))
+                   store sym ftPointedTo pointedToType (Crucible.RegEntry tp pointedToVal) ptr
+                 pure (ptr', Crucible.RegEntry tp pointedToVal))
 
 constrainHere ::
   forall arch sym argTypes tp.

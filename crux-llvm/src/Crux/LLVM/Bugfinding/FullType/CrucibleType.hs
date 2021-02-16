@@ -33,6 +33,7 @@ module Crux.LLVM.Bugfinding.FullType.CrucibleType
   ) where
 
 import           Data.Functor.Const (Const(Const, getConst))
+import           Data.Proxy (Proxy(Proxy))
 import qualified Data.Vector as Vec
 
 import qualified Data.Parameterized.Context as Ctx
@@ -44,7 +45,7 @@ import qualified Lang.Crucible.Types as CrucibleTypes hiding ((::>))
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import           Lang.Crucible.LLVM.MemType (MemType(..), SymType(..))
 import qualified Lang.Crucible.LLVM.MemType as MemType
-import           Lang.Crucible.LLVM.TypeContext (TypeContext)
+import           Lang.Crucible.LLVM.TypeContext (TypeContext, asMemType)
 
 import           Crux.LLVM.Overrides (ArchOk)
 import           Crux.LLVM.Bugfinding.Errors.Panic (panic)
@@ -70,6 +71,36 @@ toCrucibleType =
       case assignmentToCrucibleType typeReprs of
         SomeAssign' ctReprs Refl -> CrucibleTypes.StructRepr ctReprs
 
+-- | c.f. @llvmTypeToRepr@
+toCrucibleType' ::
+  forall arch full ft.
+  ( ?lc :: TypeContext
+  , ArchOk arch
+  ) =>
+  FullTypeRepr full arch ft ->
+  CrucibleTypes.TypeRepr (ToCrucibleType ft)
+toCrucibleType' =
+  \case
+    FTIntRepr _ natRepr -> LLVMMem.LLVMPointerRepr natRepr
+    FTPtrRepr _ _ _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
+    FTArrayRepr _ _natRepr fullTypeRepr ->
+      CrucibleTypes.VectorRepr (toCrucibleType' fullTypeRepr)
+    FTFullStructRepr _ _ typeReprs ->
+      case anyAssignmentToCrucibleType toCrucibleType' typeReprs of
+        SomeAssign' ctReprs Refl -> CrucibleTypes.StructRepr ctReprs
+    FTPartStructRepr _ typeReprs ->
+      case anyAssignmentToCrucibleType toCrucibleType' typeReprs of
+        SomeAssign' ctReprs Refl -> CrucibleTypes.StructRepr ctReprs
+    FTAliasRepr (Const ident) -> undefined -- TODO
+      -- TODO: Maybe handle this?
+      -- case asMemType (Alias ident) of
+      --   Left err -> panic "toCrucibleType'" ["bad alias"]
+      --   Right memType ->
+      --     case toPartType (Proxy :: Proxy arch) memType of
+      --       Just (Some partType) -> toCrucibleType' partType
+      --       Nothing -> panic "toCrucibleType'" ["bad mem type"]
+
+-- TODO: Make this total?
 toPartType ::
   forall proxy arch.
   ArchOk arch =>
@@ -114,7 +145,8 @@ toFullType ::
   Maybe (Some (FullTypeRepr 'Full arch))
 toFullType proxy memType typeRepr =
   case CrucibleTypes.asBaseType typeRepr of
-    CrucibleTypes.AsBaseType _baseTypeRepr -> unimplemented "toFullType" "Base types"
+    CrucibleTypes.AsBaseType _baseTypeRepr ->
+      unimplemented "toFullType" "Base types"
     CrucibleTypes.NotBaseType ->
       case typeRepr of
         LLVMMem.LLVMPointerRepr w ->
@@ -199,33 +231,71 @@ assignmentToCrucibleType fullTypes =
           (Ctx.sizeInt (Ctx.size fullTypes))
           (\idx ->
               case Ctx.intIndex idx (Ctx.size fullTypes) of
-                Nothing -> panic "assignmentToCrucibleType" ["Impossible"]
+                Nothing ->
+                  panic
+                    "assignmentToCrucibleType"
+                    ["Impossible: Index was from the same context!"]
                 Just (Some idx') -> Some (toCrucibleType (fullTypes Ctx.! idx')))
   in case someCrucibleTypes of
        Some crucibleTypes ->
         case testCompatibilityAssign fullTypes crucibleTypes of
           Just Refl -> SomeAssign' crucibleTypes Refl
-          Nothing -> panic "assignmentToCrucibleType" ["Impossible"]
+          Nothing ->
+            panic
+              "assignmentToCrucibleType"
+              ["Impossible: Types match by construction!"]
+
+anyAssignmentToCrucibleType ::
+  ArchOk arch =>
+  (forall ft. FullTypeRepr full arch ft -> CrucibleTypes.TypeRepr (ToCrucibleType ft)) ->
+  Ctx.Assignment (FullTypeRepr full arch) fts ->
+  SomeAssign' arch fts
+anyAssignmentToCrucibleType convert fullTypes =
+  let someCrucibleTypes =
+        Ctx.generateSome
+          (Ctx.sizeInt (Ctx.size fullTypes))
+          (\idx ->
+              case Ctx.intIndex idx (Ctx.size fullTypes) of
+                Nothing ->
+                  panic
+                    "assignmentToCrucibleType"
+                    ["Impossible: Index was from the same context!"]
+                Just (Some idx') -> Some (convert (fullTypes Ctx.! idx')))
+  in case someCrucibleTypes of
+       Some crucibleTypes ->
+        case testCompatibilityAnyAssign convert fullTypes crucibleTypes of
+          Just Refl -> SomeAssign' crucibleTypes Refl
+          Nothing ->
+            panic
+              "assignmentToCrucibleType"
+              ["Impossible: Types match by construction!"]
 
 testCompatibility ::
-  forall arch ft tp.
   ArchOk arch =>
-  FullTypeRepr 'Full arch (ft :: FullType arch) ->
+  (forall ft. FullTypeRepr full arch ft -> CrucibleTypes.TypeRepr (ToCrucibleType ft)) ->
+  FullTypeRepr full arch (ft :: FullType arch) ->
   CrucibleTypes.TypeRepr tp ->
   Maybe (ToCrucibleType ft :~: tp)
-testCompatibility fullTypeRepr = testEquality (toCrucibleType fullTypeRepr)
+testCompatibility convert fullTypeRepr = testEquality (convert fullTypeRepr)
 
 testCompatibilityAssign ::
   ArchOk arch =>
   Ctx.Assignment (FullTypeRepr 'Full arch) ctx1 ->
   Ctx.Assignment CrucibleTypes.TypeRepr ctx2 ->
   Maybe (MapToCrucibleType ctx1 :~: ctx2)
-testCompatibilityAssign ftAssign ctAssign =
-  -- TODO(lb): This is like a zip + fold?
+testCompatibilityAssign = testCompatibilityAnyAssign toCrucibleType
+
+testCompatibilityAnyAssign ::
+  ArchOk arch =>
+  (forall ft. FullTypeRepr full arch ft -> CrucibleTypes.TypeRepr (ToCrucibleType ft)) ->
+  Ctx.Assignment (FullTypeRepr full arch) ctx1 ->
+  Ctx.Assignment CrucibleTypes.TypeRepr ctx2 ->
+  Maybe (MapToCrucibleType ctx1 :~: ctx2)
+testCompatibilityAnyAssign convert ftAssign ctAssign =
   case (Ctx.viewAssign ftAssign, Ctx.viewAssign ctAssign) of
     (Ctx.AssignEmpty, Ctx.AssignEmpty) -> Just Refl
     (Ctx.AssignExtend ftRest ftHead, Ctx.AssignExtend ctRest ctHead) ->
-      case (testCompatibility ftHead ctHead, testCompatibilityAssign ftRest ctRest) of
+      case (testCompatibility convert ftHead ctHead, testCompatibilityAnyAssign convert ftRest ctRest) of
         (Just Refl, Just Refl) -> Just Refl
         _ -> Nothing
     _ -> Nothing

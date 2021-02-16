@@ -35,7 +35,7 @@ toMemType =
         Right memType -> PtrType (MemType memType)
     FTArrayRepr _ natRepr fullTypeRepr ->
       ArrayType (natValue natRepr) (toMemType fullTypeRepr)
-    FTFullStructRepr _ structInfo _ _ -> StructType structInfo
+    FTFullStructRepr _ structInfo _ -> StructType structInfo
 
 toMemType' :: FullTypeRepr full arch ft -> Either SymType MemType
 toMemType' =
@@ -50,6 +50,6 @@ toMemType' =
         Left symType ->
           panic "toMemType" ["Impossible: Alias can't appear directly in Array"]
         Right memType -> Right (ArrayType (natValue natRepr) memType)
-    FTFullStructRepr _ structInfo _ _ -> Right (StructType structInfo)
+    FTFullStructRepr _ structInfo _ -> Right (StructType structInfo)
     FTPartStructRepr structInfo _ -> Right (StructType structInfo)
     FTAliasRepr (Const ident) -> Left (Alias ident)
