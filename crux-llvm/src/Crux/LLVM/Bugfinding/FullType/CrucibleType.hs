@@ -63,7 +63,7 @@ toCrucibleType ::
 toCrucibleType =
   \case
     FTIntRepr _ natRepr -> LLVMMem.LLVMPointerRepr natRepr
-    FTPtrRepr _ _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
+    FTPtrRepr _ _ _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
     FTArrayRepr _ _natRepr fullTypeRepr ->
       CrucibleTypes.VectorRepr (toCrucibleType fullTypeRepr)
     FTFullStructRepr _ _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
@@ -78,7 +78,7 @@ toPartType proxy =
   \case
     PtrType (MemType memType) ->
       do Some pointedTo <- toPartType proxy memType
-         Just (Some (FTPtrRepr PartRepr pointedTo))
+         Just (Some (FTPtrRepr PartRepr PartRepr pointedTo))
     PtrType (Alias ident) -> Just (Some (FTAliasRepr (Const ident)))
     mt@(PtrType _) -> unimplemented "toFullType" ("Translating " ++ show mt)
     IntType n ->
@@ -119,7 +119,7 @@ toFullType proxy memType typeRepr =
           case (memType, testEquality ?ptrWidth w) of
             (PtrType _symType, Just Refl) ->
               do Some contained <- toPartType proxy memType
-                 Just (Some (FTPtrRepr FullRepr contained))
+                 Just (Some (FTPtrRepr PartRepr FullRepr contained))
             (IntType _w, _) ->
               -- TODO assert about _w
               Just (Some (FTIntRepr FullRepr w))

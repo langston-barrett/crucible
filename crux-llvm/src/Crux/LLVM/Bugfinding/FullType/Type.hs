@@ -119,8 +119,9 @@ data FullTypeRepr (full :: Full) arch (ft :: FullType arch) where
     FullTypeRepr full arch ('FTInt w)
   FTPtrRepr ::
     FullRepr full ->
-    FullTypeRepr 'Part arch ft ->
-    FullTypeRepr full arch ('FTPtr ft)
+    FullRepr full' ->
+    FullTypeRepr full arch ft ->
+    FullTypeRepr full' arch ('FTPtr ft)
   FTArrayRepr ::
     FullRepr full ->
     NatRepr n ->
@@ -146,7 +147,7 @@ toFullRepr :: FullTypeRepr full arch ft -> FullRepr full
 toFullRepr =
   \case
     FTIntRepr fullRepr _ -> fullRepr
-    FTPtrRepr fullRepr _ -> fullRepr
+    FTPtrRepr _ fullRepr _ -> fullRepr
     FTArrayRepr fullRepr _ _ -> fullRepr
     FTFullStructRepr fullRepr _ _ _ -> fullRepr
     FTPartStructRepr{} -> PartRepr
