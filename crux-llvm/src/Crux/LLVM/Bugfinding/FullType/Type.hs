@@ -130,7 +130,6 @@ data FullTypeRepr (full :: Full) arch (ft :: FullType arch) where
   FTFullStructRepr ::
     FullRepr full ->
     MemType.StructInfo ->
-    Ctx.Assignment CrucibleTypes.TypeRepr (MapToCrucibleType fields) ->
     Ctx.Assignment (FullTypeRepr full arch) fields ->
     FullTypeRepr full arch ('FTStruct fields)
   FTPartStructRepr ::
@@ -149,7 +148,7 @@ toFullRepr =
     FTIntRepr fullRepr _ -> fullRepr
     FTPtrRepr _ fullRepr _ -> fullRepr
     FTArrayRepr fullRepr _ _ -> fullRepr
-    FTFullStructRepr fullRepr _ _ _ -> fullRepr
+    FTFullStructRepr fullRepr _ _ -> fullRepr
     FTPartStructRepr{} -> PartRepr
     FTAliasRepr{} -> PartRepr
 

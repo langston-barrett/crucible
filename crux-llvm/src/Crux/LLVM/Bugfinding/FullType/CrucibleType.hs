@@ -66,7 +66,9 @@ toCrucibleType =
     FTPtrRepr _ _ _ -> LLVMMem.LLVMPointerRepr ?ptrWidth
     FTArrayRepr _ _natRepr fullTypeRepr ->
       CrucibleTypes.VectorRepr (toCrucibleType fullTypeRepr)
-    FTFullStructRepr _ _ typeReprs _ -> CrucibleTypes.StructRepr typeReprs
+    FTFullStructRepr _ _ typeReprs ->
+      case assignmentToCrucibleType typeReprs of
+        SomeAssign' ctReprs Refl -> CrucibleTypes.StructRepr ctReprs
 
 toPartType ::
   forall proxy arch.
@@ -141,7 +143,7 @@ toFullType proxy memType typeRepr =
                      Ctx.generate
                        (Ctx.size fieldTypes)
                        (\idx -> Const (MemType.fiType (MemType.siFields structInfo Vec.! Ctx.indexVal idx)))
-                 Just (Some (FTFullStructRepr FullRepr structInfo fieldTypes fullFieldTypes))
+                 Just (Some (FTFullStructRepr FullRepr structInfo fullFieldTypes))
             _ -> badCombo
         _ -> unimplemented "toFullType" (show typeRepr)
   where
@@ -179,6 +181,31 @@ assignmentToFullType proxy crucibleTypes memTypes =
               Just (Some fullTypeRepr))
      Refl <- testCompatibilityAssign fullTypes crucibleTypes
      Just (SomeAssign fullTypes Refl)
+
+data SomeAssign' arch fullTypes
+  = forall crucibleTypes.
+    SomeAssign'
+      { saCrucibleTypes :: Ctx.Assignment CrucibleTypes.TypeRepr crucibleTypes
+      , saProof' :: MapToCrucibleType fullTypes :~: crucibleTypes
+      }
+
+assignmentToCrucibleType ::
+  ArchOk arch =>
+  Ctx.Assignment (FullTypeRepr 'Full arch) fts ->
+  SomeAssign' arch fts
+assignmentToCrucibleType fullTypes =
+  let someCrucibleTypes =
+        Ctx.generateSome
+          (Ctx.sizeInt (Ctx.size fullTypes))
+          (\idx ->
+              case Ctx.intIndex idx (Ctx.size fullTypes) of
+                Nothing -> panic "assignmentToCrucibleType" ["Impossible"]
+                Just (Some idx') -> Some (toCrucibleType (fullTypes Ctx.! idx')))
+  in case someCrucibleTypes of
+       Some crucibleTypes ->
+        case testCompatibilityAssign fullTypes crucibleTypes of
+          Just Refl -> SomeAssign' crucibleTypes Refl
+          Nothing -> panic "assignmentToCrucibleType" ["Impossible"]
 
 testCompatibility ::
   forall arch ft tp.
