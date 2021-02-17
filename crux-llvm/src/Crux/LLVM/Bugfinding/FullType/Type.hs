@@ -1,10 +1,30 @@
 {-
 Module           : Crux.LLVM.Bugfinding.FullType.Type
-Description      : 'FullType' is like a 'CrucibleTypes.CrucibleType' and a 'MemType'
+Description      : 'FullType' is like a 'CrucibleTypes.CrucibleType' and a 'MemType.MemType'
 Copyright        : (c) Galois, Inc 2021
 License          : BSD3
 Maintainer       : Langston Barrett <langston@galois.com>
 Stability        : provisional
+
+A 'FullType' is like a 'CrucibleTypes.CrucibleType', but contains type
+information through pointer references. Alternatively, it\'s like a
+'MemType.MemType' that can be linked to a 'CrucibleTypes.CrucibleType' by
+type-level information.
+
+By using this machinery, we head off several sources of partiality/errors:
+
+* By passing a 'FullType' instead of a 'MemType.MemType' and a
+  'CrucibleTypes.CrucibleType', you can no longer pass incompatible/out-of-sync
+  inputs.
+* When building a @RegValue@, using 'FullType' can help prevent ill-typed
+  pointers.
+* There are a few sources of partiality in the 'MemType.MemType' to
+  'CrucibleTypes.TypeRepr' translation that can be avoided, specifically
+  ill-sized integer values.
+
+TODO: Split into Internal module, don't export PartTypeRepr constructors from
+this module, see @asFullType@
+
 -}
 
 {-# LANGUAGE DataKinds #-}
@@ -25,11 +45,9 @@ Stability        : provisional
 {-# OPTIONS_GHC -Wno-inaccessible-code #-}
 
 module Crux.LLVM.Bugfinding.FullType.Type
-  ( type Full(..)
-  , FullRepr(..)
-  , type FullType(..)
+  ( type FullType(..)
   , FullTypeRepr(..)
-  , toFullRepr
+  , PartTypeRepr(..)
   , MapToCrucibleType
   , ToCrucibleType
   , MapToBaseType
@@ -55,107 +73,70 @@ import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import qualified Lang.Crucible.LLVM.MemType as MemType
 
 -- | Type level only
---
--- Like a 'CrucibleTypes.CrucibleType', but contains type information through
--- pointer references.
---
--- Alternatively, like a 'MemType' that can be linked to a
--- 'CrucibleTypes.CrucibleType' by type-level information.
-data FullType arch where
-  FTInt :: Nat -> FullType arch
-  FTFloat :: FullType arch
-  FTPtr :: FullType arch -> FullType arch
-  FTArray :: Nat -> FullType arch -> FullType arch
-  FTStruct :: Ctx.Ctx (FullType arch) -> FullType arch
+data FullType m where
+  FTInt :: Nat -> FullType m
+  FTFloat :: FullType m
+  FTPtr :: FullType m -> FullType m
+  FTArray :: Nat -> FullType m -> FullType m
+  FTStruct :: Ctx.Ctx (FullType m) -> FullType m
 
-type family MapToCrucibleType (ctx :: Ctx (FullType arch)) :: Ctx CrucibleTypes.CrucibleType where
-  MapToCrucibleType 'Ctx.EmptyCtx   = Ctx.EmptyCtx
-  MapToCrucibleType (xs 'Ctx.::> x) = MapToCrucibleType xs Ctx.::> ToCrucibleType x
+type family MapToCrucibleType arch (ctx :: Ctx (FullType m)) :: Ctx CrucibleTypes.CrucibleType where
+  MapToCrucibleType arch 'Ctx.EmptyCtx   = Ctx.EmptyCtx
+  MapToCrucibleType arch (xs 'Ctx.::> x) = MapToCrucibleType arch xs Ctx.::> ToCrucibleType arch x
 
-type family ToCrucibleType (ft :: FullType arch) :: CrucibleTypes.CrucibleType where
-  ToCrucibleType ('FTInt n) =
+type family ToCrucibleType arch (ft :: FullType m) :: CrucibleTypes.CrucibleType where
+  ToCrucibleType arch ('FTInt n) =
     CrucibleTypes.IntrinsicType
       "LLVM_pointer"
       (Ctx.EmptyCtx Ctx.::> CrucibleTypes.BVType n)
-  ToCrucibleType ('FTPtr _ft :: FullType arch) =
+  ToCrucibleType arch ('FTPtr _ft) =
     CrucibleTypes.IntrinsicType
       "LLVM_pointer"
       (Ctx.EmptyCtx Ctx.::> CrucibleTypes.BVType (ArchWidth arch))
-  ToCrucibleType ('FTArray _n ft) =
-    CrucibleTypes.VectorType (ToCrucibleType ft)
-  ToCrucibleType ('FTStruct ctx) =
-    CrucibleTypes.StructType (MapToCrucibleType ctx)
+  ToCrucibleType arch ('FTArray _n ft) =
+    CrucibleTypes.VectorType (ToCrucibleType arch ft)
+  ToCrucibleType arch ('FTStruct ctx) =
+    CrucibleTypes.StructType (MapToCrucibleType arch ctx)
 
-type family MapToBaseType (ctx :: Ctx (FullType arch)) :: Ctx CrucibleTypes.BaseType where
-  MapToBaseType 'Ctx.EmptyCtx   = Ctx.EmptyCtx
-  MapToBaseType (xs 'Ctx.::> x) = MapToBaseType xs Ctx.::> ToBaseType x
+type family MapToBaseType arch (ctx :: Ctx (FullType m)) :: Ctx CrucibleTypes.BaseType where
+  MapToBaseType arch 'Ctx.EmptyCtx   = Ctx.EmptyCtx
+  MapToBaseType arch (xs 'Ctx.::> x) = MapToBaseType arch xs Ctx.::> ToBaseType arch x
 
 -- | The type of annotated What4 values that correspond to each 'FullType'
-type family ToBaseType (ft :: FullType arch) :: CrucibleTypes.BaseType where
-  ToBaseType ('FTInt n) = CrucibleTypes.BaseBVType n
-  ToBaseType ('FTPtr _ft :: FullType arch) = CrucibleTypes.BaseBVType (ArchWidth arch)
-  ToBaseType ('FTStruct ctx) = CrucibleTypes.BaseStructType (MapToBaseType ctx)
+type family ToBaseType arch (ft :: FullType m) :: CrucibleTypes.BaseType where
+  ToBaseType arch ('FTInt n) = CrucibleTypes.BaseBVType n
+  ToBaseType arch ('FTPtr _ft) = CrucibleTypes.BaseBVType (ArchWidth arch)
+  ToBaseType arch ('FTStruct ctx) = CrucibleTypes.BaseStructType (MapToBaseType arch ctx)
   -- TODO(lb): BaseArrayType for Vector? It's not a BaseType in Crucible
 
-data Full
-  = Full
-  | Part
-
-data FullRepr (full :: Full) where
-  FullRepr :: FullRepr 'Full
-  PartRepr :: FullRepr 'Part
-
--- | A 'FullTypeRepr' has enough information to recover a
--- 'CrucibleTypes.CrucibleType'.
---
--- The parameter @full@ indicates whether this type is under a 'FTPtrRepr'. If
--- @full@ is @True@, then the type doesn't have enough information to recover a
--- 'CrucibleTypes.CrucibleType'.
-data FullTypeRepr (full :: Full) arch (ft :: FullType arch) where
+data FullTypeRepr m (ft :: FullType m) where
   FTIntRepr ::
     (1 <= w) =>
-    FullRepr full ->
     NatRepr w ->
-    FullTypeRepr full arch ('FTInt w)
+    FullTypeRepr m ('FTInt w)
   FTPtrRepr ::
-    FullRepr full ->
-    FullRepr full' ->
-    FullTypeRepr full arch ft ->
-    FullTypeRepr full' arch ('FTPtr ft)
+    PartTypeRepr m ft ->
+    FullTypeRepr m ('FTPtr ft)
   FTArrayRepr ::
-    FullRepr full ->
     NatRepr n ->
-    FullTypeRepr full arch ft ->
-    FullTypeRepr full arch ('FTArray n ft)
-  FTFullStructRepr ::
-    FullRepr full ->
+    FullTypeRepr m ft ->
+    FullTypeRepr m ('FTArray n ft)
+  FTStructRepr ::
     MemType.StructInfo ->
-    Ctx.Assignment (FullTypeRepr full arch) fields ->
-    FullTypeRepr full arch ('FTStruct fields)
-  FTPartStructRepr ::
-    MemType.StructInfo ->
-    Ctx.Assignment (FullTypeRepr 'Part arch) fields ->
-    FullTypeRepr 'Part arch ('FTStruct fields)
+    Ctx.Assignment (FullTypeRepr m) fields ->
+    FullTypeRepr m ('FTStruct fields)
+
+-- | This functions similarly to 'MemType.SymType'
+data PartTypeRepr m (ft :: FullType m) where
+  PTFullRepr :: FullTypeRepr m ft -> PartTypeRepr m ft
   -- The Const is so that we can get type variables in scope in the TestEquality
   -- instance, see below.
-  FTAliasRepr ::
-    Const L.Ident ft ->
-    FullTypeRepr 'Part arch ft
-
-toFullRepr :: FullTypeRepr full arch ft -> FullRepr full
-toFullRepr =
-  \case
-    FTIntRepr fullRepr _ -> fullRepr
-    FTPtrRepr _ fullRepr _ -> fullRepr
-    FTArrayRepr fullRepr _ _ -> fullRepr
-    FTFullStructRepr fullRepr _ _ -> fullRepr
-    FTPartStructRepr{} -> PartRepr
-    FTAliasRepr{} -> PartRepr
+  PTAliasRepr :: Const L.Ident ft -> PartTypeRepr m ft
 
 -- data IntConstraint = IntConstraint
 
 -- -- Describe the structure of values and constraints on them
--- data ValueSpec (ty :: FullType arch) where
+-- data ValueSpec (ty :: FullType) where
 --   VSMinimal :: ValueSpec ty
 --   VSInt :: [IntConstraint] -> ValueSpec ('FTInt n)
 --   VSAnyPtr :: ValueSpec ('FTPtr ty) -- TODO just VSMinimal
@@ -167,7 +148,7 @@ toFullRepr =
 --   VSArray :: Vector n (ValueSpec ty) -> ValueSpec ('FTArray n ty)
 
 -- -- Should a Cursor say what type it points *to*?
--- data Cursor (ty :: FullType arch) where
+-- data Cursor (ty :: FullType) where
 --   Here :: Cursor ty
 --   Dereference :: Cursor ty -> Cursor ('FTPtr ty)
 --   Index :: (i <= n) => NatRepr i -> Cursor ty -> Cursor ('FTArray n ty)
@@ -211,28 +192,13 @@ toFullRepr =
 
 $(return [])
 
-instance TestEquality FullRepr where
-  testEquality = $(U.structuralTypeEquality [t|FullRepr|] [])
-
-instance OrdF FullRepr where
-  compareF = $(U.structuralTypeOrd [t|FullRepr|] [])
-
--- TODO(lb): We just assume (via unsafeCoerce) that types with the same L.Ident
--- are the same. Only valid when one L.Module is in use.
-instance TestEquality (FullTypeRepr full arch) where
+-- | We assume (via unsafeCoerce) that types with the same L.Ident are the same.
+-- This is validated by the existential used in @makeModuleTypes@.
+instance TestEquality (PartTypeRepr m) where
   testEquality =
-    $(U.structuralTypeEquality [t|FullTypeRepr|]
+    $(U.structuralTypeEquality [t|PartTypeRepr|]
       (let appAny con = U.TypeApp con U.AnyType
-       in [ ( appAny (U.ConType [t|NatRepr|])
-            , [|testEquality|]
-            )
-          , ( appAny (U.ConType [t|FullRepr|])
-            , [|testEquality|]
-            )
-          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
-            , [|testEquality|]
-            )
-          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+       in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
             , [|testEquality|]
             )
           , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
@@ -241,21 +207,30 @@ instance TestEquality (FullTypeRepr full arch) where
             )
           ]))
 
--- | See note on 'TestEquality' instance.
-instance OrdF (FullTypeRepr full arch) where
-  compareF =
-    $(U.structuralTypeOrd [t|FullTypeRepr|]
+instance TestEquality (FullTypeRepr m) where
+  testEquality =
+    $(U.structuralTypeEquality [t|FullTypeRepr|]
       (let appAny con = U.TypeApp con U.AnyType
        in [ ( appAny (U.ConType [t|NatRepr|])
-            , [|compareF|]
+            , [|testEquality|]
             )
-          , ( appAny (U.ConType [t|FullRepr|])
-            , [|compareF|]
+          , ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
+            , [|testEquality|]
             )
-          , ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
-            , [|compareF|]
+          , ( appAny (appAny (U.ConType [t|PartTypeRepr|]))
+            , [|testEquality|]
             )
           , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|testEquality|]
+            )
+          ]))
+
+-- | See note on 'TestEquality' instance.
+instance OrdF (PartTypeRepr m) where
+  compareF =
+    $(U.structuralTypeOrd [t|PartTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
             , [|compareF|]
             )
           , ( appAny (U.TypeApp (U.ConType [t|Const|]) (U.ConType [t|L.Ident|]))
@@ -265,5 +240,24 @@ instance OrdF (FullTypeRepr full arch) where
                       GT -> unsafeCoerce GTF :: OrderingF ft1 ft2
                       EQ -> unsafeCoerce EQF :: OrderingF ft1 ft2
               |]
+            )
+          ]))
+
+
+instance OrdF (FullTypeRepr m) where
+  compareF =
+    $(U.structuralTypeOrd [t|FullTypeRepr|]
+      (let appAny con = U.TypeApp con U.AnyType
+       in [ ( appAny (U.ConType [t|NatRepr|])
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|PartTypeRepr|]))
+            , [|compareF|]
             )
           ]))

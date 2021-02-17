@@ -130,7 +130,6 @@ tests =
     , isUnclassified "do_memset.c" "do_memset"  -- goal: isSafeWP
     , isUnclassified "do_recv.c" "do_recv"
     , isUnclassified "linked_list_sum.c" "linked_list_sum"  -- goal: isSafe
-    , isUnclassified "nested_structs.c" "nested_structs"
     , isUnclassified "oob_read_heap.c" "oob_read_heap"  -- goal: notSafe
     , isUnclassified "oob_read_stack.c" "oob_read_stack"  -- goal: notSafe
     , isUnclassified "ptr_as_array.c" "ptr_as_array"  -- goal: isSafe
@@ -140,6 +139,7 @@ tests =
     , isUnimplemented "add1_double.c" "add1_double"  -- goal: ???
     , isUnimplemented "add1_float.c" "add1_float"  -- goal: ???
     , isUnimplemented "call_function_pointer.c" "call_function_pointer"  -- goal: ???
+    , isUnimplemented "nested_structs.c" "nested_structs"
 
     -- TODO: Not sure if Crux can do C++?
     -- , isSafe "cxxbasic.cpp" "cxxbasic"

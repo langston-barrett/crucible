@@ -58,7 +58,6 @@ import qualified Lumberjack as LJ
 import           Data.Parameterized.Classes (OrdF)
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
-import           Data.Parameterized.Some (Some)
 
 import qualified What4.Interface as What4
 
@@ -74,7 +73,8 @@ import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (LocalMem, makeLocalMem, globalMem)
 import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
-import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), FullTypeRepr, ToCrucibleType)
+import           Crux.LLVM.Bugfinding.FullType.Type (FullTypeRepr, ToCrucibleType)
+import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
@@ -85,15 +85,15 @@ import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
 
-data TypedSelector arch argTypes tp =
-  TypedSelector (Selector arch argTypes) (CrucibleTypes.BaseTypeRepr tp)
+data TypedSelector m argTypes tp =
+  TypedSelector (Selector m argTypes) (CrucibleTypes.BaseTypeRepr tp)
 
-data SetupError arch argTypes
+data SetupError m arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
-  | SetupBadConstraintSelector (Selector arch argTypes) MemType Constraint
+  | SetupBadConstraintSelector (Selector m argTypes) MemType Constraint
 
-ppSetupError :: SetupError arch argTypes -> Doc Void
+ppSetupError :: SetupError m arch argTypes -> Doc Void
 ppSetupError =
   \case
     SetupTypeSeekError typeSeekError -> ppTypeSeekError typeSeekError
@@ -114,62 +114,62 @@ data SetupAssumption sym
       , assumptionPred :: What4.Pred sym
       }
 
-data SetupState arch sym argTypes =
+data SetupState m arch sym argTypes =
   SetupState
-    { _setupMem :: LocalMem arch sym
-    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
+    { _setupMem :: LocalMem m arch sym
+    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
       -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
       -- ^ Counter for generating unique/fresh symbols
     }
 
-makeSetupState :: LLVMMem.MemImpl sym -> SetupState arch sym argTypes
+makeSetupState :: LLVMMem.MemImpl sym -> SetupState m arch sym argTypes
 makeSetupState mem = SetupState (makeLocalMem mem) MapF.empty 0
 
-setupMem :: Simple Lens (SetupState arch sym argTypes) (LocalMem arch sym)
+setupMem :: Simple Lens (SetupState m arch sym argTypes) (LocalMem m arch sym)
 setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 
-setupMemImpl :: SetupState arch sym argTypes -> (LLVMMem.MemImpl sym)
+setupMemImpl :: SetupState m arch sym argTypes -> (LLVMMem.MemImpl sym)
 setupMemImpl = view (setupMem . globalMem)
 
-setupAnnotations :: Simple Lens (SetupState arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes))
+setupAnnotations :: Simple Lens (SetupState m arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector m argTypes))
 setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 
-symbolCounter :: Simple Lens (SetupState arch sym argTypes) Int
+symbolCounter :: Simple Lens (SetupState m arch sym argTypes) Int
 symbolCounter = lens _symbolCounter (\s v -> s { _symbolCounter = v })
 
-newtype Setup arch sym argTypes a =
+newtype Setup m arch sym argTypes a =
   Setup
     (ExceptT
-      (SetupError arch argTypes)
-      (RWST (Context arch argTypes)
+      (SetupError m arch argTypes)
+      (RWST (Context m arch argTypes)
             [SetupAssumption sym]
-            (SetupState arch sym argTypes)
+            (SetupState m arch sym argTypes)
             IO)
       a)
   deriving (Applicative, Functor, Monad, MonadIO)
 
-deriving instance MonadError (SetupError arch argTypes) (Setup arch sym argTypes)
-deriving instance MonadState (SetupState arch sym argTypes) (Setup arch sym argTypes)
-deriving instance MonadReader (Context arch argTypes) (Setup arch sym argTypes)
-deriving instance MonadWriter [SetupAssumption sym] (Setup arch sym argTypes)
+deriving instance MonadError (SetupError m arch argTypes) (Setup m arch sym argTypes)
+deriving instance MonadState (SetupState m arch sym argTypes) (Setup m arch sym argTypes)
+deriving instance MonadReader (Context m arch argTypes) (Setup m arch sym argTypes)
+deriving instance MonadWriter [SetupAssumption sym] (Setup m arch sym argTypes)
 
-instance LJ.HasLog Text (Setup arch sym argTypes) where
+instance LJ.HasLog Text (Setup m arch sym argTypes) where
   getLogAction = pure $ LJ.LogAction (liftIO . TextIO.putStrLn . ("[Crux] " <>))
 
-data SetupResult arch sym argTypes =
+data SetupResult m arch sym argTypes =
   SetupResult
     { resultMem :: LLVMMem.MemImpl sym
-    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
+    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
     , resultAssumptions :: [SetupAssumption sym]
     }
 
 runSetup ::
-  MonadIO m =>
-  Context arch argTypes ->
+  MonadIO f =>
+  Context m arch argTypes ->
   LLVMMem.MemImpl sym ->
-  Setup arch sym argTypes a ->
-  m (Either (SetupError arch argTypes) (SetupResult arch sym argTypes, a))
+  Setup m arch sym argTypes a ->
+  f (Either (SetupError m arch argTypes) (SetupResult m arch sym argTypes, a))
 runSetup context mem (Setup computation) = do
   result <-
     liftIO $
@@ -184,7 +184,7 @@ runSetup context mem (Setup computation) = do
               , result'
               )
 
-freshSymbol :: Setup arch sym argTypes What4.SolverSymbol
+freshSymbol :: Setup m arch sym argTypes What4.SolverSymbol
 freshSymbol =
   do counter <- symbolCounter <+= 1
      pure $ What4.safeSymbol ("fresh" ++ show counter)
@@ -192,34 +192,34 @@ freshSymbol =
 assume ::
   Constraint ->
   What4.Pred sym ->
-  Setup arch sym argTypes ()
+  Setup m arch sym argTypes ()
 assume constraint predicate = tell [SetupAssumption constraint predicate]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
   What4.SymAnnotation sym tp ->
-  Selector arch argTypes ->
+  Selector m argTypes ->
   CrucibleTypes.BaseTypeRepr tp ->
-  Setup arch sym argTypes ()
+  Setup m arch sym argTypes ()
 addAnnotation ann selector typeRepr =
   setupAnnotations %= MapF.insert ann (TypedSelector selector typeRepr)
 
 seekType ::
   Cursor ->
   MemType ->
-  Setup arch sym argTypes MemType
+  Setup m arch sym argTypes MemType
 seekType cursor memType =
   do context <- ask
      withTypeContext context $
        either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
 
-storableType :: ArchOk arch => MemType -> Setup arch sym argTypes LLVMMem.StorageType
+storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType
 storableType memType =
   maybe (throwError (SetupTypeTranslationError memType)) pure (LLVMMem.toStorableType memType)
 
 modifyMem ::
-  (LocalMem arch sym -> Setup arch sym argTypes (a, LocalMem arch sym)) ->
-  Setup arch sym argTypes a
+  (LocalMem m arch sym -> Setup m arch sym argTypes (a, LocalMem m arch sym)) ->
+  Setup m arch sym argTypes a
 modifyMem f =
   do mem <- gets (view setupMem)
      (val, mem') <- f mem
@@ -227,21 +227,20 @@ modifyMem f =
      pure val
 
 _modifyMem_ ::
-  (LocalMem arch sym -> Setup arch sym argTypes (LocalMem arch sym)) ->
-  Setup arch sym argTypes ()
+  (LocalMem m arch sym -> Setup m arch sym argTypes (LocalMem m arch sym)) ->
+  Setup m arch sym argTypes ()
 _modifyMem_ f = modifyMem (fmap ((),) . f)
 
 malloc ::
-  forall sym arch argTypes full ft.
+  forall m sym arch argTypes ft.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
   sym ->
-  FullTypeRepr full arch ft ->
-  MemType ->
+  FullTypeRepr m ft ->
   (LLVMMem.LLVMPtr sym (ArchWidth arch)) ->
-  Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
-malloc sym fullTypeRepr memType ptr =
+  Setup m arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
+malloc sym fullTypeRepr ptr =
   do context <- ask
      let dl =
            context ^.
@@ -252,38 +251,37 @@ malloc sym fullTypeRepr memType ptr =
      ptr' <-
        modifyMem $
          \mem ->
-           liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl fullTypeRepr memType
+           liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl fullTypeRepr
      pure ptr'
 
 store ::
-  forall arch sym argTypes full ft.
+  forall m arch sym argTypes ft.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   sym ->
-  FullTypeRepr full arch ft ->
-  MemType ->
-  Crucible.RegEntry sym (ToCrucibleType ft) ->
+  FullTypeRepr m ft ->
+  Crucible.RegEntry sym (ToCrucibleType arch ft) ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  Setup arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
-store sym fullTypeRepr memType regEntry ptr =
-  do storageType <- storableType memType
+  Setup m arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
+store sym fullTypeRepr regEntry ptr =
+  do storageType <- storableType (toMemType fullTypeRepr)
      modifyMem $
        \mem ->
          liftIO $
            LocalMem.store (Proxy :: Proxy arch) mem sym fullTypeRepr storageType regEntry ptr
 
 load ::
-  forall arch sym argTypes full ft.
+  forall m arch sym argTypes ft.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   sym ->
-  FullTypeRepr full arch ft ->
+  FullTypeRepr m ft ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  Setup arch sym argTypes (Maybe (LocalMem.TypedRegEntry arch sym ft))
+  Setup m arch sym argTypes (Maybe (LocalMem.TypedRegEntry m arch sym ft))
 load sym fullTypeRepr ptr =
   do mem <- gets (view setupMem)
      pure $ LocalMem.load (Proxy :: Proxy arch) mem sym fullTypeRepr ptr

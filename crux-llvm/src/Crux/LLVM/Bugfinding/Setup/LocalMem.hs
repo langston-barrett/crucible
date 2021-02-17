@@ -21,6 +21,8 @@ retrieve previously-allocated values without fear of failure.
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE PolyKinds #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Crux.LLVM.Bugfinding.Setup.LocalMem
@@ -40,10 +42,8 @@ import           Control.Monad (join)
 import           Control.Monad.IO.Class (liftIO)
 import           Data.BitVector.Sized (mkBV)
 import           Data.Functor.Compose (Compose(Compose, getCompose))
-import qualified Data.Map as Map
-import           Data.Map (Map)
+import           Data.Kind (Type)
 
-import           Data.Parameterized.Some (Some(Some))
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
 
@@ -59,34 +59,35 @@ import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import           Lang.Crucible.LLVM.MemModel (StorageType)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMMem
-import           Lang.Crucible.LLVM.MemType (MemType, memTypeSize)
+import           Lang.Crucible.LLVM.MemType (memTypeSize)
 
 import           Crux.LLVM.Overrides (ArchOk)
 
-import           Crux.LLVM.Bugfinding.FullType (FullType(FTPtr), FullTypeRepr(FTPtrRepr), ToCrucibleType, ToBaseType, toFullRepr)
+import           Crux.LLVM.Bugfinding.FullType (FullTypeRepr(FTPtrRepr), PartTypeRepr(PTFullRepr), ToCrucibleType)
+import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 import           Crux.LLVM.Bugfinding.Setup.Annotation (Annotation, makeAnnotation)
 
-data TypedRegEntry arch sym ft =
-  forall full. TypedRegEntry (FullTypeRepr full arch ft) (Crucible.RegEntry sym (ToCrucibleType ft))
+data TypedRegEntry m arch sym ft =
+  TypedRegEntry (FullTypeRepr m ft) (Crucible.RegEntry sym (ToCrucibleType arch ft))
 
-data LocalMem arch sym
+data LocalMem (m :: Type) arch sym
   = LocalMem
-      { _localMem :: MapF (Annotation arch sym) (Compose Maybe (TypedRegEntry arch sym))
+      { _localMem :: MapF (Annotation m arch sym) (Compose Maybe (TypedRegEntry m arch sym))
       -- The keys are always BaseBV annotations, but those aren't Ord
       , _globalMem :: LLVMMem.MemImpl sym
       }
 
-makeLocalMem :: LLVMMem.MemImpl sym -> LocalMem arch sym
+makeLocalMem :: LLVMMem.MemImpl sym -> LocalMem m arch sym
 makeLocalMem mem =
   LocalMem
     { _localMem = MapF.empty
     , _globalMem = mem
     }
 
-localMem :: Simple Lens (LocalMem arch sym) (MapF (Annotation arch sym) (Compose Maybe (TypedRegEntry arch sym)))
+localMem :: Simple Lens (LocalMem m arch sym) (MapF (Annotation m arch sym) (Compose Maybe (TypedRegEntry m arch sym)))
 localMem = lens _localMem (\s v -> s { _localMem = v })
 
-globalMem :: Simple Lens (LocalMem arch sym) (LLVMMem.MemImpl sym)
+globalMem :: Simple Lens (LocalMem m arch sym) (LLVMMem.MemImpl sym)
 globalMem = lens _globalMem (\s v -> s { _globalMem = v })
 
 -- | Retrieve a pre-existing annotation for a pointer, or make a new one.
@@ -104,46 +105,42 @@ getAnnotation _proxy sym ptr =
     Just annotation -> pure (annotation, ptr)
     Nothing -> liftIO $ LLVMMem.annotatePointerOffset sym ptr
 
-mkPtrRepr :: FullTypeRepr full arch ft -> FullTypeRepr full arch ('FTPtr ft)
-mkPtrRepr fullTypeRepr =
-  FTPtrRepr (toFullRepr fullTypeRepr) (toFullRepr fullTypeRepr) fullTypeRepr
-
 load ::
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
   proxy arch ->
-  LocalMem arch sym ->
+  LocalMem m arch sym ->
   sym ->
-  FullTypeRepr full arch ft ->
+  FullTypeRepr m ft ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  Maybe (TypedRegEntry arch sym ft)
+  Maybe (TypedRegEntry m arch sym ft)
 load _proxy mem sym ftRepr ptr =
   case What4.getAnnotation sym (LLVMMem.llvmPointerOffset ptr) of
     Just ann ->
       join $ getCompose <$>
-        MapF.lookup (makeAnnotation (mkPtrRepr ftRepr) ann) (mem ^. localMem)
+        MapF.lookup (makeAnnotation (FTPtrRepr $ PTFullRepr ftRepr) ann) (mem ^. localMem)
     Nothing -> Nothing
 
 malloc ::
+  forall m arch sym ft proxy.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
   proxy arch ->
-  LocalMem arch sym ->
+  LocalMem m arch sym ->
   sym ->
   DataLayout ->
-  FullTypeRepr full arch ft ->
-  MemType ->
-  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem arch sym)
-malloc proxy mem sym dl ftRepr memType =
+  FullTypeRepr m ft ->
+  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem m arch sym)
+malloc proxy mem sym dl ftRepr =
   do (ptr, globalMem') <-
        liftIO $
          do sizeBv <-
               What4.bvLit
                 sym
                 ?ptrWidth
-                (mkBV ?ptrWidth (bytesToInteger (memTypeSize dl memType)))
+                (mkBV ?ptrWidth (bytesToInteger (memTypeSize dl (toMemType ftRepr))))
             LLVMMem.doMalloc
               sym
               LLVMMem.HeapAlloc  -- TODO(lb): Change based on arg/global
@@ -156,7 +153,7 @@ malloc proxy mem sym dl ftRepr memType =
      pure (ptr', mem { _globalMem = globalMem'
                      , _localMem =
                         MapF.insert
-                          (makeAnnotation (mkPtrRepr ftRepr) annotation)
+                          (makeAnnotation (FTPtrRepr $ PTFullRepr ftRepr) annotation)
                           (Compose Nothing)
                           (mem ^. localMem)
                      })
@@ -166,17 +163,16 @@ maybeMalloc ::
   , ArchOk arch
   ) =>
   proxy arch ->
-  LocalMem arch sym ->
+  LocalMem m arch sym ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   sym ->
   DataLayout ->
-  FullTypeRepr full arch ft ->
-  MemType ->
-  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem arch sym)
-maybeMalloc proxy mem ptr sym dl fullTypeRepr memType =
+  FullTypeRepr m ft ->
+  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem m arch sym)
+maybeMalloc proxy mem ptr sym dl fullTypeRepr =
   case load proxy mem sym fullTypeRepr ptr of
     Just _ -> pure (ptr, mem)
-    Nothing -> malloc proxy mem sym dl fullTypeRepr memType
+    Nothing -> malloc proxy mem sym dl fullTypeRepr
 
 store ::
   ( Crucible.IsSymInterface sym
@@ -184,13 +180,13 @@ store ::
   , ArchOk arch
   ) =>
   proxy arch ->
-  LocalMem arch sym ->
+  LocalMem m arch sym ->
   sym ->
-  FullTypeRepr full arch ft ->
+  FullTypeRepr m ft ->
   StorageType ->
-  Crucible.RegEntry sym (ToCrucibleType ft) ->
+  Crucible.RegEntry sym (ToCrucibleType arch ft) ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem arch sym)
+  IO (LLVMMem.LLVMPtr sym (ArchWidth arch), LocalMem m arch sym)
 store proxy mem sym fullTypeRepr storageType regEntry@(Crucible.RegEntry typeRepr regValue) ptr =
   do (annotation, ptr') <- getAnnotation proxy sym ptr
      globalMem' <- LLVMMem.doStore sym (mem ^. globalMem) ptr' typeRepr storageType noAlignment regValue
@@ -199,7 +195,7 @@ store proxy mem sym fullTypeRepr storageType regEntry@(Crucible.RegEntry typeRep
        , mem { _globalMem = globalMem'
              , _localMem =
                  MapF.insert
-                   (makeAnnotation (mkPtrRepr fullTypeRepr) annotation)
+                   (makeAnnotation (FTPtrRepr $ PTFullRepr fullTypeRepr) annotation)
                    (Compose (Just (TypedRegEntry fullTypeRepr regEntry)))
                    (mem ^. localMem)
              }

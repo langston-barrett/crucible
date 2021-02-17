@@ -21,39 +21,34 @@ module Crux.LLVM.Bugfinding.Setup.Annotation
   , makeAnnotation
   ) where
 
-import           Data.Type.Equality (TestEquality(testEquality), (:~:)(Refl))
+import           Data.Type.Equality (TestEquality(testEquality))
 
 import           Data.Parameterized.Classes (OrdF(compareF))
 import qualified Data.Parameterized.TH.GADT as U
 
 import qualified What4.Interface as What4
 
-import           Crux.LLVM.Bugfinding.FullType (FullType(FTPtr), FullTypeRepr, FullRepr, ToBaseType, toFullRepr)
+import           Crux.LLVM.Bugfinding.FullType (FullType(FTPtr), FullTypeRepr, ToBaseType)
 
-data Annotation arch sym ft =
-  forall full.
+data Annotation m arch sym ft =
   Annotation
-    { symAnnotation :: What4.SymAnnotation sym (ToBaseType ('FTPtr ft))
-    , annfullRepr :: FullRepr full
-    , annFullTypeRepr :: FullTypeRepr full arch ('FTPtr ft)
+    { symAnnotation :: What4.SymAnnotation sym (ToBaseType arch ('FTPtr ft))
+    , _annFullTypeRepr :: FullTypeRepr m ('FTPtr ft)
     }
 
 makeAnnotation ::
-  FullTypeRepr full arch ('FTPtr ft) ->
-  What4.SymAnnotation sym (ToBaseType ('FTPtr ft)) ->
-  Annotation arch sym ft
-makeAnnotation ftRepr ann = Annotation ann (toFullRepr ftRepr) ftRepr
+  FullTypeRepr m ('FTPtr ft) ->
+  What4.SymAnnotation sym (ToBaseType arch ('FTPtr ft)) ->
+  Annotation m arch sym ft
+makeAnnotation ftRepr ann = Annotation ann ftRepr
 
 $(return [])
 
-instance TestEquality (What4.SymAnnotation sym) => TestEquality (Annotation arch sym) where
+instance TestEquality (What4.SymAnnotation sym) => TestEquality (Annotation m arch sym) where
   testEquality =
     $(U.structuralTypeEquality [t|Annotation|]
       (let appAny con = U.TypeApp con U.AnyType
-       in [ ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
-            , [|testEquality|]
-            )
-          , ( appAny (U.ConType [t|FullRepr|])
+       in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
             , [|testEquality|]
             )
           , ( appAny (appAny (U.ConType [t|What4.SymAnnotation|]))
@@ -61,14 +56,11 @@ instance TestEquality (What4.SymAnnotation sym) => TestEquality (Annotation arch
             )
           ]))
 
-instance OrdF (What4.SymAnnotation sym) => OrdF (Annotation arch sym) where
+instance OrdF (What4.SymAnnotation sym) => OrdF (Annotation m arch sym) where
   compareF =
     $(U.structuralTypeOrd [t|Annotation|]
       (let appAny con = U.TypeApp con U.AnyType
-       in [ ( appAny (appAny (appAny (U.ConType [t|FullTypeRepr|])))
-            , [|compareF|]
-            )
-          , ( appAny (U.ConType [t|FullRepr|])
+       in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
             , [|compareF|]
             )
           , ( appAny (appAny (U.ConType [t|What4.SymAnnotation|]))

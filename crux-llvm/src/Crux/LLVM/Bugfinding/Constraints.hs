@@ -69,20 +69,20 @@ data ValueConstraint
   deriving (Eq, Ord)
 
 -- | A (possibly) \"relational\" constraint across several values.
-data RelationalConstraint arch argTypes
-  = SizeOfAllocation (Selector arch argTypes) (Selector arch argTypes)
+data RelationalConstraint m arch argTypes
+  = SizeOfAllocation (Selector m argTypes) (Selector m argTypes)
   -- ^ The first argument (a bitvector) is equal to the size of the allocation
   -- pointed to by the second
   deriving (Eq, Ord)
 
-data Constraints arch argTypes
+data Constraints m arch argTypes
   = Constraints
       { argConstraints :: Ctx.Assignment (Const (Set ValueConstraint)) argTypes
       , globalConstraints :: Map L.Symbol (Set ValueConstraint)
-      , relationalConstraints :: Set (RelationalConstraint arch argTypes)
+      , relationalConstraints :: Set (RelationalConstraint m arch argTypes)
       }
 
-instance Eq (Constraints arch argTypes) where
+instance Eq (Constraints m arch argTypes) where
   cs1 == cs2 =
     and [ toListFC getConst (argConstraints cs1) == toListFC getConst (argConstraints cs2)
         , globalConstraints cs1 == globalConstraints cs2
@@ -92,7 +92,7 @@ instance Eq (Constraints arch argTypes) where
 -- | Union
 --
 -- TODO: Merge identical constraints?
-instance Semigroup (Constraints arch types) where
+instance Semigroup (Constraints m arch types) where
   cs1 <> cs2 =
     Constraints
       { argConstraints =
@@ -104,7 +104,7 @@ instance Semigroup (Constraints arch types) where
       , relationalConstraints = relationalConstraints cs1 <> relationalConstraints cs2
       }
 
-emptyConstraints :: Ctx.Size argTypes -> Constraints arch argTypes
+emptyConstraints :: Ctx.Size argTypes -> Constraints m arch argTypes
 emptyConstraints sz =
   Constraints
     { argConstraints = Ctx.generate sz (\_index -> Const Set.empty)
@@ -112,7 +112,7 @@ emptyConstraints sz =
     , relationalConstraints = Set.empty
     }
 
-isEmpty :: Constraints arch argTypes -> Bool
+isEmpty :: Constraints m arch argTypes -> Bool
 isEmpty (Constraints argCs globCs relCs) =
   and [ allFC ((== Set.empty) . getConst) argCs
       , globCs == Map.empty
@@ -134,7 +134,7 @@ ppValueConstraint' top (ValueConstraint body cursor) =
 ppValueConstraint :: ValueConstraint -> Doc Void
 ppValueConstraint = ppValueConstraint' "<top>"
 
-ppConstraints :: Constraints arch argTypes -> Doc Void
+ppConstraints :: Constraints m arch argTypes -> Doc Void
 ppConstraints (Constraints argCs globCs _relCs) =
   let ppArgC idx (Const constraints) =
         PP.nest
@@ -164,7 +164,7 @@ oneArgumentConstraint ::
   Ctx.Size argTypes ->
   Ctx.Index argTypes ft ->
   Set ValueConstraint ->
-  Constraints arch argTypes
+  Constraints m arch argTypes
 oneArgumentConstraint sz idx constraints =
   let empty = emptyConstraints sz
   in empty

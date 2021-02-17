@@ -66,14 +66,14 @@ data TruePositive
 
 -- | An error is either a true positive, a false positive due to some missing
 -- preconditions, or unknown.
-data Explanation arch types
+data Explanation m arch types
   = ExTruePositive TruePositive
-  | ExMissingPreconditions (Constraints arch types)
+  | ExMissingPreconditions (Constraints m arch types)
   | ExUnclassified (Doc Void)
   -- ^ We don't (yet) know what to do about this error
 
 partitionExplanations ::
-  [Explanation arch types] -> ([TruePositive], [Constraints arch types], [Doc Void])
+  [Explanation m arch types] -> ([TruePositive], [Constraints m arch types], [Doc Void])
 partitionExplanations = go [] [] []
   where go ts cs ds =
           \case
@@ -93,7 +93,7 @@ ppTruePositive =
   \case
     UninitializedStackVariable -> "Uninitialized stack variable"
 
-ppExplanation :: Explanation arch types -> Text
+ppExplanation :: Explanation m arch types -> Text
 ppExplanation =
   \case
     ExTruePositive truePositive -> ppTruePositive truePositive
@@ -116,24 +116,24 @@ summarizeOp =
 -- true or false positive. If it is a false positive, deduce further
 -- preconditions.
 classify ::
-  forall m sym arch argTypes.
+  forall f m sym arch argTypes.
   ( Crucible.IsSymInterface sym
-  , MonadIO m
-  , HasLog Text m
+  , MonadIO f
+  , HasLog Text f
   ) =>
-  Context arch argTypes ->
+  Context m arch argTypes ->
   sym ->
-  Crucible.RegMap sym (MapToCrucibleType argTypes) {-^ Function arguments -} ->
-  MapF (What4.SymAnnotation sym) (TypedSelector arch argTypes)
+  Crucible.RegMap sym (MapToCrucibleType arch argTypes) {-^ Function arguments -} ->
+  MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
-  m (Explanation arch argTypes)
+  f (Explanation m arch argTypes)
 classify context sym (Crucible.RegMap _args) annotations badBehavior =
   writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   let
     getPtrOffsetAnn ::
       LLVMPointer.LLVMPtr sym w ->
-      Maybe (TypedSelector arch argTypes (What4.BaseBVType w))
+      Maybe (TypedSelector m argTypes (What4.BaseBVType w))
     getPtrOffsetAnn ptr =
       flip MapF.lookup annotations =<<
         What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)

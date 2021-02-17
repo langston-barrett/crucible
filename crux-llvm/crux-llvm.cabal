@@ -47,6 +47,7 @@ library
     Crux.LLVM.Bugfinding.FullType
     Crux.LLVM.Bugfinding.FullType.CrucibleType
     Crux.LLVM.Bugfinding.FullType.MemType
+    Crux.LLVM.Bugfinding.FullType.ModuleTypes
     Crux.LLVM.Bugfinding.FullType.Type
     Crux.LLVM.Bugfinding.Setup
     Crux.LLVM.Bugfinding.Setup.Annotation

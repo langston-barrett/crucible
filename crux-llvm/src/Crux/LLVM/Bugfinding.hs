@@ -113,10 +113,10 @@ findFun nm mp =
 simulateLLVM ::
   ArchOk arch =>
   HandleAllocator ->
-  Context arch argTypes ->
-  IORef [Explanation arch argTypes] ->
-  Constraints arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
+  Context m arch argTypes ->
+  IORef [Explanation m arch argTypes] ->
+  Constraints m arch argTypes ->
+  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   MemOptions ->
   Crux.SimulatorCallback
 simulateLLVM halloc context explRef preconds cfg memOptions =
@@ -182,13 +182,13 @@ runSimulator ::
   ( ?outputConfig ::  OutputConfig
   , ArchOk arch
   ) =>
-  Context arch argTypes ->
+  Context m arch argTypes ->
   HandleAllocator ->
-  Constraints arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
+  Constraints m arch argTypes ->
+  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   MemOptions ->
-  IO [Explanation arch argTypes]
+  IO [Explanation m arch argTypes]
 runSimulator context halloc preconditions cfg cruxOpts memOptions =
   do explRef <- newIORef []
      void $
@@ -205,21 +205,21 @@ runSimulator context halloc preconditions cfg cruxOpts memOptions =
 
 -- | The outer loop of bugfinding mode
 
-data FunctionSummary arch argTypes
+data FunctionSummary m arch argTypes
   = FoundBugs (NonEmpty TruePositive)
-  | SafeWithPreconditions (Constraints arch argTypes)
+  | SafeWithPreconditions (Constraints m arch argTypes)
   | AlwaysSafe -- TODO(lb): This isn't really true until we "deepen" arguments
 
 data SomeBugfindingResult =
-  forall arch argTypes. SomeBugfindingResult (BugfindingResult arch argTypes)
+  forall m arch argTypes. SomeBugfindingResult (BugfindingResult m arch argTypes)
 
-data BugfindingResult arch argTypes
+data BugfindingResult m arch argTypes
   = BugfindingResult
       { unclassifiedErrors :: [Doc Void]
-      , summary :: FunctionSummary arch argTypes
+      , summary :: FunctionSummary m arch argTypes
       }
 
-printFunctionSummary :: FunctionSummary arch argTypes -> Text
+printFunctionSummary :: FunctionSummary m arch argTypes -> Text
 printFunctionSummary =
   \case
     FoundBugs bugs ->
@@ -230,7 +230,7 @@ printFunctionSummary =
       <> Text.pack (show (ppConstraints preconditions))
     AlwaysSafe -> "This function is always safe."
 
-makeFunctionSummary :: Constraints arch argTypes -> [TruePositive] -> FunctionSummary arch argTypes
+makeFunctionSummary :: Constraints m arch argTypes -> [TruePositive] -> FunctionSummary m arch argTypes
 makeFunctionSummary preconditions truePositives =
   case (isEmpty preconditions, truePositives) of
     (True, []) -> AlwaysSafe
@@ -241,12 +241,12 @@ bugfindingLoop ::
   ( ?outputConfig ::  OutputConfig
   , ArchOk arch
   ) =>
-  Context arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType argTypes) ret ->
+  Context m arch argTypes ->
+  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   MemOptions ->
   HandleAllocator ->
-  IO (BugfindingResult arch argTypes)
+  IO (BugfindingResult m arch argTypes)
 bugfindingLoop context cfg cruxOpts memOptions halloc =
   do let emptyCs = emptyConstraints (Ctx.size (context ^. argumentFullTypes))
      let runSim preconds =

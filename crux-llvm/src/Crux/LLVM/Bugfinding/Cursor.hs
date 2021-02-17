@@ -67,12 +67,12 @@ ppCursor top =
     Field idx cursor -> ppCursor top cursor <> PP.pretty ("." ++ show idx)
 
 -- TODO(lb): Not sure why I have to specify the kind here?
-data Selector arch (argTypes :: Ctx (FullType arch))
+data Selector m (argTypes :: Ctx (FullType m))
   = SelectArgument !(Some (Ctx.Index argTypes)) Cursor
   | SelectGlobal !L.Symbol Cursor
   deriving (Eq, Ord)
 
-selectorCursor :: Simple Lens (Selector arch argTypes) Cursor
+selectorCursor :: Simple Lens (Selector m argTypes) Cursor
 selectorCursor =
   lens
     (\case
