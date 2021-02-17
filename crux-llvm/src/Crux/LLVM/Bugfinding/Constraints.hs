@@ -7,6 +7,7 @@ Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
 -}
 
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE PolyKinds #-}
@@ -19,6 +20,7 @@ module Crux.LLVM.Bugfinding.Constraints
   , RelationalConstraint(..)
   , Selector(..)
   , ValueConstraint(..)
+  , SomeValueConstraint(..)
   , Constraints(..)
   , emptyConstraints
   , isEmpty
@@ -31,8 +33,8 @@ module Crux.LLVM.Bugfinding.Constraints
 
 import           Control.Lens (set)
 import           Data.Functor.Const
-import           Data.Functor.Compose (Compose(Compose, getCompose))
-import           Data.Type.Equality (TestEquality(testEquality))
+import           Data.Functor.Compose (Compose(Compose))
+import           Data.Type.Equality (TestEquality(testEquality), (:~:)(Refl))
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Maybe (isJust)
@@ -43,8 +45,8 @@ import           Data.Void (Void)
 import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 
-import           Data.Parameterized.Classes (IxedF(ixF), OrdF(compareF, leqF))
-import           Data.Parameterized.Some (Some(Some))
+import           Data.Parameterized.Classes (IxedF(ixF), OrdF(compareF, leqF), OrderingF(LTF, GTF, EQF))
+import           Data.Parameterized.Some (Some)
 import qualified Data.Parameterized.TH.GADT as U
 
 import qualified Text.LLVM.AST as L
@@ -55,45 +57,88 @@ import           Data.Parameterized.TraversableFC (allFC, toListFC)
 import           Lang.Crucible.LLVM.DataLayout (fromAlignment, Alignment)
 
 import           Crux.LLVM.Bugfinding.Cursor
+import           Crux.LLVM.Bugfinding.FullType.Type (FullType(..), FullTypeRepr)
 
--- | A constraint on a single value
-data Constraint
-  = Allocated
+data Constraint m (atTy :: FullType m) where
+  Allocated :: Constraint m ('FTPtr ft)
   -- ^ This pointer is not null
-  | Initialized
+  Initialized :: Constraint m ('FTPtr ft)
   -- ^ This pointer points to initialized memory
-  | Aligned Alignment
+  Aligned :: Alignment -> Constraint m ('FTPtr ft)
   -- ^ This pointer has at least this alignment
-  | SizeAtLeast !Int
+  SizeAtLeast :: !Int -> Constraint m ('FTPtr ft)
   -- ^ The allocation backing this pointer has at least this size
-  deriving (Eq, Ord)
 
-data ValueConstraint m ft
+data SomeConstraint m
+  = forall ft. SomeConstraint (Constraint m ft)
+
+-- | Ignores type indices
+instance Eq (SomeConstraint m) where
+  SomeConstraint c1 == SomeConstraint c2 =
+    case (c1, c2) of
+      (Allocated, Allocated) -> True
+      (Initialized, Initialized) -> True
+      (Aligned align, Aligned align') -> align == align'
+      (SizeAtLeast n, SizeAtLeast n') -> n == n'
+      _ -> False
+
+-- | Ignores type indices
+instance Ord (SomeConstraint m) where
+  compare (SomeConstraint c1) (SomeConstraint c2) =
+    case (c1, c2) of
+      (Allocated, Allocated) -> EQ
+      (Allocated, _) -> LT
+      (Initialized, Initialized) -> EQ
+      (Initialized, _) -> LT
+      (Aligned align, Aligned align') -> compare align align'
+      (Aligned _, _) -> LT
+      (SizeAtLeast i, SizeAtLeast i') -> compare i i'
+      (SizeAtLeast _, _) -> GT
+
+data ValueConstraint m inTy atTy
   = ValueConstraint
-      { constraintBody :: Constraint
-      , constraintCursor :: Cursor m ft
-      -- TODO un-some
+      { inTypeRepr :: FullTypeRepr m inTy
+      , constraintCursor :: Cursor m inTy atTy
+      , constraintBody :: Constraint m atTy
       }
 
-instance Eq (ValueConstraint m ft) where
-  ValueConstraint body1 cursor1 == ValueConstraint body2 cursor2 =
-    body1 == body1 && isJust (testEquality cursor1 cursor2)
+data SomeValueConstraint m inTy
+  = forall atTy. SomeValueConstraint (ValueConstraint m inTy atTy)
 
-instance Ord (ValueConstraint m ft) where
-  ValueConstraint body1 cursor1 <= ValueConstraint body2 cursor2 =
-    body1 <= body1 && leqF cursor1 cursor2
+instance Eq (SomeValueConstraint m inTy) where
+  SomeValueConstraint (ValueConstraint inTyRep1 cursor1 body1) ==
+    SomeValueConstraint (ValueConstraint inTyRep2 cursor2 body2) =
+    SomeConstraint body1 == SomeConstraint body2 &&
+    isJust (testEquality cursor1 cursor2) &&
+    isJust (testEquality inTyRep1 inTyRep2)
+
+instance Ord (SomeValueConstraint m inTy) where
+  SomeValueConstraint (ValueConstraint inTyRep1 cursor1 body1) <=
+    SomeValueConstraint (ValueConstraint inTyRep2 cursor2 body2) =
+    (SomeConstraint body1 <= SomeConstraint body2)
+    && leqF cursor1 cursor2
+    && leqF inTyRep1 inTyRep2
 
 -- | A (possibly) \"relational\" constraint across several values.
-data RelationalConstraint m arch argTypes ft
-  = SizeOfAllocation (Selector m argTypes ft) (Selector m argTypes ft)
+data RelationalConstraint m arch argTypes
+  = forall inTy inTy' ft ft'.
+    SizeOfAllocation
+      (Selector m argTypes inTy ('FTInt ft))
+      (Selector m argTypes inTy' ('FTPtr ft'))
   -- ^ The first argument (a bitvector) is equal to the size of the allocation
   -- pointed to by the second
 
+instance Eq (RelationalConstraint m arch argTypes) where
+  rc1 == rc2 = error "TODO eq relationalconstraint"
+
+instance Ord (RelationalConstraint m arch argTypes) where
+  rc1 <= rc2 = error "TODO ord relationalconstraint"
+
 data Constraints m arch argTypes
   = Constraints
-      { argConstraints :: Ctx.Assignment (Compose Set (ValueConstraint m)) argTypes
-      , globalConstraints :: Map L.Symbol (Set (Some (ValueConstraint m)))
-      , relationalConstraints :: Set (Some (RelationalConstraint m arch argTypes))
+      { argConstraints :: Ctx.Assignment (Compose Set (SomeValueConstraint m)) argTypes
+      , globalConstraints :: Map L.Symbol (Set (Some (SomeValueConstraint m)))
+      , relationalConstraints :: Set (RelationalConstraint m arch argTypes)
       }
 
 instance Eq (Constraints m arch argTypes) where
@@ -134,19 +179,23 @@ emptyConstraints sz =
 isEmpty :: Constraints m arch argTypes -> Bool
 isEmpty cs@(Constraints argCs _ _) = emptyConstraints (Ctx.size argCs) == cs
 
-ppConstraint :: Constraint -> Doc Void
+ppConstraint :: Constraint m ft -> Doc Void
 ppConstraint =
   \case
-    Allocated -> PP.pretty "is allocated"
-    Initialized -> PP.pretty "is initialized"
-    Aligned alignment -> PP.pretty "is aligned to " <> PP.viaShow (fromAlignment alignment)
-    SizeAtLeast size -> PP.pretty "has size at least " <> PP.viaShow size
+    Allocated ->
+      PP.pretty "is allocated"
+    Initialized ->
+      PP.pretty "is initialized"
+    Aligned alignment ->
+      PP.pretty "is aligned to " <> PP.viaShow (fromAlignment alignment)
+    SizeAtLeast size ->
+      PP.pretty "has size at least " <> PP.viaShow size
 
-ppValueConstraint' :: String -> ValueConstraint m ft -> Doc Void
-ppValueConstraint' top (ValueConstraint body cursor) =
+ppValueConstraint' :: String -> ValueConstraint m inTy atTy -> Doc Void
+ppValueConstraint' top (ValueConstraint _ty cursor body) =
   ppCursor top cursor <> PP.pretty ": " <> ppConstraint body
 
-ppValueConstraint :: ValueConstraint m ft -> Doc Void
+ppValueConstraint :: ValueConstraint m inTy atTy -> Doc Void
 ppValueConstraint = ppValueConstraint' "<top>"
 
 ppConstraints :: Constraints m arch argTypes -> Doc Void
@@ -164,8 +213,8 @@ ppConstraints (Constraints argCs globCs _relCs) =
       --     (PP.vsep ( PP.pretty "Global " <> PP.pretty sym
       --              : map ppValueConstraint (Set.toList constraints)
       --              ))
-  -- TODO: print relCs, globCs
-  in PP.vsep $ toListWithIndex ppArgC argCs -- ++ map (uncurry ppGlobC) (Map.toList globCs)
+  -- in PP.vsep $ toListWithIndex ppArgC argCs -- ++ map (uncurry ppGlobC) (Map.toList globCs)
+  in PP.pretty "TODO Not implemented"
   where
     toListWithIndex :: (forall tp. Ctx.Index ctx tp -> f tp -> a)
                     -> Ctx.Assignment f ctx
@@ -177,8 +226,8 @@ ppConstraints (Constraints argCs globCs _relCs) =
 
 oneArgumentConstraint ::
   Ctx.Size argTypes ->
-  Ctx.Index argTypes ft ->
-  Set (ValueConstraint m ft) ->
+  Ctx.Index argTypes inTy ->
+  Set (SomeValueConstraint m inTy) ->
   Constraints m arch argTypes
 oneArgumentConstraint sz idx constraints =
   let empty = emptyConstraints sz
@@ -190,11 +239,11 @@ oneArgumentConstraint sz idx constraints =
 -- TODO split modules
 $(return [])
 
-instance TestEquality (ValueConstraint m) where
+instance TestEquality (ValueConstraint m inTy) where
   testEquality =
     $(U.structuralTypeEquality [t|ValueConstraint|]
       (let appAny con = U.TypeApp con U.AnyType
-       in [ ( appAny (appAny (U.ConType [t|Cursor|]))
+       in [ ( appAny (appAny (appAny (U.ConType [t|Cursor|])))
             , [|testEquality|]
             )
           , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
@@ -203,14 +252,23 @@ instance TestEquality (ValueConstraint m) where
           , ( appAny (appAny (U.ConType [t|Ctx.Index|]))
             , [|testEquality|]
             )
+          , ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
+            , [|testEquality|]
+            )
+          , ( appAny (appAny (U.ConType [t|Constraint|]))
+            , [|\cs1 cs2 ->
+                  if SomeConstraint cs1 == SomeConstraint cs2
+                  then Just Refl
+                  else Nothing |]
+            )
           ]))
 
-instance OrdF (ValueConstraint m) where
+instance OrdF (ValueConstraint m inTy) where
   compareF =
     $(U.structuralTypeOrd [t|ValueConstraint|]
       (let appAny con = U.TypeApp con U.AnyType
        in [
-            ( appAny (appAny (U.ConType [t|Cursor|]))
+            ( appAny (appAny (appAny (U.ConType [t|Cursor|])))
             , [|compareF|]
             )
           , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
@@ -218,42 +276,26 @@ instance OrdF (ValueConstraint m) where
             )
           , ( appAny (appAny (U.ConType [t|Ctx.Index|]))
             , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|FullTypeRepr|]))
+            , [|compareF|]
+            )
+          , ( appAny (appAny (U.ConType [t|Constraint|]))
+            , [| \cs1 cs2 ->
+                   case compare (SomeConstraint cs1) (SomeConstraint cs2) of
+                     LT -> LTF
+                     GT -> GTF
+                     EQ -> EQF |]
             )
           ]))
 
-instance TestEquality (RelationalConstraint m arch argTypes) where
-  testEquality =
-    $(U.structuralTypeEquality [t|RelationalConstraint|]
-      (let appAny con = U.TypeApp con U.AnyType
-       in [ ( appAny (appAny (U.ConType [t|Cursor|]))
-            , [|testEquality|]
-            )
-          , ( appAny (appAny (appAny (U.ConType [t|Selector|])))
-            , [|testEquality|]
-            )
-          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
-            , [|testEquality|]
-            )
-          , ( appAny (appAny (U.ConType [t|Ctx.Index|]))
-            , [|testEquality|]
-            )
-          ]))
-
-instance OrdF (RelationalConstraint m arch argTypes) where
-  compareF =
-    $(U.structuralTypeOrd [t|RelationalConstraint|]
-      (let appAny con = U.TypeApp con U.AnyType
-       in [
-            ( appAny (appAny (U.ConType [t|Cursor|]))
-            , [|compareF|]
-            )
-          , ( appAny (appAny (appAny (U.ConType [t|Selector|])))
-            , [|compareF|]
-            )
-          , ( appAny (appAny (U.ConType [t|Ctx.Assignment|]))
-            , [|compareF|]
-            )
-          , ( appAny (appAny (U.ConType [t|Ctx.Index|]))
-            , [|compareF|]
-            )
-          ]))
+instance TestEquality (SomeValueConstraint m) where
+  testEquality
+    (SomeValueConstraint vc1@(ValueConstraint inTy _ _))
+    (SomeValueConstraint vc2@(ValueConstraint inTy' _ _)) =
+    case testEquality inTy inTy' of
+      Just Refl ->
+        if isJust (testEquality vc1 vc2)
+        then Just Refl
+        else Nothing
+      Nothing -> Nothing

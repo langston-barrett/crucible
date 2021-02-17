@@ -31,6 +31,7 @@ import           Data.Functor.Const (Const(getConst))
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           Data.Type.Equality ((:~:)(Refl))
 import           Data.Void (Void)
 
 import           Prettyprinter (Doc)
@@ -50,15 +51,16 @@ import qualified Lang.Crucible.Simulator as Crucible
 
 import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPointer
 import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
+import           Lang.Crucible.LLVM.Errors (ppBB)
 import qualified Lang.Crucible.LLVM.Errors.MemoryError as LLVMErrors
 import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as LLVMErrors
 
 import           Crux.LLVM.Bugfinding.Constraints
 import           Crux.LLVM.Bugfinding.Context
-import           Crux.LLVM.Bugfinding.Cursor (ppCursor)
-import           Crux.LLVM.Bugfinding.FullType (MapToCrucibleType)
+import           Crux.LLVM.Bugfinding.Cursor (ppCursor, SomeInSelector(SomeInSelector))
+import           Crux.LLVM.Bugfinding.FullType (MapToCrucibleType, IsPtrRepr(..), isPtrRepr)
 import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
-import Lang.Crucible.LLVM.Errors (ppBB)
+import           Crux.LLVM.Bugfinding.Errors.Panic (panic)
 
 data TruePositive
   -- TODO which
@@ -124,7 +126,7 @@ classify ::
   Context m arch argTypes ->
   sym ->
   Crucible.RegMap sym (MapToCrucibleType arch argTypes) {-^ Function arguments -} ->
-  MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
+  MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
   f (Explanation m arch argTypes)
@@ -133,7 +135,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
   let
     getPtrOffsetAnn ::
       LLVMPointer.LLVMPtr sym w ->
-      Maybe (TypedSelector m argTypes (What4.BaseBVType w))
+      Maybe (TypedSelector m arch argTypes (What4.BaseBVType w))
     getPtrOffsetAnn ptr =
       flip MapF.lookup annotations =<<
         What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)
@@ -147,7 +149,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.WriteBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector (Some (SelectArgument idx cursor)) _typeRepr) ->
+            Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _baseTypeRepr) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Read from a pointer with insufficient"
@@ -162,17 +164,25 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                      [ "Prescription: Add a precondition that the pointer"
                      , "is sufficiently aligned."
                      ]
-                 return $
-                   ExMissingPreconditions $
-                     oneArgumentConstraint
-                       (Ctx.size (context ^. argumentFullTypes))
-                       idx
-                       (Set.singleton (ValueConstraint (Aligned alignment) cursor))
+                 case isPtrRepr ftRepr of
+                   Nothing -> panic "classify" ["Expected pointer type"]
+                   Just (IsPtrRepr Refl) ->
+                     return $
+                       ExMissingPreconditions $
+                         oneArgumentConstraint
+                           (Ctx.size (context ^. argumentFullTypes))
+                           idx
+                           (Set.singleton
+                               (SomeValueConstraint
+                                 (ValueConstraint
+                                   (context ^. argumentFullTypes . ixF' idx)
+                                   cursor
+                                   (Aligned alignment))))
             _ -> unclass
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector (Some (SelectArgument idx cursor)) _typeRepr) ->
+            Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Wrote to a pointer with insufficient"
@@ -187,19 +197,27 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                      [ "Prescription: Add a precondition that the pointer"
                      , "is sufficiently aligned."
                      ]
-                 return $
-                   ExMissingPreconditions $
-                     oneArgumentConstraint
-                       (Ctx.size (context ^. argumentFullTypes))
-                       idx
-                       (Set.singleton (ValueConstraint (Aligned alignment) cursor))
+                 case isPtrRepr ftRepr of
+                   Nothing -> panic "classify" ["Expected pointer type"]
+                   Just (IsPtrRepr Refl) ->
+                     return $
+                       ExMissingPreconditions $
+                         oneArgumentConstraint
+                           (Ctx.size (context ^. argumentFullTypes))
+                           idx
+                           (Set.singleton
+                             (SomeValueConstraint
+                               (ValueConstraint
+                               (context ^. argumentFullTypes . ixF' idx)
+                               cursor
+                               (Aligned alignment))))
             _ -> unclass
       LLVMErrors.BBMemoryError
         (LLVMErrors.MemoryError
           (summarizeOp -> (_expl, ptr))
           LLVMErrors.UnwritableRegion) ->
             case getPtrOffsetAnn ptr of
-              Just (TypedSelector (Some (SelectArgument idx cursor)) _typeRepr) ->
+              Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
                 -- TODO: Double check that it really was unmapped not read-only
                 -- or something?
                 do writeLogM $
@@ -216,12 +234,20 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                        [ "Prescription: Add a precondition that the pointer"
                        , "points to allocated memory."
                        ]
-                   return $
-                     ExMissingPreconditions $
-                       oneArgumentConstraint
-                         (Ctx.size (context ^. argumentFullTypes))
-                         idx
-                         (Set.singleton (ValueConstraint Allocated cursor))
+                   case isPtrRepr ftRepr of
+                     Nothing -> panic "classify" ["Expected pointer type"]
+                     Just (IsPtrRepr Refl) ->
+                       return $
+                         ExMissingPreconditions $
+                           oneArgumentConstraint
+                             (Ctx.size (context ^. argumentFullTypes))
+                             idx
+                             (Set.singleton
+                               (SomeValueConstraint
+                                (ValueConstraint
+                                 (context ^. argumentFullTypes . ixF' idx)
+                                 cursor
+                                 Allocated)))
               -- TODO(lb): Something about globals, probably?
               _ -> unclass
       LLVMErrors.BBMemoryError
@@ -229,7 +255,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
           _op
           (LLVMErrors.NoSatisfyingWrite _storageType ptr)) ->
             case getPtrOffsetAnn ptr of
-              Just (TypedSelector (Some (SelectArgument idx cursor)) _typeRepr) ->
+              Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
                 do writeLogM $
                      Text.unwords
                        [ "Diagnosis: Read from an uninitialized pointer in argument"
@@ -243,12 +269,20 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                        [ "Prescription: Add a precondition that the pointer"
                        , "points to initialized memory."
                        ]
-                   return $
-                     ExMissingPreconditions $
-                       oneArgumentConstraint
-                         (Ctx.size (context ^. argumentFullTypes))
-                         idx
-                         (Set.singleton (ValueConstraint Initialized cursor))
+                   case isPtrRepr ftRepr of
+                     Nothing -> panic "classify" ["Expected pointer type"]
+                     Just (IsPtrRepr Refl) ->
+                       return $
+                         ExMissingPreconditions $
+                           oneArgumentConstraint
+                             (Ctx.size (context ^. argumentFullTypes))
+                             idx
+                             (Set.singleton
+                               (SomeValueConstraint
+                                (ValueConstraint
+                                 (context ^. argumentFullTypes . ixF' idx)
+                                 cursor
+                                 Initialized)))
               -- TODO(lb): Something about globals, probably?
               _ -> unclass
       _ -> unclass

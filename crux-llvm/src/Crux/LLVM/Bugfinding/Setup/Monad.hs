@@ -11,6 +11,7 @@ Stability    : provisional
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -20,6 +21,7 @@ Stability    : provisional
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 
 module Crux.LLVM.Bugfinding.Setup.Monad
   ( Setup
@@ -46,6 +48,7 @@ import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Proxy (Proxy(Proxy))
 import           Data.Text (Text)
 import qualified Data.Text.IO as TextIO
+import           Data.Type.Equality ((:~:)(Refl))
 import           Control.Monad.Except (throwError, ExceptT, MonadError, runExceptT)
 import           Control.Monad.Reader (MonadReader, ask)
 import           Control.Monad.State.Strict (MonadState, gets)
@@ -78,20 +81,25 @@ import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
-import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, Cursor, seekMemType)
+import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, Cursor, seekMemType, SomeSelector(..), SomeInSelector(..))
 import Lang.Crucible.LLVM.MemType (SymType, MemType)
 import Lang.Crucible.LLVM.TypeContext (TypeContext(llvmDataLayout))
 import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
 
-data TypedSelector m argTypes bt =
-  TypedSelector (Some (Selector m argTypes)) (CrucibleTypes.BaseTypeRepr bt)
+data TypedSelector m arch argTypes bt =
+  forall ft.
+  TypedSelector
+    (FullTypeRepr m ft)
+    (ToBaseType arch ft :~: bt)
+    (SomeInSelector m argTypes ft)
+    (CrucibleTypes.BaseTypeRepr bt)
 
 data SetupError m arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
-  | SetupBadConstraintSelector (Some (Selector m argTypes)) MemType Constraint
+  | SetupBadConstraintSelector (SomeSelector m argTypes) MemType (Some (Constraint m))
 
 ppSetupError :: SetupError m arch argTypes -> Doc Void
 ppSetupError =
@@ -99,7 +107,7 @@ ppSetupError =
     SetupTypeSeekError typeSeekError -> ppTypeSeekError typeSeekError
     SetupTypeTranslationError memType ->
       PP.pretty ("Couldn't translate MemType" :: Text) <> PP.viaShow memType
-    SetupBadConstraintSelector _selector memType constraint ->
+    SetupBadConstraintSelector _selector memType (Some constraint) ->
       PP.nest 2 $
         PP.vsep
           -- TODO print selector too
@@ -108,16 +116,16 @@ ppSetupError =
           , "Constraint: " <> ppConstraint constraint
           ]
 
-data SetupAssumption sym
+data SetupAssumption m sym
   = SetupAssumption
-      { assumptionReason :: Constraint
+      { assumptionReason :: Some (Constraint m)
       , assumptionPred :: What4.Pred sym
       }
 
 data SetupState m arch sym argTypes =
   SetupState
     { _setupMem :: LocalMem m arch sym
-    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
+    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
       -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
       -- ^ Counter for generating unique/fresh symbols
@@ -132,7 +140,7 @@ setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 setupMemImpl :: SetupState m arch sym argTypes -> (LLVMMem.MemImpl sym)
 setupMemImpl = view (setupMem . globalMem)
 
-setupAnnotations :: Simple Lens (SetupState m arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector m argTypes))
+setupAnnotations :: Simple Lens (SetupState m arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes))
 setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 
 symbolCounter :: Simple Lens (SetupState m arch sym argTypes) Int
@@ -143,7 +151,7 @@ newtype Setup m arch sym argTypes a =
     (ExceptT
       (SetupError m arch argTypes)
       (RWST (Context m arch argTypes)
-            [SetupAssumption sym]
+            [SetupAssumption m sym]
             (SetupState m arch sym argTypes)
             IO)
       a)
@@ -152,7 +160,7 @@ newtype Setup m arch sym argTypes a =
 deriving instance MonadError (SetupError m arch argTypes) (Setup m arch sym argTypes)
 deriving instance MonadState (SetupState m arch sym argTypes) (Setup m arch sym argTypes)
 deriving instance MonadReader (Context m arch argTypes) (Setup m arch sym argTypes)
-deriving instance MonadWriter [SetupAssumption sym] (Setup m arch sym argTypes)
+deriving instance MonadWriter [SetupAssumption m sym] (Setup m arch sym argTypes)
 
 instance LJ.HasLog Text (Setup m arch sym argTypes) where
   getLogAction = pure $ LJ.LogAction (liftIO . TextIO.putStrLn . ("[Crux] " <>))
@@ -160,8 +168,8 @@ instance LJ.HasLog Text (Setup m arch sym argTypes) where
 data SetupResult m arch sym argTypes =
   SetupResult
     { resultMem :: LLVMMem.MemImpl sym
-    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m argTypes)
-    , resultAssumptions :: [SetupAssumption sym]
+    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
+    , resultAssumptions :: [SetupAssumption m sym]
     }
 
 runSetup ::
@@ -190,19 +198,27 @@ freshSymbol =
      pure $ What4.safeSymbol ("fresh" ++ show counter)
 
 assume ::
-  Constraint ->
+  Constraint m ty ->
   What4.Pred sym ->
   Setup m arch sym argTypes ()
-assume constraint predicate = tell [SetupAssumption constraint predicate]
+assume constraint predicate = tell [SetupAssumption (Some constraint) predicate]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
-  What4.SymAnnotation sym bt ->
-  Selector m argTypes ft {-^ Path to this value -} ->
-  CrucibleTypes.BaseTypeRepr bt ->
+  What4.SymAnnotation sym (ToBaseType arch atTy) ->
+  Selector m argTypes inTy atTy {-^ Path to this value -} ->
+  FullTypeRepr m atTy ->
+  CrucibleTypes.BaseTypeRepr (ToBaseType arch atTy) ->
   Setup m arch sym argTypes ()
-addAnnotation ann selector typeRepr =
-  setupAnnotations %= MapF.insert ann (TypedSelector (Some selector) typeRepr)
+addAnnotation ann selector fullTypeRepr baseTypeRepr =
+  setupAnnotations %=
+    MapF.insert
+      ann
+      (TypedSelector
+         fullTypeRepr
+         Refl
+         (SomeInSelector selector)
+         baseTypeRepr)
 
 storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType
 storableType memType =

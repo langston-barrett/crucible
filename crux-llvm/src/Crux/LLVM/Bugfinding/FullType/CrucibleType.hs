@@ -25,11 +25,19 @@ module Crux.LLVM.Bugfinding.FullType.CrucibleType
   , SomeAssign(..)
   , SomeIndex(..)
   , assignmentToFullType
+  , SomeAssign'(..)
+  , assignmentToCrucibleType
+  , assignmentToCrucibleTypeA
   , translateIndex
   , generateM
   ) where
 
+import           Prelude hiding (unzip)
+
+import           Data.Functor ((<&>))
 import           Data.Functor.Const (Const(Const, getConst))
+import           Data.Functor.Identity (Identity(Identity, runIdentity))
+import           Data.Functor.Product (Product(Pair))
 import           Data.Proxy (Proxy(Proxy))
 import           Control.Monad.State (runStateT)
 
@@ -67,7 +75,7 @@ toCrucibleType proxy =
       CrucibleTypes.VectorRepr (toCrucibleType proxy fullTypeRepr)
     FTStructRepr _ typeReprs ->
       case assignmentToCrucibleType proxy typeReprs of
-        SomeAssign' ctReprs Refl -> CrucibleTypes.StructRepr ctReprs
+        SomeAssign' ctReprs Refl _ -> CrucibleTypes.StructRepr ctReprs
 
 data SomeAssign arch crucibleTypes
   = forall m fullTypes.
@@ -105,37 +113,65 @@ assignmentToFullType proxy crucibleTypes memTypes =
            Just Refl -> Right (SomeAssign fullTypes moduleTypes' Refl)
            Nothing -> panic "Impossible" []
 
-data SomeAssign' arch m fullTypes
+data SomeAssign' arch m fullTypes f
   = forall crucibleTypes.
     SomeAssign'
       { saCrucibleTypes :: Ctx.Assignment CrucibleTypes.TypeRepr crucibleTypes
       , saProof' :: MapToCrucibleType arch fullTypes :~: crucibleTypes
+      , saValues :: Ctx.Assignment f crucibleTypes
       }
 
-assignmentToCrucibleType ::
-  ArchOk arch =>
+-- | Unzip an assignment of pairs into a pair of assignments.
+--
+-- TODO https://github.com/GaloisInc/parameterized-utils/pull/97
+unzip :: Ctx.Assignment (Product f g) ctx -> (Ctx.Assignment f ctx, Ctx.Assignment g ctx)
+unzip fgs =
+  case Ctx.viewAssign fgs of
+    Ctx.AssignEmpty -> (Ctx.empty, Ctx.empty)
+    Ctx.AssignExtend rest (Pair f g) ->
+      let (fs, gs) = unzip rest
+      in (Ctx.extend fs f, Ctx.extend gs g)
+
+assignmentToCrucibleTypeA ::
+  (Applicative f, ArchOk arch) =>
   proxy arch ->
+  (forall ft. Ctx.Index fts ft -> FullTypeRepr m ft -> f (g (ToCrucibleType arch ft))) ->
   Ctx.Assignment (FullTypeRepr m) fts ->
-  SomeAssign' arch m fts
-assignmentToCrucibleType proxy fullTypes =
+  f (SomeAssign' arch m fts g)
+assignmentToCrucibleTypeA proxy g fullTypes =
   let someCrucibleTypes =
-        Ctx.generateSome
+        Ctx.generateSomeM
           (Ctx.sizeInt (Ctx.size fullTypes))
           (\idx ->
               case Ctx.intIndex idx (Ctx.size fullTypes) of
                 Nothing ->
                   panic
-                    "assignmentToCrucibleType"
+                    "assignmentToCrucibleTypeA"
                     ["Impossible: Index was from the same context!"]
-                Just (Some idx') -> Some (toCrucibleType proxy (fullTypes Ctx.! idx')))
-  in case someCrucibleTypes of
-       Some crucibleTypes ->
-        case testCompatibilityAssign proxy fullTypes crucibleTypes of
-          Just Refl -> SomeAssign' crucibleTypes Refl
-          Nothing ->
-            panic
-              "assignmentToCrucibleType"
-              ["Impossible: Types match by construction!"]
+                Just (Some idx') ->
+                  let ft = fullTypes Ctx.! idx'
+                  in g idx' ft <&> \val -> Some (Pair val (toCrucibleType proxy ft)))
+  in someCrucibleTypes <&>
+       \someCrucibleTypes' ->
+          case someCrucibleTypes' of
+            Some both ->
+              let (values, crucibleTypes) = unzip both
+              in case testCompatibilityAssign proxy fullTypes crucibleTypes of
+                    Just Refl -> SomeAssign' crucibleTypes Refl values
+                    Nothing ->
+                      panic
+                        "assignmentToCrucibleTypeA"
+                        ["Impossible: Types match by construction!"]
+
+assignmentToCrucibleType ::
+  ArchOk arch =>
+  proxy arch ->
+  Ctx.Assignment (FullTypeRepr m) fts ->
+  SomeAssign' arch m fts (Const ())
+assignmentToCrucibleType proxy fullTypes =
+  runIdentity
+    (assignmentToCrucibleTypeA proxy (\_ _ -> Identity (Const ())) fullTypes)
+
 
 testCompatibility ::
   forall proxy arch m ft tp.

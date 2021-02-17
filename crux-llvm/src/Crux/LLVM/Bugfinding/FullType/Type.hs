@@ -21,6 +21,7 @@ By using this machinery, we head off several sources of partiality/errors:
 * There are a few sources of partiality in the 'MemType.MemType' to
   'CrucibleTypes.TypeRepr' translation that can be avoided, specifically
   ill-sized integer values.
+* 'FullType' distinguishes between pointers and pointer-widths integers.
 
 TODO: Split into Internal module, don't export PartTypeRepr constructors from
 this module, see @asFullType@
@@ -52,9 +53,12 @@ module Crux.LLVM.Bugfinding.FullType.Type
   , ToCrucibleType
   , MapToBaseType
   , ToBaseType
+  , isPtrRepr
+  , IsPtrRepr(..)
   ) where
 
 import           GHC.TypeLits (Nat)
+import           Data.Kind (Type)
 import           Data.Functor.Const (Const(Const))
 import           Data.Type.Equality (TestEquality(testEquality), (:~:)(Refl))
 import           Unsafe.Coerce (unsafeCoerce)
@@ -73,7 +77,7 @@ import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import qualified Lang.Crucible.LLVM.MemType as MemType
 
 -- | Type level only
-data FullType m where
+data FullType (m :: Type) where
   FTInt :: Nat -> FullType m
   FTFloat :: FullType m
   FTPtr :: FullType m -> FullType m
@@ -132,6 +136,15 @@ data PartTypeRepr m (ft :: FullType m) where
   -- The Const is so that we can get type variables in scope in the TestEquality
   -- instance, see below.
   PTAliasRepr :: Const L.Ident ft -> PartTypeRepr m ft
+
+
+data IsPtrRepr m ft = forall ft'. IsPtrRepr (ft :~: FTPtr ft')
+
+isPtrRepr :: forall m ft. FullTypeRepr m ft -> Maybe (IsPtrRepr m ft)
+isPtrRepr =
+  \case
+    FTPtrRepr (rep :: PartTypeRepr m ft') -> Just (IsPtrRepr Refl)
+    _ -> Nothing
 
 -- data IntConstraint = IntConstraint
 
