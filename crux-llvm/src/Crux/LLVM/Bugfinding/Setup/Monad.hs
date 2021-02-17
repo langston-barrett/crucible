@@ -55,6 +55,7 @@ import           Control.Monad.RWS (RWST, runRWST)
 import qualified Lumberjack as LJ
 
 import           Data.Parameterized.Classes (OrdF)
+import           Data.Parameterized.Some (Some(Some))
 import           Data.Parameterized.Map (MapF)
 import qualified Data.Parameterized.Map as MapF
 
@@ -72,7 +73,7 @@ import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (LocalMem, makeLocalMem, globalMem)
 import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
-import           Crux.LLVM.Bugfinding.FullType.Type (FullTypeRepr, ToCrucibleType)
+import           Crux.LLVM.Bugfinding.FullType.Type (FullTypeRepr, ToCrucibleType, ToBaseType)
 import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 
 -- TODO unsorted
@@ -84,13 +85,13 @@ import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
 
-data TypedSelector m argTypes tp =
-  TypedSelector (Selector m argTypes) (CrucibleTypes.BaseTypeRepr tp)
+data TypedSelector m argTypes bt =
+  TypedSelector (Some (Selector m argTypes)) (CrucibleTypes.BaseTypeRepr bt)
 
 data SetupError m arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
-  | SetupBadConstraintSelector (Selector m argTypes) MemType Constraint
+  | SetupBadConstraintSelector (Some (Selector m argTypes)) MemType Constraint
 
 ppSetupError :: SetupError m arch argTypes -> Doc Void
 ppSetupError =
@@ -196,12 +197,12 @@ assume constraint predicate = tell [SetupAssumption constraint predicate]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
-  What4.SymAnnotation sym tp ->
-  Selector m argTypes ->
-  CrucibleTypes.BaseTypeRepr tp ->
+  What4.SymAnnotation sym bt ->
+  Selector m argTypes ft {-^ Path to this value -} ->
+  CrucibleTypes.BaseTypeRepr bt ->
   Setup m arch sym argTypes ()
 addAnnotation ann selector typeRepr =
-  setupAnnotations %= MapF.insert ann (TypedSelector selector typeRepr)
+  setupAnnotations %= MapF.insert ann (TypedSelector (Some selector) typeRepr)
 
 storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType
 storableType memType =

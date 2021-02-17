@@ -28,9 +28,10 @@ import           Control.Monad (void)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
 import           Data.Functor.Const (Const(Const, getConst))
+import           Data.Functor.Compose (Compose(getCompose))
 import qualified Data.Set as Set
 import           Data.Text (Text)
-import           Data.Type.Equality ((:~:)(Refl))
+import           Data.Type.Equality ((:~:)(Refl), testEquality)
 
 import           Lumberjack (HasLog, writeLogM)
 
@@ -56,6 +57,7 @@ import           Crux.LLVM.Bugfinding.Cursor
 import           Crux.LLVM.Bugfinding.FullType.CrucibleType (SomeIndex(..), translateIndex, generateM, toCrucibleType)
 import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), ToCrucibleType, MapToCrucibleType, FullTypeRepr(FTPtrRepr))
 import           Crux.LLVM.Bugfinding.FullType.MemType (asFullType, toMemType)
+import           Crux.LLVM.Bugfinding.Errors.Panic (panic)
 import           Crux.LLVM.Bugfinding.Errors.Unimplemented (unimplemented)
 import           Crux.LLVM.Bugfinding.Setup.Monad
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (TypedRegEntry(..))
@@ -123,11 +125,11 @@ logRegMap context sym mem (Crucible.RegMap regmap) =
 
 
 annotatedTerm ::
-  forall m arch sym tp argTypes.
+  forall m arch sym ft tp argTypes.
   (Crucible.IsSymInterface sym) =>
   sym ->
   CrucibleTypes.BaseTypeRepr tp ->
-  Selector m argTypes ->
+  Selector m argTypes ft {-^ Path to this value -} ->
   Setup m arch sym argTypes (What4.SymExpr sym tp)
 annotatedTerm sym typeRepr selector =
   do symbol <- freshSymbol
@@ -138,12 +140,12 @@ annotatedTerm sym typeRepr selector =
      pure expr
 
 generateMinimalValue ::
-  forall proxy m sym arch tp argTypes.
+  forall proxy m sym arch ft tp argTypes.
   (Crucible.IsSymInterface sym, ArchOk arch) =>
   proxy arch ->
   sym ->
   CrucibleTypes.TypeRepr tp ->
-  Selector m argTypes {-^ Path to this value -} ->
+  Selector m argTypes ft {-^ Path to this value -} ->
   Setup m arch sym argTypes (Crucible.RegValue sym tp)
 generateMinimalValue proxy sym typeRepr selector =
   case CrucibleTypes.asBaseType typeRepr of
@@ -197,9 +199,9 @@ generateMinimalArgs context sym = do
                       (Proxy :: Proxy arch)
                       sym
                       typeRepr
-                      (SelectArgument (Some index) Here))
-                  -- (case translateIndex (Ctx.size (context ^. argumentFullTypes)) index of
-                  --    SomeIndex index' Refl -> SelectArgument (Some index) Here))
+                      (SelectArgument
+                         index
+                         (Here (context ^. argumentFullTypes . ixF' index))))
   mem <- gets setupMemImpl
   logRegMap context sym mem args
   return args
@@ -210,7 +212,7 @@ generateMinimalArgs context sym = do
 --
 -- TODO: Allow for array initialization
 initialize ::
-  forall m arch sym argTypes ft.
+  forall m arch sym argTypes ft ft'.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
@@ -218,7 +220,7 @@ initialize ::
   Context m arch argTypes ->
   sym ->
   FullTypeRepr m ('FTPtr ft) {-^ Type of pointer -} ->
-  Selector m argTypes {-^ Selector for the pointer -} ->
+  Selector m argTypes ft' {-^ Path to the pointer -} ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   Setup m arch sym argTypes ( LLVMMem.LLVMPtr sym (ArchWidth arch)
                             , Crucible.RegEntry sym (ToCrucibleType arch ft)
@@ -236,20 +238,21 @@ initialize context sym (FTPtrRepr ptPointedTo) selector pointer =
                   (Proxy :: Proxy arch)
                   sym
                   tp
-                  (selector & selectorCursor %~ Dereference)
+                  (selector) -- TODO
+                  -- (selector & selectorCursor %~ Dereference)
               ptr' <-
                 store sym ftPointedTo (Crucible.RegEntry tp pointedToVal) ptr
               pure (ptr', Crucible.RegEntry tp pointedToVal)
 
 constrainHere ::
-  forall m arch sym argTypes ft.
+  forall m arch sym argTypes ft ft'.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
   ) =>
   Context m arch argTypes ->
   sym ->
-  Selector m argTypes {-^ Top-level selector -} ->
+  Selector m argTypes ft' {-^ Top-level selector -} ->
   Constraint ->
   FullTypeRepr m ft ->
   Crucible.RegEntry sym (ToCrucibleType arch ft) ->
@@ -277,14 +280,14 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
                 pretty <- showMe fullTypeRepr regEntry'
                 writeLogM ("Constrained value: " <> Text.pack (show pretty))
                 pure regEntry'
-           _ -> throwError (SetupBadConstraintSelector selector (toMemType fullTypeRepr) constraint)
+           _ -> throwError (SetupBadConstraintSelector (Some selector) (toMemType fullTypeRepr) constraint)
        Aligned alignment ->
          case typeRepr of
            LLVMMem.PtrRepr ->
              do assume constraint =<<
                   liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
                 pure regEntry
-           _ -> throwError (SetupBadConstraintSelector selector (toMemType fullTypeRepr) constraint)
+           _ -> throwError (SetupBadConstraintSelector (Some selector) (toMemType fullTypeRepr) constraint)
        Initialized ->
          case fullTypeRepr of
            (FTPtrRepr partTypeRepr) ->
@@ -297,11 +300,11 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
                 writeLogM ("Initialized pointer: " <> Text.pack (show prettyPtr))
                 writeLogM ("Pointed-to value: " <> Text.pack (show prettyVal))
                 pure regEntry'
-           _ -> throwError (SetupBadConstraintSelector selector (toMemType fullTypeRepr) constraint)
+           _ -> throwError (SetupBadConstraintSelector (Some selector) (toMemType fullTypeRepr) constraint)
        _ -> unimplemented "constrainHere" ("Constraint:" ++ show (ppConstraint constraint))
 
 constrainValue ::
-  forall m arch sym argTypes ft.
+  forall m arch sym argTypes ft ft'.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
@@ -309,14 +312,17 @@ constrainValue ::
   Context m arch argTypes ->
   sym ->
   Constraint ->
-  Selector m argTypes {-^ Parent selector for the cursor -} ->
-  Cursor ->
+  Selector m argTypes ft' {-^ Parent selector for the cursor -} ->
+  Cursor m ft' ->
   FullTypeRepr m ft ->
   Crucible.RegEntry sym (ToCrucibleType arch ft) ->
   Setup m arch sym argTypes (Crucible.RegEntry sym (ToCrucibleType arch ft))
 constrainValue context sym constraint selector cursor ftRepr regEntry@(Crucible.RegEntry typeRepr regValue) =
   case cursor of
-    Here -> constrainHere context sym selector constraint ftRepr regEntry
+    Here ftRepr' ->
+      case testEquality ftRepr ftRepr' of
+        Nothing -> panic "constrainValue" ["Mismatched type representatives"]
+        Just _ -> constrainHere context sym selector constraint ftRepr regEntry
     Dereference cursor' ->
       case ftRepr of
         FTPtrRepr (asFullType (context ^. moduleTypes) -> pointedToRepr) ->
@@ -325,9 +331,9 @@ constrainValue context sym constraint selector cursor ftRepr regEntry@(Crucible.
              -- that.
              (ptr, pointedToValue) <-
                initialize context sym ftRepr selector regValue
-             void $ constrainValue context sym constraint selector cursor' pointedToRepr  pointedToValue
+             void $ constrainValue context sym constraint selector cursor pointedToRepr  pointedToValue
              pure $ Crucible.RegEntry typeRepr ptr
-        _ -> throwError (SetupBadConstraintSelector selector (toMemType ftRepr) constraint)
+        _ -> throwError (SetupBadConstraintSelector (Some selector) (toMemType ftRepr) constraint)
     _ -> unimplemented "constrainValue" "Non-top-level cursors"
 
 constrainOneArgument ::
@@ -338,7 +344,7 @@ constrainOneArgument ::
   ) =>
   Context m arch argTypes ->
   sym ->
-  [ValueConstraint] ->
+  [ValueConstraint m ft] ->
   Ctx.Index argTypes ft ->
   Crucible.RegEntry sym (ToCrucibleType arch ft) ->
   Setup m arch sym argTypes (Crucible.RegEntry sym (ToCrucibleType arch ft))
@@ -353,7 +359,7 @@ constrainOneArgument context sym constraints idx regEntry =
                  context
                  sym
                  constraint
-                 (SelectArgument (Some idx) cursor)
+                 (SelectArgument idx cursor)
                  cursor
                  (context ^. argumentFullTypes . to (Ctx.! idx))
                  regEntry
@@ -380,7 +386,7 @@ constrain context sym preconds (Crucible.RegMap args) =
                constrainOneArgument
                  context
                  sym
-                 (Set.toList (getConst (argConstraints preconds Ctx.! idx)))
+                 (Set.toList (getCompose (argConstraints preconds Ctx.! idx)))
                  idx
                  (args Ctx.! idx'))
      return (Crucible.RegMap args')
