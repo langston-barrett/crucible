@@ -35,7 +35,6 @@ module Crux.LLVM.Bugfinding.Setup.Monad
   , assume
   , addAnnotation
   , runSetup
-  , seekType
   , storableType
   , load
   , malloc
@@ -203,15 +202,6 @@ addAnnotation ::
   Setup m arch sym argTypes ()
 addAnnotation ann selector typeRepr =
   setupAnnotations %= MapF.insert ann (TypedSelector selector typeRepr)
-
-seekType ::
-  Cursor ->
-  MemType ->
-  Setup m arch sym argTypes MemType
-seekType cursor memType =
-  do context <- ask
-     withTypeContext context $
-       either (throwError . SetupTypeSeekError) pure (seekMemType cursor memType)
 
 storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType
 storableType memType =
