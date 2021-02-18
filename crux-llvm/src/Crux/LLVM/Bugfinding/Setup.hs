@@ -8,6 +8,7 @@ Stability    : provisional
 -}
 
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
@@ -23,13 +24,12 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, (^.), (%~), (.~))
-import           Control.Monad (void)
+import           Control.Lens (to, (^.), (%~))
+import           Control.Monad (void, unless)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
 import           Data.Functor.Const (Const(Const, getConst))
 import           Data.Functor.Compose (Compose(getCompose))
-import qualified Data.Semigroupoid as Semigroupoid
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import           Data.Type.Equality ((:~:)(Refl), testEquality)
@@ -161,7 +161,7 @@ generateMinimalValue proxy sym fullTypeRepr selector =
     FTIntRepr w ->
       do liftIO . LLVMMem.llvmPointer_bv sym =<<
             annotatedTerm sym fullTypeRepr (CrucibleTypes.BaseBVRepr w) selector
-    FTStructRepr structInfo (fields :: Ctx.Assignment (FullTypeRepr m) fieldTypes) ->
+    FTStructRepr _ (fields :: Ctx.Assignment (FullTypeRepr m) fieldTypes) ->
       do let
            convert ::
              forall ft.
@@ -288,11 +288,13 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
            LLVMMem.PtrRepr ->
              do assume constraint =<<
                   liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
+                pretty <- showMe fullTypeRepr regEntry
+                writeLogM ("Constrained value: " <> Text.pack (show pretty))
                 pure regEntry
            _ -> throwError (SetupBadConstraintSelector (SomeSelector selector) (toMemType fullTypeRepr) (Some constraint))
        Initialized ->
          case fullTypeRepr of
-           (FTPtrRepr partTypeRepr) ->
+           FTPtrRepr partTypeRepr ->
              do let fullTypeRepr' = asFullType (context ^. moduleTypes) partTypeRepr
                 (ptr, freshVal) <-
                   initialize context sym fullTypeRepr selector regValue
@@ -324,7 +326,7 @@ constrainValue context sym constraint cursor selector ftRepr regEntry@(Crucible.
       case testEquality ftRepr ftRepr' of
         Nothing -> panic "constrainValue" ["Mismatched type representatives"]
         Just _ -> constrainHere context sym selector constraint ftRepr regEntry
-    Dereference cursor' ->
+    Dereference _ ->
       case ftRepr of
         -- TODO
         FTPtrRepr (asFullType (context ^. moduleTypes) -> pointedToRepr) ->
@@ -334,23 +336,26 @@ constrainValue context sym constraint cursor selector ftRepr regEntry@(Crucible.
              (ptr, pointedToValue) <-
                initialize context sym ftRepr selector regValue
              case dereference pointedToRepr cursor of
-               Left Refl -> undefined
-               Right cursor'' ->
-                 do void $
+               -- This case is technically unreachable because we matched on
+               -- Here above, but... it typechecks and makes GHC happy.
+               Left Refl -> constrainHere context sym selector constraint ftRepr regEntry
+               Right cursor' ->
+                 do regEntry' <-
                       constrainValue
                        context
                        sym
                        constraint
-                       cursor''
-                       (selector & selectorCursor %~ \cursor -> Dereference cursor)
+                       cursor'
+                       (selector & selectorCursor %~ Dereference)
                        pointedToRepr
                        pointedToValue
-                    pure $ Crucible.RegEntry typeRepr ptr
+                    ptr' <- store sym pointedToRepr regEntry' ptr
+                    pure $ Crucible.RegEntry typeRepr ptr'
         _ -> throwError (SetupBadConstraintSelector (SomeSelector selector) (toMemType ftRepr) (Some constraint))
     _ -> unimplemented "constrainValue" "Non-top-level cursors"
 
 constrainOneArgument ::
-  forall m arch sym argTypes inTy atTy.
+  forall m arch sym argTypes inTy.
   ( Crucible.IsSymInterface sym
   , LLVMMem.HasLLVMAnn sym
   , ArchOk arch
@@ -395,13 +400,10 @@ constrain context sym preconds (Crucible.RegMap args) =
          (Proxy :: Proxy arch)
          (Ctx.size (context ^. argumentStorageTypes))
          (\idx idx' Refl ->
-            do writeLogM ("Modifying argument #" <> Text.pack (show (Ctx.indexVal idx)))
-               constrainOneArgument
-                 context
-                 sym
-                 (Set.toList (getCompose (argConstraints preconds Ctx.! idx)))
-                 idx
-                 (args Ctx.! idx'))
+            do let constraints = Set.toList (getCompose (argConstraints preconds Ctx.! idx))
+               unless (null constraints) $
+                 writeLogM ("Modifying argument #" <> Text.pack (show (Ctx.indexVal idx)))
+               constrainOneArgument context sym constraints idx (args Ctx.! idx'))
      return (Crucible.RegMap args')
 
 setupExecution ::

@@ -107,14 +107,14 @@ tests :: TT.TestTree
 tests =
   TT.testGroup "bugfinding"
     [ isSafe "add1.c" "add1"
+    , isSafe "assert_arg_eq.c" "assert_arg_eq" -- TODO: Compile with asserts!
+    , isSafe "assert_false.c" "assert_false" -- TODO: Compile with asserts!
     , isSafe "branch.c" "branch"
     , isSafe "compare_to_null.c" "compare_to_null"
     , isSafe "factorial.c" "factorial"  -- TODO only up to the recursion bound?
     , isSafe "loop_arg_bound.c" "loop_arg_bound"
     , isSafe "loop_constant_bound_arg_start.c" "loop_constant_bound_arg_start"
     , isSafe "print.c" "print"
-    , isSafe "assert_arg_eq.c" "assert_arg_eq" -- TODO: Compile with asserts!
-    , isSafe "assert_false.c" "assert_false" -- TODO: Compile with asserts!
     , isSafe "read_global.c" "read_global"
     , isSafe "write_global.c" "write_global"
     , isSafeWithPreconditions "deref_arg.c" "deref_arg"
@@ -123,6 +123,8 @@ tests =
     , isSafeWithPreconditions "writes_to_arg.c" "writes_to_arg"
     , isSafeWithPreconditions "writes_to_arg_conditional.c" "writes_to_arg_conditional"
     , isSafeWithPreconditions "writes_to_arg_conditional_ptr.c" "writes_to_arg_conditional_ptr"
+    , isSafeWithPreconditions "writes_to_arg_field.c" "writes_to_arg_field"
+    , isSafeWithPreconditions "writes_to_arg_ptr.c" "writes_to_arg_ptr"
     , isUnclassified "do_exit.c" "do_exit"  -- goal: isSafe
     , isUnclassified "do_fork.c" "do_fork"
     , isUnclassified "do_getchar.c" "do_getchar"  -- goal: isSafe
@@ -135,7 +137,6 @@ tests =
     , isUnclassified "ptr_as_array.c" "ptr_as_array"  -- goal: isSafe
     , isUnclassified "sized_array_arg.c" "sized_array_arg"  -- goal: isSafe
     , isUnclassified "uninitialized_stack.c" "uninitialized_stack"  -- goal: notSafe
-    , isUnclassified "writes_to_arg_ptr.c" "writes_to_arg_ptr"  -- goal: isSafeWP
     , isUnimplemented "add1_double.c" "add1_double"  -- goal: ???
     , isUnimplemented "add1_float.c" "add1_float"  -- goal: ???
     , isUnimplemented "call_function_pointer.c" "call_function_pointer"  -- goal: ???

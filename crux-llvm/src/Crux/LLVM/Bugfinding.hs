@@ -62,6 +62,7 @@ import Lang.Crucible.LLVM.Translation
         , llvmPtrWidth, llvmTypeCtx
         )
 
+import Lang.Crucible.LLVM.Errors (ppBB)
 import Lang.Crucible.LLVM.MemModel.Partial (BoolAnn(BoolAnn))
 import Lang.Crucible.LLVM.Extension( LLVM )
 
@@ -172,8 +173,11 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
                     -- TODO(lb)
                     -- panic "simulateLLVM" ["Unexplained error!"]
                   Just badBehavior ->
-                    classify context sym args argAnnotations badBehavior >>=
-                      modifyIORef explRef . (:)
+                    do -- Helpful for debugging:
+                       -- putStrLn "~~~~~~~~~~~"
+                       -- putStrLn (show (ppBB badBehavior))
+                       classify context sym args argAnnotations badBehavior >>=
+                         modifyIORef explRef . (:)
                 return mempty
 
        return (Crux.RunnableState initSt, explainFailure)
