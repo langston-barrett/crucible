@@ -97,13 +97,13 @@ getAnnotation ::
   proxy arch ->
   sym ->
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
-  IO ( What4.SymAnnotation sym (CrucibleTypes.BaseBVType (ArchWidth arch))
+  IO ( What4.SymAnnotation sym CrucibleTypes.BaseNatType
      , LLVMMem.LLVMPtr sym (ArchWidth arch)
      )
 getAnnotation _proxy sym ptr =
-  case What4.getAnnotation sym (LLVMMem.llvmPointerOffset ptr) of
+  case What4.getAnnotation sym (LLVMMem.llvmPointerBlock ptr) of
     Just annotation -> pure (annotation, ptr)
-    Nothing -> liftIO $ LLVMMem.annotatePointerOffset sym ptr
+    Nothing -> liftIO $ LLVMMem.annotatePointerBlock sym ptr
 
 load ::
   ( Crucible.IsSymInterface sym
@@ -116,7 +116,7 @@ load ::
   LLVMMem.LLVMPtr sym (ArchWidth arch) ->
   Maybe (TypedRegEntry m arch sym ft)
 load _proxy mem sym ftRepr ptr =
-  case What4.getAnnotation sym (LLVMMem.llvmPointerOffset ptr) of
+  case What4.getAnnotation sym (LLVMMem.llvmPointerBlock ptr) of
     Just ann ->
       join $ getCompose <$>
         MapF.lookup (makeAnnotation (FTPtrRepr $ PTFullRepr ftRepr) ann) (mem ^. localMem)

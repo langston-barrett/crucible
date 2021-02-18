@@ -35,7 +35,8 @@ module Crux.LLVM.Bugfinding.Setup.Monad
   , TypedSelector(..)
   , freshSymbol
   , assume
-  , addAnnotation
+  , getAnnotation
+  , annotatePointer
   , runSetup
   , storableType
   , load
@@ -46,6 +47,8 @@ module Crux.LLVM.Bugfinding.Setup.Monad
 import           Control.Lens (to, (.=), (%=), (<+=), Simple, Lens, lens, (^.), view)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Proxy (Proxy(Proxy))
+import           Data.Map (Map)
+import qualified Data.Map as Map
 import           Data.Text (Text)
 import qualified Data.Text.IO as TextIO
 import           Data.Type.Equality ((:~:)(Refl))
@@ -59,8 +62,6 @@ import qualified Lumberjack as LJ
 
 import           Data.Parameterized.Classes (OrdF)
 import           Data.Parameterized.Some (Some(Some))
-import           Data.Parameterized.Map (MapF)
-import qualified Data.Parameterized.Map as MapF
 
 import qualified What4.Interface as What4
 
@@ -70,13 +71,14 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 
 import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
+import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
 import           Crux.LLVM.Bugfinding.Context
 import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (LocalMem, makeLocalMem, globalMem)
 import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
-import           Crux.LLVM.Bugfinding.FullType.Type (FullTypeRepr, ToCrucibleType, ToBaseType)
+import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), FullTypeRepr, ToCrucibleType, ToBaseType)
 import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 
 -- TODO unsorted
@@ -88,13 +90,8 @@ import qualified Prettyprinter as PP
 import           Prettyprinter (Doc)
 import Data.Void (Void)
 
-data TypedSelector m arch argTypes bt =
-  forall ft.
-  TypedSelector
-    (FullTypeRepr m ft)
-    (ToBaseType arch ft :~: bt)
-    (SomeInSelector m argTypes ft)
-    (CrucibleTypes.BaseTypeRepr bt)
+data TypedSelector m arch argTypes ft =
+  TypedSelector (FullTypeRepr m ft) (SomeInSelector m argTypes ft)
 
 data SetupError m arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
@@ -125,14 +122,14 @@ data SetupAssumption m sym
 data SetupState m arch sym argTypes =
   SetupState
     { _setupMem :: LocalMem m arch sym
-    , _setupAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
+    , _setupAnnotations :: Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes))
       -- ^ This map tracks where a given expression originated from
     , _symbolCounter :: !Int
       -- ^ Counter for generating unique/fresh symbols
     }
 
 makeSetupState :: LLVMMem.MemImpl sym -> SetupState m arch sym argTypes
-makeSetupState mem = SetupState (makeLocalMem mem) MapF.empty 0
+makeSetupState mem = SetupState (makeLocalMem mem) Map.empty 0
 
 setupMem :: Simple Lens (SetupState m arch sym argTypes) (LocalMem m arch sym)
 setupMem = lens _setupMem (\s v -> s { _setupMem = v })
@@ -140,7 +137,7 @@ setupMem = lens _setupMem (\s v -> s { _setupMem = v })
 setupMemImpl :: SetupState m arch sym argTypes -> (LLVMMem.MemImpl sym)
 setupMemImpl = view (setupMem . globalMem)
 
-setupAnnotations :: Simple Lens (SetupState m arch sym argTypes) (MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes))
+setupAnnotations :: Simple Lens (SetupState m arch sym argTypes) (Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes)))
 setupAnnotations = lens _setupAnnotations (\s v -> s { _setupAnnotations = v })
 
 symbolCounter :: Simple Lens (SetupState m arch sym argTypes) Int
@@ -168,7 +165,7 @@ instance LJ.HasLog Text (Setup m arch sym argTypes) where
 data SetupResult m arch sym argTypes =
   SetupResult
     { resultMem :: LLVMMem.MemImpl sym
-    , resultAnnotations :: MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
+    , resultAnnotations :: Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes))
     , resultAssumptions :: [SetupAssumption m sym]
     }
 
@@ -205,20 +202,65 @@ assume constraint predicate = tell [SetupAssumption (Some constraint) predicate]
 
 addAnnotation ::
   OrdF (What4.SymAnnotation sym) =>
-  What4.SymAnnotation sym (ToBaseType arch atTy) ->
+  Some (What4.SymAnnotation sym) ->
   Selector m argTypes inTy atTy {-^ Path to this value -} ->
   FullTypeRepr m atTy ->
-  CrucibleTypes.BaseTypeRepr (ToBaseType arch atTy) ->
   Setup m arch sym argTypes ()
-addAnnotation ann selector fullTypeRepr baseTypeRepr =
+addAnnotation ann selector fullTypeRepr =
   setupAnnotations %=
-    MapF.insert
-      ann
-      (TypedSelector
-         fullTypeRepr
-         Refl
-         (SomeInSelector selector)
-         baseTypeRepr)
+    Map.insert ann (Some (TypedSelector fullTypeRepr (SomeInSelector selector)))
+
+-- | Retrieve a pre-existing annotation, or make a new one.
+getAnnotation ::
+  Crucible.IsSymInterface sym =>
+  sym ->
+  Selector m argTypes inTy atTy {-^ Path to this value -} ->
+  FullTypeRepr m atTy ->
+  What4.SymExpr sym (ToBaseType arch atTy) ->
+  Setup m arch sym argTypes ( What4.SymAnnotation sym (ToBaseType arch atTy)
+                            , What4.SymExpr sym (ToBaseType arch atTy)
+                            )
+getAnnotation sym selector fullTypeRepr expr =
+  case What4.getAnnotation sym expr of
+    Just annotation ->
+      do addAnnotation (Some annotation) selector fullTypeRepr
+         pure (annotation, expr)
+    Nothing ->
+      do (annotation, expr') <- liftIO $ What4.annotateTerm sym expr
+         addAnnotation (Some annotation) selector fullTypeRepr
+         pure (annotation, expr')
+
+annotatePointer ::
+  Crucible.IsSymInterface sym =>
+  sym ->
+  Selector m argTypes inTy atTy {-^ Path to this pointer -} ->
+  FullTypeRepr m atTy ->
+  LLVMMem.LLVMPtr sym w ->
+  Setup m arch sym argTypes (LLVMMem.LLVMPtr sym w)
+annotatePointer sym selector fullTypeRepr ptr =
+  do let block = LLVMPtr.llvmPointerBlock ptr
+     liftIO $ putStrLn ("Annotating pointer: " ++ show (LLVMPtr.ppPtr ptr))
+     ptr' <-
+       case What4.getAnnotation sym block of
+         Just annotation ->
+           do addAnnotation (Some annotation) selector fullTypeRepr
+              pure ptr
+         Nothing ->
+           do (annotation, ptr') <- liftIO (LLVMPtr.annotatePointerBlock sym ptr)
+              addAnnotation (Some annotation) selector fullTypeRepr
+              pure ptr'
+     let offset = LLVMPtr.llvmPointerOffset ptr'
+     ptr'' <-
+       case What4.getAnnotation sym offset of
+         Just annotation ->
+           do addAnnotation (Some annotation) selector fullTypeRepr
+              pure ptr'
+         Nothing ->
+           do (annotation, ptr'') <- liftIO (LLVMPtr.annotatePointerOffset sym ptr)
+              addAnnotation (Some annotation) selector fullTypeRepr
+              pure ptr''
+     liftIO $ putStrLn ("Annotated pointer: " ++ show (LLVMPtr.ppPtr ptr''))
+     pure ptr''
 
 storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType
 storableType memType =
@@ -239,15 +281,16 @@ _modifyMem_ ::
 _modifyMem_ f = modifyMem (fmap ((),) . f)
 
 malloc ::
-  forall m sym arch argTypes ft.
+  forall m sym arch argTypes inTy atTy.
   ( Crucible.IsSymInterface sym
   , ArchOk arch
   ) =>
   sym ->
-  FullTypeRepr m ft ->
+  FullTypeRepr m ('FTPtr atTy) ->
+  Selector m argTypes inTy ('FTPtr atTy) {-^ Path to this pointer -} ->
   (LLVMMem.LLVMPtr sym (ArchWidth arch)) ->
   Setup m arch sym argTypes (LLVMMem.LLVMPtr sym (ArchWidth arch))
-malloc sym fullTypeRepr ptr =
+malloc sym fullTypeRepr selector ptr =
   do context <- ask
      let dl =
            context ^.
@@ -259,7 +302,7 @@ malloc sym fullTypeRepr ptr =
        modifyMem $
          \mem ->
            liftIO $ LocalMem.maybeMalloc (Proxy :: Proxy arch) mem ptr sym dl fullTypeRepr
-     pure ptr'
+     annotatePointer sym selector fullTypeRepr ptr'
 
 store ::
   forall m arch sym argTypes ft.

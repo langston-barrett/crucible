@@ -25,9 +25,12 @@ module Crux.LLVM.Bugfinding.Classify
   , classify
   ) where
 
+import           Control.Applicative ((<|>))
 import           Control.Lens (to, (^.))
 import           Control.Monad.IO.Class (MonadIO)
 import           Data.Functor.Const (Const(getConst))
+import           Data.Map (Map)
+import qualified Data.Map as Map
 import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
@@ -40,8 +43,6 @@ import           Lumberjack (writeLogM, HasLog)
 
 import           Data.Parameterized.Classes (IxedF'(ixF'))
 import qualified Data.Parameterized.Context as Ctx
-import           Data.Parameterized.Map (MapF)
-import qualified Data.Parameterized.Map as MapF
 import           Data.Parameterized.Some (Some(Some))
 
 import qualified What4.Interface as What4
@@ -126,7 +127,7 @@ classify ::
   Context m arch argTypes ->
   sym ->
   Crucible.RegMap sym (MapToCrucibleType arch argTypes) {-^ Function arguments -} ->
-  MapF (What4.SymAnnotation sym) (TypedSelector m arch argTypes)
+  Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes))
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
   f (Explanation m arch argTypes)
@@ -135,10 +136,16 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
   let
     getPtrOffsetAnn ::
       LLVMPointer.LLVMPtr sym w ->
-      Maybe (TypedSelector m arch argTypes (What4.BaseBVType w))
+      Maybe (Some (TypedSelector m arch argTypes))
     getPtrOffsetAnn ptr =
-      flip MapF.lookup annotations =<<
+      flip Map.lookup annotations . Some =<<
         What4.getAnnotation sym (LLVMPointer.llvmPointerOffset ptr)
+    getPtrBlockAnn ::
+      LLVMPointer.LLVMPtr sym w ->
+      Maybe (Some (TypedSelector m arch argTypes))
+    getPtrBlockAnn ptr =
+      flip Map.lookup annotations . Some =<<
+        What4.getAnnotation sym (LLVMPointer.llvmPointerBlock ptr)
     argName :: Ctx.Index argTypes tp -> String
     argName idx = context ^. argumentNames . ixF' idx . to getConst . to (maybe "<top>" Text.unpack)
     unclass =
@@ -149,7 +156,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.WriteBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _baseTypeRepr) ->
+            Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Read from a pointer with insufficient"
@@ -182,7 +189,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMErrors.BBUndefinedBehavior
         (LLVMErrors.ReadBadAlignment ptr alignment) ->
           case getPtrOffsetAnn (Crucible.unRV ptr) of
-            Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
+            Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
               do writeLogM $
                    Text.unwords
                      [ "Diagnosis: Wrote to a pointer with insufficient"
@@ -216,8 +223,8 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
         (LLVMErrors.MemoryError
           (summarizeOp -> (_expl, ptr))
           LLVMErrors.UnwritableRegion) ->
-            case getPtrOffsetAnn ptr of
-              Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
+            case getPtrBlockAnn ptr of
+              Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
                 -- TODO: Double check that it really was unmapped not read-only
                 -- or something?
                 do writeLogM $
@@ -254,8 +261,8 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
         (LLVMErrors.MemoryError
           _op
           (LLVMErrors.NoSatisfyingWrite _storageType ptr)) ->
-            case getPtrOffsetAnn ptr of
-              Just (TypedSelector ftRepr Refl (SomeInSelector (SelectArgument idx cursor)) _typeRepr) ->
+            case getPtrBlockAnn ptr <|> getPtrOffsetAnn ptr of
+              Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
                 do writeLogM $
                      Text.unwords
                        [ "Diagnosis: Read from an uninitialized pointer in argument"
@@ -284,5 +291,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                                  cursor
                                  Initialized)))
               -- TODO(lb): Something about globals, probably?
+              -- Just _ -> error "HERE"
+              -- Nothing -> error (show (length (Map.keys annotations)))
               _ -> unclass
       _ -> unclass

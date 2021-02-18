@@ -109,7 +109,7 @@ type family MapToBaseType arch (ctx :: Ctx (FullType m)) :: Ctx CrucibleTypes.Ba
 -- | The type of annotated What4 values that correspond to each 'FullType'
 type family ToBaseType arch (ft :: FullType m) :: CrucibleTypes.BaseType where
   ToBaseType arch ('FTInt n) = CrucibleTypes.BaseBVType n
-  ToBaseType arch ('FTPtr _ft) = CrucibleTypes.BaseBVType (ArchWidth arch)
+  ToBaseType arch ('FTPtr _ft) = CrucibleTypes.BaseNatType
   ToBaseType arch ('FTStruct ctx) = CrucibleTypes.BaseStructType (MapToBaseType arch ctx)
   -- TODO(lb): BaseArrayType for Vector? It's not a BaseType in Crucible
 

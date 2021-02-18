@@ -15,6 +15,7 @@ Stability    : provisional
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE ViewPatterns #-}
 
 module Crux.LLVM.Bugfinding.Setup
@@ -37,6 +38,7 @@ import           Data.Type.Equality ((:~:)(Refl), testEquality)
 import           Lumberjack (HasLog, writeLogM)
 
 import qualified Data.Parameterized.Context as Ctx
+import           Data.Parameterized.NatRepr (NatRepr, type (<=))
 import           Data.Parameterized.Some (Some(..))
 
 import qualified What4.Interface as What4
@@ -48,6 +50,7 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.Globals as LLVMGlobals
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
+import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 
 
 import           Crux.LLVM.Overrides (ArchOk)
@@ -136,11 +139,25 @@ annotatedTerm ::
   Setup m arch sym argTypes (What4.SymExpr sym (ToBaseType arch atTy))
 annotatedTerm sym fullTypeRepr baseTypeRepr selector =
   do symbol <- freshSymbol
-      -- TODO(lb): Is freshConstant correct here?
-     (annotation, expr) <-
-        liftIO $ What4.annotateTerm sym =<< What4.freshConstant sym symbol baseTypeRepr
-     addAnnotation annotation selector fullTypeRepr baseTypeRepr
+     (_, expr) <-
+       getAnnotation sym selector fullTypeRepr =<<
+         liftIO (What4.freshConstant sym symbol baseTypeRepr)
      pure expr
+
+-- | A fresh pointer with an annotated block and offset
+annotatedLLVMPtr ::
+  forall m arch sym inTy atTy argTypes w.
+  (1 <= w, Crucible.IsSymInterface sym) =>
+  sym ->
+  NatRepr w ->
+  FullTypeRepr m atTy ->
+  Selector m argTypes inTy atTy {-^ Path to this pointer -} ->
+  Setup m arch sym argTypes (LLVMMem.LLVMPtr sym w)
+annotatedLLVMPtr sym w fullTypeRepr selector =
+  do symbol <- freshSymbol
+     ptr <- liftIO . LLVMMem.llvmPointer_bv sym =<<
+         liftIO (What4.freshConstant sym symbol (What4.BaseBVRepr w))
+     annotatePointer sym selector fullTypeRepr ptr
 
 generateMinimalValue ::
   forall proxy m sym arch inTy atTy argTypes.
@@ -153,14 +170,12 @@ generateMinimalValue ::
 generateMinimalValue proxy sym fullTypeRepr selector =
   case fullTypeRepr of
     FTPtrRepr _fullTypeRepr' ->
-      do liftIO . LLVMMem.llvmPointer_bv sym =<<
-            annotatedTerm sym fullTypeRepr (CrucibleTypes.BaseBVRepr ?ptrWidth) selector
+      annotatedLLVMPtr sym ?ptrWidth fullTypeRepr selector
     -- CrucibleTypes.VectorRepr _containedTypeRepr ->
     --   -- TODO(lb): These are fixed size. What size should we generate?
     --   unin "Generating values of vector types"
     FTIntRepr w ->
-      do liftIO . LLVMMem.llvmPointer_bv sym =<<
-            annotatedTerm sym fullTypeRepr (CrucibleTypes.BaseBVRepr w) selector
+      annotatedLLVMPtr sym w fullTypeRepr selector
     FTStructRepr _ (fields :: Ctx.Assignment (FullTypeRepr m) fieldTypes) ->
       do let
            convert ::
@@ -229,13 +244,13 @@ initialize ::
   Setup m arch sym argTypes ( LLVMMem.LLVMPtr sym (ArchWidth arch)
                             , Crucible.RegEntry sym (ToCrucibleType arch ft)
                             )
-initialize context sym (FTPtrRepr ptPointedTo) selector pointer =
+initialize context sym ft@(FTPtrRepr ptPointedTo) selector pointer =
   let ftPointedTo = asFullType (context ^. moduleTypes) ptPointedTo
   in load sym ftPointedTo pointer >>=
        \case
          Just (TypedRegEntry _fullTypeRepr' regEntry) -> pure (pointer, regEntry)
          Nothing ->
-           do ptr <- malloc sym ftPointedTo pointer
+           do ptr <- malloc sym ft selector pointer
               pointedToVal <-
                 generateMinimalValue
                   (Proxy :: Proxy arch)
@@ -279,7 +294,7 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
              do let fullTypeRepr' = asFullType (context ^. moduleTypes) partTypeRepr
                 regEntry' <-
                   Crucible.RegEntry typeRepr <$>
-                    malloc sym fullTypeRepr' regValue
+                    malloc sym fullTypeRepr selector regValue
                 pretty <- showMe fullTypeRepr regEntry'
                 writeLogM ("Constrained value: " <> Text.pack (show pretty))
                 pure regEntry'

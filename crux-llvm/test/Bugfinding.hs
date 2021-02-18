@@ -132,6 +132,7 @@ tests =
     , isUnclassified "do_memset.c" "do_memset"  -- goal: isSafeWP
     , isUnclassified "do_recv.c" "do_recv"
     , isUnclassified "linked_list_sum.c" "linked_list_sum"  -- goal: isSafe
+    , isUnclassified "mutually_recursive_linked_list_sum.c" "mutually_recursive_linked_list_sum"
     , isUnclassified "oob_read_heap.c" "oob_read_heap"  -- goal: notSafe
     , isUnclassified "oob_read_stack.c" "oob_read_stack"  -- goal: notSafe
     , isUnclassified "ptr_as_array.c" "ptr_as_array"  -- goal: isSafe
