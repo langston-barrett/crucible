@@ -26,19 +26,24 @@ module Crux.LLVM.Bugfinding.Cursor
   ( Cursor(..)
   , SomeCursor
   , ppCursor
-  , dereference
-  , Selector(..)
-  , SomeSelector(..)
-  , SomeInSelector(..)
-  , selectorCursor
+
+  -- * Operations on 'Cursor'
+  , findBottom
+  , deepenPtr
+  , deepenStruct
   , TypeSeekError(..)
   , ppTypeSeekError
   , seekLlvmType
   , seekMemType
+
+  -- * 'Selector'
+  , Selector(..)
+  , SomeSelector(..)
+  , SomeInSelector(..)
+  , selectorCursor
   ) where
 
 import           Control.Lens (Lens, lens)
-import           Data.Kind (Type)
 import           Data.Semigroupoid (Semigroupoid(o))
 import           Data.Word (Word64)
 import           Data.Void (Void)
@@ -58,53 +63,64 @@ import           Lang.Crucible.LLVM.MemType (MemType, SymType)
 import qualified Lang.Crucible.LLVM.MemType as MemType
 import           Lang.Crucible.LLVM.TypeContext (TypeContext, asMemType)
 
-import           Crux.LLVM.Bugfinding.FullType (FullType(..), FullTypeRepr)
+import           Crux.LLVM.Bugfinding.FullType (FullType(..), FullTypeRepr(..))
+import           Crux.LLVM.Bugfinding.FullType.ModuleTypes (ModuleTypes)
+import           Crux.LLVM.Bugfinding.FullType.MemType (asFullType)
 
 data Cursor m (inTy :: FullType m) (atTy :: FullType m) where
   Here :: FullTypeRepr m atTy -> Cursor m atTy atTy
-  Dereference :: Cursor m inTy ('FTPtr atTy) -> Cursor m inTy atTy
+  Dereference :: Cursor m inTy atTy -> Cursor m ('FTPtr inTy) atTy
   Index ::
-    (i <= n) =>
+    (i <= n) => -- TODO should be <
     NatRepr i ->
     NatRepr n ->
-    Cursor m inTy ('FTArray n atTy) ->
-    Cursor m inTy atTy
+    Cursor m inTy atTy ->
+    Cursor m ('FTArray n inTy) atTy
   Field ::
     Ctx.Assignment (FullTypeRepr m) fields ->
-    Ctx.Index fields atTy ->
-    Cursor m inTy ('FTStruct fields) ->
-    Cursor m inTy atTy
+    Ctx.Index fields inTy ->
+    Cursor m inTy atTy ->
+    Cursor m ('FTStruct fields) atTy
 
 instance Semigroupoid (Cursor m) where
   o cursor1 cursor2 =
     case (cursor1, cursor2) of
       (Here _, _) -> cursor2
       (_, Here _) -> cursor1
-      (Dereference cursor1', _) -> Dereference (o cursor1' cursor2)
-      (Index i n cursor1', _) -> Index i n (o cursor1' cursor2)
-      (Field fields idx cursor1', _) -> Field fields idx (o cursor1' cursor2)
+      (_, Field ftReprs idx cursor3) -> Field ftReprs idx (o cursor1 cursor3)
+      (_, Index i n cursor3) -> Index i n (o cursor1 cursor3)
+      (_, Dereference cursor3) -> Dereference (o cursor1 cursor3)
 
--- | Shrink this cursor to make it apply to a smaller type
-dereference ::
-  forall (m :: Type) inTy atTy.
-  FullTypeRepr m inTy ->
-  Cursor m ('FTPtr inTy) atTy ->
-  Either ('FTPtr inTy :~: atTy) (Cursor m inTy atTy)
-dereference repr =
+findBottom :: Cursor m inTy atTy -> FullTypeRepr m atTy
+findBottom =
   \case
-    Here _ -> Left Refl
-    Dereference r ->
-      case dereference repr r of
-        Left Refl -> Right (Here repr)
-        Right r' -> Right (Dereference r')
-    Index i (n :: NatRepr n) r ->
-      case dereference repr r of
-        Right r' -> Right (Index i n r')
-        Left refl -> case refl of {}
-    Field (f :: Ctx.Assignment (FullTypeRepr m) fields) i r ->
-      case dereference repr r of
-        Right r' -> Right (Field f i r')
-        Left refl -> case refl of {}
+    Here repr -> repr
+    Dereference cursor' -> findBottom cursor'
+    Index _ _ cursor' -> findBottom cursor'
+    Field _ _ cursor' -> findBottom cursor'
+
+deepenPtr ::
+  ModuleTypes m ->
+  Cursor m inTy ('FTPtr atTy) ->
+  Cursor m inTy atTy
+deepenPtr mts =
+  \case
+    Here (FTPtrRepr ptRepr) -> Dereference (Here (asFullType mts ptRepr))
+    Dereference cursor -> Dereference (deepenPtr mts cursor)
+    Index i n cursor -> Index i n (deepenPtr mts cursor)
+    Field fields idx cursor -> Field fields idx (deepenPtr mts cursor)
+
+deepenStruct ::
+  Ctx.Index fields atTy ->
+  Cursor m inTy ('FTStruct fields) ->
+  Cursor m inTy atTy
+deepenStruct idx =
+  \case
+    Here (FTStructRepr _structInfo fields) ->
+      Field fields idx (Here (fields Ctx.! idx))
+    Dereference cursor -> Dereference (deepenStruct idx cursor)
+    Index i n cursor -> Index i n (deepenStruct idx cursor)
+    Field fields idx' cursor -> Field fields idx' (deepenStruct idx cursor)
 
 data SomeCursor = forall m inTy atTy. SomeCursor (Cursor m inTy atTy)
 

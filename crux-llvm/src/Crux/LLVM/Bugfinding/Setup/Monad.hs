@@ -247,6 +247,10 @@ annotatePointer sym selector fullTypeRepr ptr =
               pure ptr
          Nothing ->
            do (annotation, ptr') <- liftIO (LLVMPtr.annotatePointerBlock sym ptr)
+              liftIO $ putStrLn "Annotated block!"
+              case What4.getAnnotation sym (LLVMPtr.llvmPointerBlock ptr') of
+                Just ann -> liftIO $ putStrLn "Block was annotated!"
+                Nothing -> liftIO $ putStrLn "Block was not annotated!"
               addAnnotation (Some annotation) selector fullTypeRepr
               pure ptr'
      let offset = LLVMPtr.llvmPointerOffset ptr'
@@ -259,6 +263,7 @@ annotatePointer sym selector fullTypeRepr ptr =
            do (annotation, ptr'') <- liftIO (LLVMPtr.annotatePointerOffset sym ptr)
               addAnnotation (Some annotation) selector fullTypeRepr
               pure ptr''
+     liftIO $ putStrLn ("Annotated pointer block: " ++ show (What4.printSymExpr (LLVMPtr.llvmPointerBlock ptr'')))
      liftIO $ putStrLn ("Annotated pointer: " ++ show (LLVMPtr.ppPtr ptr''))
      pure ptr''
 

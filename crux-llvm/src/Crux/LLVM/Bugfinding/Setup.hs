@@ -25,8 +25,8 @@ module Crux.LLVM.Bugfinding.Setup
   , SetupResult(SetupResult)
   ) where
 
-import           Control.Lens (to, (^.), (%~))
-import           Control.Monad (void, unless)
+import           Control.Lens (to, (^.), (%~), (.~))
+import           Control.Monad (unless)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           Data.Function ((&))
 import           Data.Functor.Const (Const(Const, getConst))
@@ -50,7 +50,6 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
 import qualified Lang.Crucible.LLVM.Globals as LLVMGlobals
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
-import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 
 
 import           Crux.LLVM.Overrides (ArchOk)
@@ -128,8 +127,7 @@ logRegMap context sym mem (Crucible.RegMap regmap) =
                   ])
     (context ^. argumentStorageTypes)
 
-
-annotatedTerm ::
+_annotatedTerm ::
   forall m arch sym inTy atTy argTypes.
   (Crucible.IsSymInterface sym) =>
   sym ->
@@ -137,7 +135,7 @@ annotatedTerm ::
   CrucibleTypes.BaseTypeRepr (ToBaseType arch atTy) ->
   Selector m argTypes inTy atTy {-^ Path to this value -} ->
   Setup m arch sym argTypes (What4.SymExpr sym (ToBaseType arch atTy))
-annotatedTerm sym fullTypeRepr baseTypeRepr selector =
+_annotatedTerm sym fullTypeRepr baseTypeRepr selector =
   do symbol <- freshSymbol
      (_, expr) <-
        getAnnotation sym selector fullTypeRepr =<<
@@ -185,8 +183,11 @@ generateMinimalValue proxy sym fullTypeRepr selector =
              Setup m arch sym argTypes (Crucible.RegValue' sym (ToCrucibleType arch ft))
            convert idx ftRepr =
              Crucible.RV <$>
-              generateMinimalValue proxy sym ftRepr
-                (selector & selectorCursor %~ \cursor -> Field fields idx cursor)
+               generateMinimalValue
+                 proxy
+                 sym
+                 ftRepr
+                 (selector & selectorCursor %~ deepenStruct idx)
          FTCT.SomeAssign' _ Refl fieldVals <-
            FTCT.assignmentToCrucibleTypeA proxy convert fields
          pure fieldVals
@@ -256,7 +257,7 @@ initialize context sym ft@(FTPtrRepr ptPointedTo) selector pointer =
                   (Proxy :: Proxy arch)
                   sym
                   ftPointedTo
-                  (selector & selectorCursor %~ \cursor -> Dereference cursor)
+                  (selector & selectorCursor %~ deepenPtr (context ^. moduleTypes))
               let tp = toCrucibleType (Proxy :: Proxy arch) ftPointedTo
               ptr' <-
                 store sym ftPointedTo (Crucible.RegEntry tp pointedToVal) ptr
@@ -289,15 +290,12 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
               liftIO $ ppRegValue (Proxy :: Proxy arch) sym mem storableTy regEnt
      case constraint of
        Allocated ->
-         case fullTypeRepr of
-           FTPtrRepr partTypeRepr ->
-             do let fullTypeRepr' = asFullType (context ^. moduleTypes) partTypeRepr
-                regEntry' <-
-                  Crucible.RegEntry typeRepr <$>
-                    malloc sym fullTypeRepr selector regValue
-                pretty <- showMe fullTypeRepr regEntry'
-                writeLogM ("Constrained value: " <> Text.pack (show pretty))
-                pure regEntry'
+         do regEntry' <-
+              Crucible.RegEntry typeRepr <$>
+                malloc sym fullTypeRepr selector regValue
+            pretty <- showMe fullTypeRepr regEntry'
+            writeLogM ("Constrained value: " <> Text.pack (show pretty))
+            pure regEntry'
        Aligned alignment ->
          case typeRepr of
            LLVMMem.PtrRepr ->
@@ -321,6 +319,7 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
                 pure regEntry'
        _ -> unimplemented "constrainHere" ("Constraint:" ++ show (ppConstraint constraint))
 
+
 constrainValue ::
   forall m arch sym argTypes inTy atTy atTy'.
   ( Crucible.IsSymInterface sym
@@ -341,33 +340,44 @@ constrainValue context sym constraint cursor selector ftRepr regEntry@(Crucible.
       case testEquality ftRepr ftRepr' of
         Nothing -> panic "constrainValue" ["Mismatched type representatives"]
         Just _ -> constrainHere context sym selector constraint ftRepr regEntry
-    Dereference _ ->
+    Dereference cursor' ->
       case ftRepr of
-        -- TODO
         FTPtrRepr (asFullType (context ^. moduleTypes) -> pointedToRepr) ->
           do -- If there's already a value behind this pointer, constrain that.
              -- Otherwise, allocate new memory, put a fresh value there, and constrain
              -- that.
              (ptr, pointedToValue) <-
                initialize context sym ftRepr selector regValue
-             case dereference pointedToRepr cursor of
-               -- This case is technically unreachable because we matched on
-               -- Here above, but... it typechecks and makes GHC happy.
-               Left Refl -> constrainHere context sym selector constraint ftRepr regEntry
-               Right cursor' ->
-                 do regEntry' <-
-                      constrainValue
-                       context
-                       sym
-                       constraint
-                       cursor'
-                       (selector & selectorCursor %~ Dereference)
-                       pointedToRepr
-                       pointedToValue
-                    ptr' <- store sym pointedToRepr regEntry' ptr
-                    pure $ Crucible.RegEntry typeRepr ptr'
-        _ -> throwError (SetupBadConstraintSelector (SomeSelector selector) (toMemType ftRepr) (Some constraint))
-    _ -> unimplemented "constrainValue" "Non-top-level cursors"
+             regEntry' <-
+               constrainValue
+                context
+                sym
+                constraint
+                cursor'
+                (selector & selectorCursor %~ deepenPtr (context ^. moduleTypes))
+                pointedToRepr
+                pointedToValue
+             ptr' <- store sym pointedToRepr regEntry' ptr
+             pure $ Crucible.RegEntry typeRepr ptr'
+    Field fieldReprs idx cursor' ->
+      case (ftRepr, typeRepr) of
+        (FTStructRepr _structInfo fieldTypeReprs, CrucibleTypes.StructRepr fieldTypes) ->
+          case translateIndex (Proxy :: Proxy arch) (Ctx.size fieldTypeReprs) idx of
+            SomeIndex idx' Refl ->
+              do Crucible.RegEntry _ constrainedField <-
+                   constrainValue
+                     context
+                     sym
+                     constraint
+                     cursor'
+                     (selector & selectorCursor %~ deepenStruct idx)
+                     (fieldReprs Ctx.! idx)
+                     (Crucible.RegEntry
+                       (fieldTypes ^. ixF' idx')
+                       (regValue ^. ixF' idx' . to Crucible.unRV))
+                 pure $ Crucible.RegEntry typeRepr (regValue & ixF' idx' .~ Crucible.RV constrainedField)
+    Index _ _ _ -> unimplemented "constrainValue" "Index cursors"
+
 
 constrainOneArgument ::
   forall m arch sym argTypes inTy.
