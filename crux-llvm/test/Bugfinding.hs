@@ -255,6 +255,11 @@ tests =
     , isUnimplemented "call_function_pointer.c" "call_function_pointer"  -- goal: ???
     , isUnimplemented "nested_structs.c" "nested_structs"
 
+    -- SQLite
+    -- This is slow
+    , isSafeWithPreconditions "sqlite-3.32.1/sqlite3.c" "appendText" False
+    , hasBugs "sqlite-3.32.1/sqlite3.c" "sqlite3_filename_database"
+
     -- TODO: Fix upstream?
     -- "error: in do_memcpy_const_size\nError during memory load"
     , isUnannotated "do_memcpy_const_size.c" "do_memcpy_const_size"  -- goal: isSafeWP
