@@ -51,7 +51,6 @@ import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Text (Text)
 import qualified Data.Text.IO as TextIO
-import           Data.Type.Equality ((:~:)(Refl))
 import           Control.Monad.Except (throwError, ExceptT, MonadError, runExceptT)
 import           Control.Monad.Reader (MonadReader, ask)
 import           Control.Monad.State.Strict (MonadState, gets)
@@ -67,7 +66,6 @@ import qualified What4.Interface as What4
 
 import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
-import qualified Lang.Crucible.Types as CrucibleTypes
 
 import           Lang.Crucible.LLVM.Extension (ArchWidth)
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
@@ -75,7 +73,7 @@ import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 import qualified Lang.Crucible.LLVM.Translation as LLVMTrans
 
 import           Crux.LLVM.Bugfinding.Context
-import           Crux.LLVM.Bugfinding.Constraints (Constraint, ppConstraint)
+import           Crux.LLVM.Bugfinding.Constraints (Constraint)
 import           Crux.LLVM.Bugfinding.Setup.LocalMem (LocalMem, makeLocalMem, globalMem)
 import qualified Crux.LLVM.Bugfinding.Setup.LocalMem as LocalMem
 import           Crux.LLVM.Bugfinding.FullType.Type (FullType(FTPtr), FullTypeRepr, ToCrucibleType, ToBaseType)
@@ -83,7 +81,7 @@ import           Crux.LLVM.Bugfinding.FullType.MemType (toMemType)
 
 -- TODO unsorted
 import           Crux.LLVM.Overrides (ArchOk)
-import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, Cursor, seekMemType, SomeSelector(..), SomeInSelector(..))
+import           Crux.LLVM.Bugfinding.Cursor (ppTypeSeekError, TypeSeekError, Selector, SomeInSelector(..))
 import Lang.Crucible.LLVM.MemType (SymType, MemType)
 import Lang.Crucible.LLVM.TypeContext (TypeContext(llvmDataLayout))
 import qualified Prettyprinter as PP
@@ -96,7 +94,6 @@ data TypedSelector m arch argTypes ft =
 data SetupError m arch argTypes
   = SetupTypeSeekError (TypeSeekError SymType)
   | SetupTypeTranslationError MemType
-  | SetupBadConstraintSelector (SomeSelector m argTypes) MemType (Some (Constraint m))
 
 ppSetupError :: SetupError m arch argTypes -> Doc Void
 ppSetupError =
@@ -104,14 +101,6 @@ ppSetupError =
     SetupTypeSeekError typeSeekError -> ppTypeSeekError typeSeekError
     SetupTypeTranslationError memType ->
       PP.pretty ("Couldn't translate MemType" :: Text) <> PP.viaShow memType
-    SetupBadConstraintSelector _selector memType (Some constraint) ->
-      PP.nest 2 $
-        PP.vsep
-          -- TODO print selector too
-          [ PP.pretty ("Can't apply this constraint at this selector" :: Text)
-          , "Type: " <> PP.viaShow memType
-          , "Constraint: " <> ppConstraint constraint
-          ]
 
 data SetupAssumption m sym
   = SetupAssumption
@@ -239,7 +228,6 @@ annotatePointer ::
   Setup m arch sym argTypes (LLVMMem.LLVMPtr sym w)
 annotatePointer sym selector fullTypeRepr ptr =
   do let block = LLVMPtr.llvmPointerBlock ptr
-     liftIO $ putStrLn ("Annotating pointer: " ++ show (LLVMPtr.ppPtr ptr))
      ptr' <-
        case What4.getAnnotation sym block of
          Just annotation ->
@@ -247,10 +235,6 @@ annotatePointer sym selector fullTypeRepr ptr =
               pure ptr
          Nothing ->
            do (annotation, ptr') <- liftIO (LLVMPtr.annotatePointerBlock sym ptr)
-              liftIO $ putStrLn "Annotated block!"
-              case What4.getAnnotation sym (LLVMPtr.llvmPointerBlock ptr') of
-                Just ann -> liftIO $ putStrLn "Block was annotated!"
-                Nothing -> liftIO $ putStrLn "Block was not annotated!"
               addAnnotation (Some annotation) selector fullTypeRepr
               pure ptr'
      let offset = LLVMPtr.llvmPointerOffset ptr'
@@ -263,8 +247,6 @@ annotatePointer sym selector fullTypeRepr ptr =
            do (annotation, ptr'') <- liftIO (LLVMPtr.annotatePointerOffset sym ptr)
               addAnnotation (Some annotation) selector fullTypeRepr
               pure ptr''
-     liftIO $ putStrLn ("Annotated pointer block: " ++ show (What4.printSymExpr (LLVMPtr.llvmPointerBlock ptr'')))
-     liftIO $ putStrLn ("Annotated pointer: " ++ show (LLVMPtr.ppPtr ptr''))
      pure ptr''
 
 storableType :: ArchOk arch => MemType -> Setup m arch sym argTypes LLVMMem.StorageType

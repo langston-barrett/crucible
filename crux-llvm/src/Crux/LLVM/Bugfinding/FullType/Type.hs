@@ -138,12 +138,12 @@ data PartTypeRepr m (ft :: FullType m) where
   PTAliasRepr :: Const L.Ident ft -> PartTypeRepr m ft
 
 
-data IsPtrRepr m ft = forall ft'. IsPtrRepr (ft :~: FTPtr ft')
+data IsPtrRepr m ft = forall ft'. IsPtrRepr (ft :~: 'FTPtr ft')
 
 isPtrRepr :: forall m ft. FullTypeRepr m ft -> Maybe (IsPtrRepr m ft)
 isPtrRepr =
   \case
-    FTPtrRepr (rep :: PartTypeRepr m ft') -> Just (IsPtrRepr Refl)
+    FTPtrRepr _ -> Just (IsPtrRepr Refl)
     _ -> Nothing
 
 -- data IntConstraint = IntConstraint

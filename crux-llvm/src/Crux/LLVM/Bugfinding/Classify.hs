@@ -21,11 +21,13 @@ module Crux.LLVM.Bugfinding.Classify
   , partitionExplanations
   , TruePositive(..)
   , ppTruePositive
-  , ppExplanation
-  , classify
+  , Uncertainty(..)
+  , partitionUncertainty
+  , ppUncertainty
+  , classifyAssertion
+  , classifyBadBehavior
   ) where
 
-import           Control.Applicative ((<|>))
 import           Control.Lens (to, (^.))
 import           Control.Monad.IO.Class (MonadIO)
 import           Data.Functor.Const (Const(getConst))
@@ -39,6 +41,7 @@ import           Data.Type.Equality ((:~:)(Refl))
 import           Data.Void (Void)
 
 import           Prettyprinter (Doc)
+import qualified Prettyprinter as PP
 
 import           Lumberjack (writeLogM, HasLog)
 
@@ -49,6 +52,7 @@ import           Data.Parameterized.TraversableFC (foldMapFC)
 
 import qualified What4.Interface as What4
 import qualified What4.Expr.Builder as What4
+import qualified What4.ProgramLoc as What4
 
 import qualified Lang.Crucible.Backend as Crucible
 import qualified Lang.Crucible.Simulator as Crucible
@@ -67,37 +71,77 @@ import           Crux.LLVM.Bugfinding.Setup.Monad (TypedSelector(..))
 import           Crux.LLVM.Bugfinding.Errors.Panic (panic)
 
 data TruePositive
-  -- TODO which
-  = UninitializedStackVariable
+  = ConcretelyFailingAssert !What4.ProgramLoc
+
+-- | Possible sources of uncertainty, these might be true or false positives
+data Uncertainty
+  = UUnclassified (Doc Void)
+  -- ^ We don't (yet) know what to do about this error
+  | UMissingAnnotation Crucible.SimError
+  -- ^ This @Pred@ was not annotated
+  | UFailedAssert !What4.ProgramLoc
+  -- ^ A user assertion failed, but symbolically
+
+partitionUncertainty ::
+  [Uncertainty] -> ([Doc Void], [Crucible.SimError], [What4.ProgramLoc])
+partitionUncertainty = go [] [] []
+  where go us ms fs =
+          \case
+            [] -> (us, ms, fs)
+            (UUnclassified doc:rest) ->
+              let (us', ms', fs') = go us ms fs rest
+              in (doc:us', ms', fs')
+            (UMissingAnnotation err:rest) ->
+              let (us', ms', fs') = go us ms fs rest
+              in (us', err:ms', fs')
+            (UFailedAssert loc:rest) ->
+              let (us', ms', fs') = go us ms fs rest
+              in (us', ms', loc:fs')
+
 
 -- | An error is either a true positive, a false positive due to some missing
 -- preconditions, or unknown.
 data Explanation m arch types
   = ExTruePositive TruePositive
   | ExMissingPreconditions (Constraints m arch types)
-  | ExUnclassified (Doc Void)
-  -- ^ We don't (yet) know what to do about this error
+  | ExUncertain Uncertainty
+  | ExExhaustedBounds !String
+  -- ^ Hit recursion/loop bounds
 
 partitionExplanations ::
-  [Explanation m arch types] -> ([TruePositive], [Constraints m arch types], [Doc Void])
-partitionExplanations = go [] [] []
-  where go ts cs ds =
+  [Explanation m arch types] ->
+  ([TruePositive], [Constraints m arch types], [Uncertainty], [String])
+partitionExplanations = go [] [] [] []
+  where go ts cs ds es =
           \case
-            [] -> (ts, cs, ds)
+            [] -> (ts, cs, ds, es)
             (ExTruePositive t:xs) ->
-              let (ts', cs', ds') = go ts cs ds xs
-              in (t:ts', cs', ds')
+              let (ts', cs', ds', es') = go ts cs ds es xs
+              in (t:ts', cs', ds', es')
             (ExMissingPreconditions c:xs) ->
-              let (ts', cs', ds') = go ts cs ds xs
-              in (ts', c:cs', ds')
-            (ExUnclassified d:xs) ->
-              let (ts', cs', ds') = go ts cs ds xs
-              in (ts', cs', d:ds')
+              let (ts', cs', ds', es') = go ts cs ds es xs
+              in (ts', c:cs', ds', es')
+            (ExUncertain d:xs) ->
+              let (ts', cs', ds', es') = go ts cs ds es xs
+              in (ts', cs', d:ds', es')
+            (ExExhaustedBounds e:xs) ->
+              let (ts', cs', ds', es') = go ts cs ds es xs
+              in (ts', cs', ds', e:es')
 
 ppTruePositive :: TruePositive -> Text
 ppTruePositive =
   \case
-    UninitializedStackVariable -> "Uninitialized stack variable"
+    ConcretelyFailingAssert loc ->
+      "Concretely failing call to assert() at " <> Text.pack (show loc)
+
+ppUncertainty :: Uncertainty -> Text
+ppUncertainty =
+  \case
+    UUnclassified doc -> "Unclassified error:\n" <> Text.pack (show doc)
+    UMissingAnnotation err ->
+      "(Internal issue) Missing annotation for error:\n" <> Text.pack (show err)
+    UFailedAssert loc ->
+      "Symbolically failing user assertion at " <> Text.pack (show loc)
 
 ppExplanation :: Explanation m arch types -> Text
 ppExplanation =
@@ -105,7 +149,8 @@ ppExplanation =
     ExTruePositive truePositive -> ppTruePositive truePositive
     ExMissingPreconditions constraints ->
       "Missing preconditions:" <> Text.pack (show (ppConstraints constraints))
-    ExUnclassified doc -> "Unclassified/unknown error:\n" <> Text.pack (show doc)
+    ExExhaustedBounds str -> "Hit loop/recursion bounds:\n" <> Text.pack str
+    ExUncertain uncertain -> ppUncertainty uncertain
 
 summarizeOp :: LLVMErrors.MemoryOp sym w -> (Maybe String, LLVMPtr.LLVMPtr sym w)
 summarizeOp =
@@ -117,11 +162,22 @@ summarizeOp =
     LLVMErrors.MemLoadHandleOp _llvmType expl ptr _mem -> (expl, ptr)
     LLVMErrors.MemInvalidateOp _whatIsThisParam expl ptr _size _mem -> (expl, ptr)
 
+classifyAssertion ::
+  What4.IsExpr (What4.SymExpr sym) =>
+  sym ->
+  What4.Pred sym ->
+  What4.ProgramLoc ->
+  Explanation m arch argTypes
+classifyAssertion sym pred loc =
+  case What4.asConstantPred pred of
+    Just True -> panic "classifyAssertionFailure" ["Concretely true assertion failure??"]
+    Just False -> ExTruePositive (ConcretelyFailingAssert loc)
+    Nothing -> ExUncertain (UFailedAssert loc)
 
 -- | Take an error that occurred during symbolic execution, classify it as a
 -- true or false positive. If it is a false positive, deduce further
 -- preconditions.
-classify ::
+classifyBadBehavior ::
   forall f m sym arch argTypes t st fs.
   ( Crucible.IsSymInterface sym
   , sym ~ What4.ExprBuilder t st fs  -- needed for asApp
@@ -136,7 +192,7 @@ classify ::
     {-^ Term annotations (origins) -} ->
   LLVMErrors.BadBehavior sym {-^ Data about the error that occurred -} ->
   f (Explanation m arch argTypes)
-classify context sym (Crucible.RegMap _args) annotations badBehavior =
+classifyBadBehavior context sym (Crucible.RegMap _args) annotations badBehavior =
   writeLogM ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior))) >>
   let
     getPtrOffsetAnn ::
@@ -155,18 +211,22 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
       LLVMPtr.LLVMPtr sym w ->
       [Some (TypedSelector m arch argTypes)]
     getAnyPtrOffsetAnn ptr =
-      case What4.asApp (LLVMPtr.llvmPointerOffset ptr) of
-        Nothing -> []
-        Just app ->
-          foldMapFC
-            (\expr -> maybeToList (flip Map.lookup annotations . Some =<<
-                                     What4.getAnnotation sym expr))
-            app
+      let subAnns =
+            case What4.asApp (LLVMPtr.llvmPointerOffset ptr) of
+              Nothing -> []
+              Just app ->
+                foldMapFC
+                  (\expr -> maybeToList (flip Map.lookup annotations . Some =<<
+                                          What4.getAnnotation sym expr))
+                  app
+      in case getPtrOffsetAnn ptr of
+           Just ann -> ann:subAnns
+           Nothing -> subAnns
     argName :: Ctx.Index argTypes tp -> String
     argName idx = context ^. argumentNames . ixF' idx . to getConst . to (maybe "<top>" Text.unpack)
     unclass =
       do writeLogM ("Couldn't classify error." :: Text)
-         pure $ ExUnclassified (ppBB badBehavior)
+         pure $ ExUncertain (UUnclassified  (ppBB badBehavior))
   in
     case badBehavior of
       LLVMErrors.BBUndefinedBehavior
@@ -277,9 +337,9 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
         (LLVMErrors.MemoryError
           _op
           (LLVMErrors.NoSatisfyingWrite _storageType ptr)) ->
-            case (getPtrBlockAnn ptr, getAnyPtrOffsetAnn ptr) of
+            case (getPtrBlockAnn ptr, getPtrOffsetAnn ptr, getAnyPtrOffsetAnn ptr) of
               (Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor))))
-                , _) ->
+                , _, _) ->
                 do writeLogM $
                      Text.unwords
                        [ "Diagnosis: Read from an uninitialized pointer in argument"
@@ -307,7 +367,7 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                                  (context ^. argumentFullTypes . ixF' idx)
                                  cursor
                                  Initialized)))
-              (Nothing, [Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))]) ->
+              (Nothing, _, [Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))]) ->
                 do writeLogM $
                      Text.unwords
                        [ "Diagnosis: Read from an uninitialized pointer calculated"
@@ -336,5 +396,6 @@ classify context sym (Crucible.RegMap _args) annotations badBehavior =
                                  (context ^. argumentFullTypes . ixF' idx)
                                  cursor
                                  Initialized)))
+              (Nothing, Just _, _) -> error "HERE"
               _ -> unclass
       _ -> unclass

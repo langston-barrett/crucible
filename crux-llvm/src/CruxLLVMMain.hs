@@ -3,6 +3,7 @@ module CruxLLVMMain
   ( mainWithOutputTo, mainWithOutputConfig, defaultOutputConfig, processLLVMOptions )
   where
 
+import Control.Applicative ((<|>))
 import System.Exit
   ( ExitCode )
 import System.IO
@@ -29,8 +30,14 @@ mainWithOutputTo h = mainWithOutputConfig (OutputConfig False h h False)
 
 mainWithOutputConfig :: OutputConfig -> IO ExitCode
 mainWithOutputConfig outCfg =
-  Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \initOpts ->
-    do (cruxOpts, llvmOpts) <- processLLVMOptions initOpts
+  Crux.loadOptions outCfg "crux-llvm" "0.1" llvmCruxConfig $ \(initCOpts, initLOpts) ->
+    do (cruxOpts, llvmOpts) <-
+         processLLVMOptions
+           ( initCOpts { Crux.loopBound = Crux.loopBound initCOpts <|> Just 8
+                       , Crux.recursionBound = Crux.recursionBound initCOpts <|> Just 8
+                       }
+           , initLOpts
+           )
        genBitCode cruxOpts llvmOpts
        if bugfindingMode cruxOpts
          then

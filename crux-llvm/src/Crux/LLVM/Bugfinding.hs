@@ -13,42 +13,36 @@
 module Crux.LLVM.Bugfinding
   ( bugfindingMain
   , translateAndLoop
-  , BugfindingResult(..)
-  , SomeBugfindingResult(..)
-  , FunctionSummary(..)
-  , printFunctionSummary
+  , Result.SomeBugfindingResult(..)
+  , Result.FunctionSummary(..)
+  , Result.printFunctionSummary
   ) where
 
-import System.Exit
-  ( ExitCode(..) )
-
-import Data.String (fromString)
-import Data.Foldable (for_)
-import qualified Data.Map.Strict as Map
-import Data.IORef
-import Control.Lens ((^.), view)
-import Control.Monad (void, when)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import Data.Text (Text)
-import qualified Data.Text.IO as TextIO
+import           Control.Lens ((^.), view, to)
+import           Control.Monad (void, when)
+import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Data.Foldable (for_)
+import           Data.IORef
+import           Data.List (isInfixOf)
+import           Data.List.NonEmpty (NonEmpty((:|)))
+import           Data.String (fromString)
+import           Data.Text (Text)
 import           Data.Type.Equality ((:~:)(Refl))
+import qualified Data.Map.Strict as Map
+import qualified Data.Text.IO as TextIO
+import           System.Exit (ExitCode(..))
+import           System.FilePath( (</>) )
 
-import System.FilePath( (</>) )
-
-import Data.Parameterized.Some (Some(..))
+import           Data.Parameterized.Some (Some(..))
 import qualified Data.Parameterized.Context as Ctx
 
 import Lumberjack as LJ
 
 -- crucible
-import Lang.Crucible.CFG.Core (CFG, AnyCFG(..), cfgArgTypes)
-import Lang.Crucible.FunctionHandle (HandleAllocator, newHandleAllocator)
-import Lang.Crucible.Simulator
-  ( runOverrideSim, callCFG
-  , ExecState( InitialState )
-  , defaultAbortHandler, printHandle
-  )
+import qualified Lang.Crucible.CFG.Core as Crucible
+import qualified Lang.Crucible.FunctionHandle as Crucible
 import qualified Lang.Crucible.Backend as Crucible
+import qualified Lang.Crucible.Simulator as Crucible
 import qualified Lang.Crucible.Types as CrucibleTypes
 
 
@@ -77,20 +71,21 @@ import Crux.LLVM.Config
 import Crux.LLVM.Overrides
 import Crux.LLVM.Simulate (parseLLVM, setupSimCtxt, registerFunctions)
 
-import Crux.LLVM.Bugfinding.Classify (partitionExplanations, TruePositive, classify, Explanation(..), ppTruePositive)
+import Crux.LLVM.Bugfinding.Classify (partitionExplanations, classifyAssertion, classifyBadBehavior, Explanation(..), ppTruePositive, Uncertainty(..))
 import Crux.LLVM.Bugfinding.Constraints (isEmpty, ppConstraints, emptyConstraints, Constraints(..))
 import Crux.LLVM.Bugfinding.Context
 import Crux.LLVM.Bugfinding.Errors.Panic (panic)
 import Crux.LLVM.Bugfinding.FullType (MapToCrucibleType)
 import Crux.LLVM.Bugfinding.Setup (logRegMap, setupExecution, SetupResult(SetupResult), SetupAssumption(SetupAssumption))
 import Crux.LLVM.Bugfinding.Setup.Monad (ppSetupError)
+import           Crux.LLVM.Bugfinding.Result (BugfindingResult(..), SomeBugfindingResult(..))
+import qualified Crux.LLVM.Bugfinding.Result as Result
 
 -- TODO unsorted
 import qualified What4.Interface as What4
 import qualified Data.Text as Text
 import qualified What4.ProgramLoc as What4
 import qualified What4.FunctionName as What4
-import Data.List.NonEmpty (NonEmpty((:|)))
 import Prettyprinter (Doc)
 import Data.Void (Void)
 import Data.Semigroup (Semigroup(sconcat))
@@ -105,7 +100,7 @@ instance HasIOLog m => LJ.HasLog Text m where
 
 findFun ::
   (ArchOk arch, Logs) =>
-  String -> ModuleCFGMap arch -> IO (AnyCFG (LLVM arch))
+  String -> ModuleCFGMap arch -> IO (Crucible.AnyCFG (LLVM arch))
 findFun nm mp =
   case Map.lookup (fromString nm) mp of
     Just (_, anyCfg) -> pure anyCfg
@@ -113,11 +108,11 @@ findFun nm mp =
 
 simulateLLVM ::
   ArchOk arch =>
-  HandleAllocator ->
+  Crucible.HandleAllocator ->
   Context m arch argTypes ->
   IORef [Explanation m arch argTypes] ->
   Constraints m arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
+  Crucible.CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   MemOptions ->
   Crux.SimulatorCallback
 simulateLLVM halloc context explRef preconds cfg memOptions =
@@ -129,7 +124,7 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
        let ?lc = llvmCtxt^.llvmTypeCtx
        let ?recordLLVMAnnotation = \an bb -> modifyIORef bbMapRef (Map.insert an bb)
        let simctx = (setupSimCtxt halloc sym memOptions llvmCtxt)
-                      { printHandle = view outputHandle ?outputConfig }
+                      { Crucible.printHandle = view outputHandle ?outputConfig }
 
        setupResult <-
          liftIO $ setupExecution sym context preconds
@@ -155,13 +150,13 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
 
        let globSt = llvmGlobals llvmCtxt mem
        let initSt =
-             InitialState simctx globSt defaultAbortHandler CrucibleTypes.UnitRepr $
-               runOverrideSim CrucibleTypes.UnitRepr $
+             Crucible.InitialState simctx globSt Crucible.defaultAbortHandler CrucibleTypes.UnitRepr $
+               Crucible.runOverrideSim CrucibleTypes.UnitRepr $
                  do -- TODO(lb): Do this lazily
                     registerFunctions (context ^. llvmModule) trans
                     liftIO $ writeLogM ("Running " <> context ^. functionName <> " on arguments..." :: Text)
                     liftIO $ logRegMap context sym mem args
-                    void $ callCFG cfg args
+                    void $ Crucible.callCFG cfg args
 
        -- Diagnose errors and write back the results so they can be read in the
        -- outer loop
@@ -169,14 +164,29 @@ simulateLLVM halloc context explRef preconds cfg memOptions =
              do bb <- readIORef bbMapRef
                 case flip Map.lookup bb . BoolAnn =<<
                        What4.getAnnotation sym (gl ^. Crucible.labeledPred) of
-                  Nothing -> pure ()
-                    -- TODO(lb)
-                    -- panic "simulateLLVM" ["Unexplained error!"]
+                  Nothing ->
+                    case What4.getAnnotation sym (gl ^. Crucible.labeledPred) of
+                      Just ann ->
+                        panic "simulateLLVM" ["Unexplained error: no error for annotation."]
+                      Nothing ->
+                        modifyIORef explRef . (:) $
+                          case gl ^. Crucible.labeledPredMsg . to Crucible.simErrorReason of
+                            Crucible.ResourceExhausted msg ->
+                              ExExhaustedBounds msg
+                            Crucible.AssertFailureSimError msg _ ->
+                              if "Call to assert" `isInfixOf` msg  -- HACK
+                              then
+                                classifyAssertion
+                                  sym
+                                  (gl ^. Crucible.labeledPred)
+                                  (gl ^. Crucible.labeledPredMsg . to Crucible.simErrorLoc)
+                              else ExUncertain (UMissingAnnotation  (gl ^. Crucible.labeledPredMsg))
+                            _ -> ExUncertain (UMissingAnnotation (gl ^. Crucible.labeledPredMsg))
                   Just badBehavior ->
                     do -- Helpful for debugging:
                        -- putStrLn "~~~~~~~~~~~"
                        -- putStrLn (show (ppBB badBehavior))
-                       classify context sym args argAnnotations badBehavior >>=
+                       classifyBadBehavior context sym args argAnnotations badBehavior >>=
                          modifyIORef explRef . (:)
                 return mempty
 
@@ -187,9 +197,9 @@ runSimulator ::
   , ArchOk arch
   ) =>
   Context m arch argTypes ->
-  HandleAllocator ->
+  Crucible.HandleAllocator ->
   Constraints m arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
+  Crucible.CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   MemOptions ->
   IO [Explanation m arch argTypes]
@@ -209,47 +219,16 @@ runSimulator context halloc preconditions cfg cruxOpts memOptions =
 
 -- | The outer loop of bugfinding mode
 
-data FunctionSummary m arch argTypes
-  = FoundBugs (NonEmpty TruePositive)
-  | SafeWithPreconditions (Constraints m arch argTypes)
-  | AlwaysSafe -- TODO(lb): This isn't really true until we "deepen" arguments
-
-data SomeBugfindingResult =
-  forall m arch argTypes. SomeBugfindingResult (BugfindingResult m arch argTypes)
-
-data BugfindingResult m arch argTypes
-  = BugfindingResult
-      { unclassifiedErrors :: [Doc Void]
-      , summary :: FunctionSummary m arch argTypes
-      }
-
-printFunctionSummary :: FunctionSummary m arch argTypes -> Text
-printFunctionSummary =
-  \case
-    FoundBugs bugs ->
-      "There might be bugs in this function"
-      <> foldMap ppTruePositive bugs
-    SafeWithPreconditions preconditions ->
-      "This function is safe assuming the following preconditions are met:\n"
-      <> Text.pack (show (ppConstraints preconditions))
-    AlwaysSafe -> "This function is always safe."
-
-makeFunctionSummary :: Constraints m arch argTypes -> [TruePositive] -> FunctionSummary m arch argTypes
-makeFunctionSummary preconditions truePositives =
-  case (isEmpty preconditions, truePositives) of
-    (True, []) -> AlwaysSafe
-    (False, []) -> SafeWithPreconditions preconditions
-    (_, t:ts) -> FoundBugs (t :| ts)
 
 bugfindingLoop ::
   ( ?outputConfig ::  OutputConfig
   , ArchOk arch
   ) =>
   Context m arch argTypes ->
-  CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
+  Crucible.CFG (LLVM arch) blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   MemOptions ->
-  HandleAllocator ->
+  Crucible.HandleAllocator ->
   IO (BugfindingResult m arch argTypes)
 bugfindingLoop context cfg cruxOpts memOptions halloc =
   do let emptyCs = emptyConstraints (Ctx.size (context ^. argumentFullTypes))
@@ -257,37 +236,41 @@ bugfindingLoop context cfg cruxOpts memOptions halloc =
            runSimulator context halloc preconds cfg cruxOpts memOptions
 
      -- Loop, learning preconditions and reporting errors
-     let loop truePositives preconditions unclassified =
-           do (newTruePositives, newConstraints0, newUnclassified) <-
+     let loop truePositives preconditions uncertain resourceExhausted =
+           do -- TODO(lb) We basically ignore symbolic assertion failures. Maybe
+              -- configurably don't?
+              (newTruePositives, newConstraints0, newUncertain, newResourceExhausted) <-
                 partitionExplanations <$> runSim preconditions
               let newConstraints = sconcat (emptyCs :| newConstraints0)
               let allTruePositives = truePositives <> newTruePositives
               let allPreconditions = preconditions <> newConstraints
-              let allUnclassified = unclassified <> newUnclassified
+              let allUncertain = uncertain <> newUncertain
+              let allResourceExhausted = resourceExhausted <> newResourceExhausted
               let result =
                     BugfindingResult
-                      allUnclassified
-                      (makeFunctionSummary allPreconditions allTruePositives)
-              case (isEmpty newConstraints, newTruePositives, newUnclassified) of
-                (True, [], []) ->
-                  do say "Crux" "No errors!"
-                     -- TODO(lb): Increase depth till max
-                     pure result
-                (isEmpty_, _, _) ->
+                      allUncertain
+                      (Result.makeFunctionSummary
+                         allPreconditions
+                         allUncertain
+                         allTruePositives
+                         (not (null allResourceExhausted)))
+              case (isEmpty newConstraints, newTruePositives, not (null newUncertain), not (null newResourceExhausted)) of
+                (True, [], False, _) -> pure result
+                (noNewConstraints, _, isUncertain, isExhausted) ->
                   do for_ newTruePositives
                           (\pos ->
                              do say "Crux" "TRUE (?) POSITIVE!"
                                 say "Crux" (Text.unpack (ppTruePositive pos)))
-                     if isEmpty_
-                     then pure result
+                     if noNewConstraints || isUncertain || isExhausted
+                     then pure result  -- We can't really go on
                      else
                        do say "Crux" "New preconditions:"
                           say "Crux" (show (ppConstraints newConstraints))
                           when (allPreconditions == preconditions) $
                             panic "bugfindingLoop" ["Redundant constraints!"]
-                          loop allTruePositives allPreconditions allUnclassified
+                          loop allTruePositives allPreconditions allUncertain allResourceExhausted
 
-     loop [] (emptyConstraints (Ctx.size (context ^. argumentFullTypes))) []
+     loop [] (emptyConstraints (Ctx.size (context ^. argumentFullTypes))) [] []
 
 
 -- | Assumes the bitcode file has already been generated with @genBitCode@.
@@ -298,7 +281,7 @@ translateAndLoop ::
   IO SomeBugfindingResult
 translateAndLoop cruxOpts llvmOpts =
   do llvmMod <- parseLLVM (Crux.outDir cruxOpts </> "combined.bc")
-     halloc <- newHandleAllocator
+     halloc <- Crucible.newHandleAllocator
      Some trans <-
        let ?laxArith = laxArithmetic llvmOpts
            ?optLoopMerge = loopMerge llvmOpts
@@ -308,8 +291,8 @@ translateAndLoop cruxOpts llvmOpts =
        (\ptrW ->
           withPtrWidth
             ptrW
-            (do AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
-                case makeContext (Text.pack entry) (cfgArgTypes cfg) llvmMod trans of
+            (do Crucible.AnyCFG cfg <- liftIO $ findFun entry (cfgMap trans)
+                case makeContext (Text.pack entry) (Crucible.cfgArgTypes cfg) llvmMod trans of
                   Left _ -> error "Error building context!"  -- TODO(lb)
                   Right (SomeContext context Refl) ->
                     SomeBugfindingResult <$>
@@ -329,17 +312,5 @@ bugfindingMain ::
   IO ExitCode
 bugfindingMain cruxOpts llvmOpts =
   do SomeBugfindingResult result <- translateAndLoop cruxOpts llvmOpts
-     say "Crux" $
-       if null (unclassifiedErrors result)
-       then Text.unpack (printFunctionSummary (summary result))
-       else unlines
-              [ unwords
-                  [ "Couldn't classify the following errors."
-                  , "They may be true bugs, or they may be due to generated inputs"
-                  , "that don't conform to the function's preconditions."
-                  ]
-              , intercalate
-                  "---------------------\n"
-                  (map show (unclassifiedErrors result))
-              ]
+     say "Crux" $ Text.unpack (Result.printFunctionSummary (summary result))
      return ExitSuccess

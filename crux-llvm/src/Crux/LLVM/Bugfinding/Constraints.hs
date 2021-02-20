@@ -46,7 +46,7 @@ import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 
 import           Data.Parameterized.Classes (IxedF(ixF), OrdF(compareF, leqF), OrderingF(LTF, GTF, EQF))
-import           Data.Parameterized.Some (Some)
+import           Data.Parameterized.Some (Some(Some))
 import qualified Data.Parameterized.TH.GADT as U
 
 import qualified Text.LLVM.AST as L
@@ -205,16 +205,17 @@ ppConstraints (Constraints argCs globCs _relCs) =
           2
           (PP.vsep ( PP.pretty "Argument #" <> PP.viaShow (Ctx.indexVal idx)
                    -- TODO: Use argument names
-                   : map ppValueConstraint (Set.toList constraints)
+                   : map (\(SomeValueConstraint vc) -> ppValueConstraint vc)
+                         (Set.toList constraints)
                    ))
-      -- ppGlobC (L.Symbol sym) constraints =
-      --   PP.nest
-      --     2
-      --     (PP.vsep ( PP.pretty "Global " <> PP.pretty sym
-      --              : map ppValueConstraint (Set.toList constraints)
-      --              ))
-  -- in PP.vsep $ toListWithIndex ppArgC argCs -- ++ map (uncurry ppGlobC) (Map.toList globCs)
-  in PP.pretty "TODO Not implemented"
+      ppGlobC (L.Symbol sym) constraints =
+        PP.nest
+          2
+          (PP.vsep ( PP.pretty "Global " <> PP.pretty sym
+                   : map (\(Some (SomeValueConstraint vc)) -> ppValueConstraint vc)
+                         (Set.toList constraints)
+                   ))
+  in PP.vsep $ toListWithIndex ppArgC argCs ++ map (uncurry ppGlobC) (Map.toList globCs)
   where
     toListWithIndex :: (forall tp. Ctx.Index ctx tp -> f tp -> a)
                     -> Ctx.Assignment f ctx

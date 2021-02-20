@@ -8,7 +8,6 @@ Stability    : provisional
 -}
 
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
@@ -39,7 +38,6 @@ import           Lumberjack (HasLog, writeLogM)
 
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.NatRepr (NatRepr, type (<=))
-import           Data.Parameterized.Some (Some(..))
 
 import qualified What4.Interface as What4
 
@@ -73,7 +71,6 @@ import Control.Monad.State (gets)
 import Data.Parameterized.Classes (IxedF'(ixF'))
 import Prettyprinter (Doc)
 import Data.Maybe (fromMaybe)
-import Control.Monad.Error.Class (MonadError(throwError))
 import Lang.Crucible.LLVM.Extension (ArchWidth)
 
 ppRegValue ::
@@ -297,14 +294,11 @@ constrainHere context sym selector constraint fullTypeRepr regEntry@(Crucible.Re
             writeLogM ("Constrained value: " <> Text.pack (show pretty))
             pure regEntry'
        Aligned alignment ->
-         case typeRepr of
-           LLVMMem.PtrRepr ->
-             do assume constraint =<<
-                  liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
-                pretty <- showMe fullTypeRepr regEntry
-                writeLogM ("Constrained value: " <> Text.pack (show pretty))
-                pure regEntry
-           _ -> throwError (SetupBadConstraintSelector (SomeSelector selector) (toMemType fullTypeRepr) (Some constraint))
+         do assume constraint =<<
+              liftIO (LLVMMem.isAligned sym ?ptrWidth regValue alignment)
+            pretty <- showMe fullTypeRepr regEntry
+            writeLogM ("Constrained value: " <> Text.pack (show pretty))
+            pure regEntry
        Initialized ->
          case fullTypeRepr of
            FTPtrRepr partTypeRepr ->
