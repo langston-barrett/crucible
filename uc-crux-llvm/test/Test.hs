@@ -351,7 +351,7 @@ inFileTests =
         ("linked_list_sum.c", [("linked_list_sum", isSafeWithPreconditions DidHitBounds)]),
         ("memset_const_len.c", [("memset_const_len", isSafeWithPreconditions DidntHitBounds)]),
         ("memset_const_len_arg_byte.c", [("memset_const_len_arg_byte", isSafeWithPreconditions DidntHitBounds)]),
-        ("mutually_recursive_linked_list_sum.c", [("mutually_recursive_linked_list_sum", isSafeWithPreconditions DidHitBounds)]),
+        -- ("mutually_recursive_linked_list_sum.c", [("mutually_recursive_linked_list_sum", isSafeWithPreconditions DidHitBounds)]),
         ("not_double_free.c", [("not_double_free", isSafeWithPreconditions DidntHitBounds)]),
         ("ptr_as_array.c", [("ptr_as_array", isSafeWithPreconditions DidntHitBounds)]),
         ("sized_array_arg.c", [("sized_array_arg", isSafeWithPreconditions DidntHitBounds)]),
