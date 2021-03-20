@@ -73,6 +73,8 @@ data TruePositiveTag
   | TagSRemByConcreteZero
   | TagReadNonPointer
   | TagWriteNonPointer
+  | TagConcretePoison
+  -- TODO disambiguate, make different constructors for different operations
   deriving (Eq, Ord)
 
 data TruePositive
@@ -84,6 +86,7 @@ data TruePositive
   | SRemByConcreteZero
   | ReadNonPointer
   | WriteNonPointer
+  | ConcretePoison
 
 truePositiveTag :: TruePositive -> TruePositiveTag
 truePositiveTag =
@@ -96,6 +99,7 @@ truePositiveTag =
     SRemByConcreteZero {} -> TagSRemByConcreteZero
     ReadNonPointer {} -> TagReadNonPointer
     WriteNonPointer {} -> TagWriteNonPointer
+    ConcretePoison {} -> TagConcretePoison
 
 ppTruePositiveTag :: TruePositiveTag -> Text
 ppTruePositiveTag =
@@ -108,6 +112,7 @@ ppTruePositiveTag =
     TagSRemByConcreteZero -> "Signed remainder with a concretely zero divisor"
     TagReadNonPointer -> "Read from an integer that concretely wasn't a pointer"
     TagWriteNonPointer -> "Write from an integer that concretely wasn't a pointer"
+    TagConcretePoison -> "Poison value created as a result of concrete arithmetic"
 
 ppTruePositive :: TruePositive -> Text
 ppTruePositive =

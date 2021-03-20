@@ -5,11 +5,6 @@ Copyright    : (c) Galois, Inc 2021
 License      : BSD3
 Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
-
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE ViewPatterns #-}
 -}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
@@ -25,6 +20,7 @@ module UCCrux.LLVM.Classify.Poison (classifyPoison) where
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log)
 
+import           Control.Applicative ((<|>))
 import           Control.Lens ((^.), to)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 
@@ -33,7 +29,6 @@ import           Data.BitVector.Sized (BV)
 import qualified Data.BitVector.Sized as BV
 import           Data.Functor.Const (Const(getConst))
 import           Data.Map (Map)
-import qualified Data.Map as Map
 import qualified Data.Text as Text
 
 import qualified Text.LLVM.AST as L
@@ -45,11 +40,13 @@ import           Data.Parameterized.Some (Some(Some))
 
 import qualified What4.Concrete as What4
 import qualified What4.Interface as What4
+import qualified What4.Expr.Builder as What4
 
 import qualified Lang.Crucible.Simulator as Crucible
 
 import qualified Lang.Crucible.LLVM.Errors.Poison as Poison
 
+import           UCCrux.LLVM.Classify.Annotations
 import           UCCrux.LLVM.Context.App (AppContext, log)
 import           UCCrux.LLVM.Context.Function (FunctionContext, argumentNames)
 import           UCCrux.LLVM.Classify.Types
@@ -60,17 +57,24 @@ import           UCCrux.LLVM.Logging (Verbosity(Hi))
 import           UCCrux.LLVM.Setup.Monad (TypedSelector(..))
 {- ORMOLU_ENABLE -}
 
-getTermAnn ::
-  What4.IsExprBuilder sym =>
+-- | If a poison value was created and both operands were concrete expressions
+-- that don't depend on arguments or global variables, that's probably a bug.
+bothConcrete ::
+  ( What4.IsExprBuilder sym,
+    sym ~ What4.ExprBuilder t st fs -- needed for asApp
+  ) =>
   sym ->
-  -- | Term annotations (origins)
   Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes)) ->
-  What4.SymExpr sym tp ->
-  Maybe (Some (TypedSelector m arch argTypes))
-getTermAnn sym annotations expr =
-  do
-    ann <- What4.getAnnotation sym expr
-    Map.lookup (Some ann) annotations
+  What4.SymBV sym w ->
+  What4.SymBV sym w ->
+  Bool
+bothConcrete sym annotations op1 op2 =
+  case ( What4.asConcrete op1 <|> What4.asConcrete op2,
+         getAnyTermAnn sym annotations op1
+           ++ getAnyTermAnn sym annotations op2
+       ) of
+    (Nothing, []) -> True
+    _ -> False
 
 -- | For poison values created via arithmetic operations, it's easy to deduce a
 -- precondition when one of the operands is an argument to the function, and the
@@ -104,7 +108,10 @@ annotationAndValue sym annotations op1 op2 =
 
 -- | Handle signed overflow by adding bounds on input bitvectors.
 handleBVOp ::
-  (MonadIO f, What4.IsExprBuilder sym) =>
+  ( MonadIO f,
+    What4.IsExprBuilder sym,
+    sym ~ What4.ExprBuilder t st fs -- needed for asApp
+  ) =>
   AppContext ->
   FunctionContext m arch argTypes ->
   sym ->
@@ -124,44 +131,49 @@ handleBVOp ::
   ) ->
   f (Maybe (Explanation m arch argTypes))
 handleBVOp appCtx funCtx sym annotations tag op1 op2 constraint =
-  case annotationAndValue sym annotations op1 op2 of
-    -- The argument was on the LHS of the operation
-    Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor))), concreteSummand) ->
-      do
-        let argName i =
-              funCtx ^. argumentNames . ixF' i . to getConst . to (maybe "<top>" Text.unpack)
-        liftIO $
-          (appCtx ^. log) Hi $
-            Text.unwords
-              [ "Diagnosis:",
-                diagnose tag,
-                "#" <> Text.pack (show (Ctx.indexVal idx)),
-                "at",
-                Text.pack (show (ppCursor (argName idx) cursor))
-              ]
-        liftIO $ (appCtx ^. log) Hi (prescribe tag)
-        case ftRepr of
-          FTIntRepr w ->
-            pure $
-              ExMissingPreconditions
-                . (tag,)
-                . (: [])
-                . NewConstraint (SomeInSelector (SelectArgument idx cursor))
-                <$>
-                -- NOTE(lb): The trunc' operation here *should* be a
-                -- no-op, but since the Poison constructors don't have a
-                -- NatRepr, we can't check. That's fixable, but not high
-                -- priority since we'd just panic anyway if the widths
-                -- didn't match.
-                ( constraint w $
-                    bimap (BV.trunc' w) (BV.trunc' w) concreteSummand
-                )
-          _ -> pure Nothing
-    _ -> pure Nothing
+  if bothConcrete sym annotations op1 op2
+    then pure $ Just $ ExTruePositive ConcretePoison
+    else case annotationAndValue sym annotations op1 op2 of
+      -- The argument was on the LHS of the operation
+      Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor))), concreteSummand) ->
+        do
+          let argName i =
+                funCtx ^. argumentNames . ixF' i . to getConst . to (maybe "<top>" Text.unpack)
+          liftIO $
+            (appCtx ^. log) Hi $
+              Text.unwords
+                [ "Diagnosis:",
+                  diagnose tag,
+                  "#" <> Text.pack (show (Ctx.indexVal idx)),
+                  "at",
+                  Text.pack (show (ppCursor (argName idx) cursor))
+                ]
+          liftIO $ (appCtx ^. log) Hi (prescribe tag)
+          case ftRepr of
+            FTIntRepr w ->
+              pure $
+                ExMissingPreconditions
+                  . (tag,)
+                  . (: [])
+                  . NewConstraint (SomeInSelector (SelectArgument idx cursor))
+                  <$>
+                  -- NOTE(lb): The trunc' operation here *should* be a
+                  -- no-op, but since the Poison constructors don't have a
+                  -- NatRepr, we can't check. That's fixable, but not high
+                  -- priority since we'd just panic anyway if the widths
+                  -- didn't match.
+                  ( constraint w $
+                      bimap (BV.trunc' w) (BV.trunc' w) concreteSummand
+                  )
+            _ -> pure Nothing
+      _ -> pure Nothing
 
 classifyPoison ::
-  forall f sym m arch argTypes.
-  (MonadIO f, What4.IsExprBuilder sym) =>
+  forall f sym m arch argTypes t st fs.
+  ( MonadIO f,
+    What4.IsExprBuilder sym,
+    sym ~ What4.ExprBuilder t st fs -- needed for asApp
+  ) =>
   AppContext ->
   FunctionContext m arch argTypes ->
   sym ->

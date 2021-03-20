@@ -33,8 +33,6 @@ import           Control.Monad.IO.Class (MonadIO, liftIO)
 import qualified Data.BitVector.Sized as BV
 import           Data.Functor.Const (Const(getConst))
 import           Data.Map (Map)
-import qualified Data.Map as Map
-import           Data.Maybe (maybeToList)
 import           Data.Text (Text)
 import qualified Data.Text as Text
 import           Data.Type.Equality ((:~:)(Refl))
@@ -44,7 +42,6 @@ import qualified Text.LLVM.AST as L
 import           Data.Parameterized.Classes (IxedF'(ixF'), ShowF)
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some (Some(Some))
-import           Data.Parameterized.TraversableFC (foldMapFC)
 
 import qualified What4.Concrete as What4
 import qualified What4.Interface as What4
@@ -62,6 +59,7 @@ import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as UB
 import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 import           Lang.Crucible.LLVM.MemType (memTypeSize)
 
+import           UCCrux.LLVM.Classify.Annotations
 import           UCCrux.LLVM.Classify.Poison
 import           UCCrux.LLVM.Classify.Types
 import           UCCrux.LLVM.Context.App (AppContext, log)
@@ -188,7 +186,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
     LLVMErrors.BBUndefinedBehavior (UB.SRemByZero _dividend (Crucible.RV divisor)) ->
       handleDivRemByZero TagSRemByConcreteZero SRemByConcreteZero divisor
     LLVMErrors.BBUndefinedBehavior (UB.WriteBadAlignment ptr alignment) ->
-      case getPtrOffsetAnn (Crucible.unRV ptr) of
+      case getPtrOffsetAnn' (Crucible.unRV ptr) of
         Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
           do
             let tag = ArgWriteBadAlignment
@@ -212,7 +210,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
         _ -> unclass appCtx badBehavior
     LLVMErrors.BBUndefinedBehavior
       (UB.ReadBadAlignment ptr alignment) ->
-        case getPtrOffsetAnn (Crucible.unRV ptr) of
+        case getPtrOffsetAnn' (Crucible.unRV ptr) of
           Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
             do
               let tag = ArgReadBadAlignment
@@ -239,7 +237,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
         maybe (unclass appCtx badBehavior) pure =<< handleFreeUnallocated ptr
     LLVMErrors.BBUndefinedBehavior
       (UB.FreeBadOffset (Crucible.RV ptr)) ->
-        case getPtrOffsetAnn ptr of
+        case getPtrOffsetAnn' ptr of
           Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
             -- At the moment, we only handle the case where the pointer is
             -- unallocated.
@@ -283,7 +281,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
               liftIO $
                 (appCtx ^. log) Hi $
                   Text.unwords ["Diagnosis:", ppTruePositiveTag tag]
-              case getPtrOffsetAnn ptr of
+              case getPtrOffsetAnn' ptr of
                 Just (Some (TypedSelector _ (SomeInSelector (SelectArgument idx cursor)))) ->
                   liftIO $
                     (appCtx ^. log) Hi $
@@ -298,9 +296,9 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
               return $ ExTruePositive DoubleFree
     LLVMErrors.BBUndefinedBehavior
       (UB.PtrAddOffsetOutOfBounds (Crucible.RV ptr) (Crucible.RV offset)) ->
-        case getPtrOffsetAnn ptr of
+        case getPtrOffsetAnn' ptr of
           Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
-            case getTermAnn offset of
+            case getTermAnn' offset of
               Just (Some (TypedSelector _ (SomeInSelector (SelectArgument _ _)))) ->
                 do
                   let tag = UnfixedArgPtrOffsetArg
@@ -359,7 +357,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           _ -> unclass appCtx badBehavior
     LLVMErrors.BBUndefinedBehavior
       (UB.MemsetInvalidRegion (Crucible.RV ptr) _fillByte (Crucible.RV len)) ->
-        case (getPtrOffsetAnn ptr, What4.asConcrete len) of
+        case (getPtrOffsetAnn' ptr, What4.asConcrete len) of
           ( Just
               ( Some
                   ( TypedSelector
@@ -407,7 +405,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           (summarizeOp -> (_expl, ptr))
           MemError.UnwritableRegion
         ) ->
-        case (getPtrOffsetAnn ptr, getAnyPtrOffsetAnn ptr) of
+        case (getPtrOffsetAnn' ptr, getAnyPtrOffsetAnn' ptr) of
           (Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))), _) ->
             case isPtrRepr ftRepr of
               Nothing -> panic "classify" ["Expected pointer type"]
@@ -459,7 +457,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           (summarizeOp -> (_expl, ptr))
           MemError.UnreadableRegion
         ) ->
-        case (getPtrOffsetAnn ptr, getAnyPtrOffsetAnn ptr) of
+        case (getPtrOffsetAnn' ptr, getAnyPtrOffsetAnn' ptr) of
           -- If the pointer expression doesn't involve the function's
           -- arguments/global variables at all, then it's just a standard null
           -- dereference or similar.
@@ -482,8 +480,8 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           (MemError.NoSatisfyingWrite _storageType ptr)
         ) ->
         do
-          blockAnn <- liftIO $ getPtrBlockAnn ptr
-          case (blockAnn, getPtrOffsetAnn ptr, getAnyPtrOffsetAnn ptr) of
+          blockAnn <- liftIO $ getPtrBlockAnn' ptr
+          case (blockAnn, getPtrOffsetAnn' ptr, getAnyPtrOffsetAnn' ptr) of
             ( Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))),
               _,
               _
@@ -543,7 +541,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           (MemError.MemLoadHandleOp _type _str ptr _)
           (MemError.BadFunctionPointer _msg)
         ) ->
-        case getPtrOffsetAnn ptr of
+        case getPtrOffsetAnn' ptr of
           Just (Some (TypedSelector _ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
             do
               let tag = UnfixedFunctionPtrInArg
@@ -561,36 +559,25 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
           _ -> unclass appCtx badBehavior
     _ -> unclass appCtx badBehavior
   where
-    getTermAnn ::
+    getTermAnn' ::
       What4.SymExpr sym tp ->
       Maybe (Some (TypedSelector m arch argTypes))
-    getTermAnn expr =
-      flip Map.lookup annotations . Some =<< What4.getAnnotation sym expr
+    getTermAnn' = getTermAnn sym annotations
 
-    getPtrOffsetAnn ::
+    getPtrOffsetAnn' ::
       LLVMPtr.LLVMPtr sym w ->
       Maybe (Some (TypedSelector m arch argTypes))
-    getPtrOffsetAnn ptr = getTermAnn (LLVMPtr.llvmPointerOffset ptr)
+    getPtrOffsetAnn' = getPtrOffsetAnn sym annotations
 
-    getPtrBlockAnn ::
+    getPtrBlockAnn' ::
       LLVMPtr.LLVMPtr sym w ->
       IO (Maybe (Some (TypedSelector m arch argTypes)))
-    getPtrBlockAnn ptr =
-      do
-        int <- What4.natToInteger sym (LLVMPtr.llvmPointerBlock ptr)
-        pure $ getTermAnn int
+    getPtrBlockAnn' = getPtrBlockAnn sym annotations
 
-    getAnyPtrOffsetAnn ::
+    getAnyPtrOffsetAnn' ::
       LLVMPtr.LLVMPtr sym w ->
       [Some (TypedSelector m arch argTypes)]
-    getAnyPtrOffsetAnn ptr =
-      let subAnns =
-            case What4.asApp (LLVMPtr.llvmPointerOffset ptr) of
-              Nothing -> []
-              Just app -> foldMapFC (maybeToList . getTermAnn) app
-       in case getPtrOffsetAnn ptr of
-            Just ann -> ann : subAnns
-            Nothing -> subAnns
+    getAnyPtrOffsetAnn' = getAnyPtrOffsetAnn sym annotations
 
     elemsFromOffset' ::
       What4.ConcreteVal (What4.BaseBVType w) ->
@@ -608,7 +595,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
                 Just False -> False
                 _ -> True
         if isUnallocated
-          then case getPtrOffsetAnn ptr of
+          then case getPtrOffsetAnn' ptr of
             Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
               do
                 let tag = ArgFreeUnallocated
@@ -640,7 +627,7 @@ classifyBadBehavior appCtx modCtx funCtx sym (Crucible.RegMap _args) annotations
     handleDivRemByZero tag truePositive divisor =
       case What4.asConcrete divisor of
         Nothing ->
-          case getTermAnn divisor of
+          case getTermAnn' divisor of
             Just (Some (TypedSelector ftRepr (SomeInSelector (SelectArgument idx cursor)))) ->
               do
                 let tag' = ArgNonZero

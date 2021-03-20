@@ -26,6 +26,7 @@ library
 
   exposed-modules:
     UCCrux.LLVM.Classify
+    UCCrux.LLVM.Classify.Annotations
     UCCrux.LLVM.Classify.Poison
     UCCrux.LLVM.Classify.Types
     UCCrux.LLVM.Config
