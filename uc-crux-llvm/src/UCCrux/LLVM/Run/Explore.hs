@@ -18,7 +18,6 @@ where
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log, writeFile)
 
-
 import           Control.Concurrent (threadDelay )
 import           Control.Concurrent.Async (race)
 import           Control.Exception (displayException)
@@ -57,6 +56,56 @@ import           UCCrux.LLVM.Run.Loop (loopOnFunction)
 import           UCCrux.LLVM.Stats (Stats(unimplementedFreq), getStats, ppStats)
 {- ORMOLU_ENABLE -}
 
+withTimeout :: Int -> IO a -> IO (Either () a)
+withTimeout timeout action = race (threadDelay timeout) action
+
+exploreOne ::
+  ( ?outputConfig :: OutputConfig,
+    ArchOk arch
+  ) =>
+  AppContext ->
+  ModuleContext arch ->
+  CruxOptions ->
+  UCCruxLLVMOptions ->
+  Crucible.HandleAllocator ->
+  FilePath ->
+  String ->
+  IO Stats
+exploreOne appCtx modCtx cruxOpts ucOpts halloc dir func =
+  do
+    let logFilePath = dir </> func -<.> ".summary.log"
+    logExists <- doesPathExist logFilePath
+    if not logExists || Config.reExplore ucOpts
+      then do
+        (appCtx ^. log) Hi $ "Exploring " <> Text.pack func
+        maybeResult <-
+          withTimeout
+            -- TODO Make this configurable
+            5000000 -- 5s in microseconds
+            (loopOnFunction appCtx modCtx halloc cruxOpts ucOpts func)
+        case maybeResult of
+          Right (Right (SomeBugfindingResult result)) ->
+            do
+              writeFile logFilePath (Result.printFunctionSummary (Result.summary result))
+              pure (getStats result)
+          Right (Left unin) ->
+            do
+              (appCtx ^. log) Hi $ "Hit unimplemented feature in " <> Text.pack func
+              writeFile logFilePath (Text.pack (displayException unin))
+              pure
+                ( mempty
+                    { unimplementedFreq = Map.singleton (panicComponent unin) 1
+                    }
+                )
+          Left () ->
+            do
+              (appCtx ^. log) Hi $ "Hit timeout in " <> Text.pack func
+              writeFile logFilePath (Text.pack "Timeout - likely solver or Crucible bug")
+              pure mempty -- TODO Record timeout
+      else do
+        (appCtx ^. log) Med $ "Skipping already-explored function " <> Text.pack func
+        pure mempty
+
 -- | Explore arbitrary functions in this module, trying to find some bugs.
 --
 -- The strategy/order is exceedingly naive right now, it literally just applies
@@ -83,41 +132,7 @@ explore appCtx modCtx cruxOpts ucOpts halloc =
     let dir = bldDir cruxOpts </> takeFileName (modCtx ^. moduleFilePath) -<.> ""
     createDirectoryIfMissing True dir
     stats <-
-      for (filter (`notElem` Config.skipFunctions ucOpts) functions) $
-        \func ->
-          do
-            let logFilePath = dir </> func -<.> ".summary.log"
-            logExists <- doesPathExist logFilePath
-            if not logExists || Config.reExplore ucOpts
-              then do
-                (appCtx ^. log) Hi $ "Exploring " <> Text.pack func
-                maybeResult <-
-                  let timeout =
-                        threadDelay
-                          -- TODO Make this configurable
-                          5000000 -- 5s in microseconds
-                  in race timeout $
-                        loopOnFunction appCtx modCtx halloc cruxOpts ucOpts func
-                case maybeResult of
-                  Right (Right (SomeBugfindingResult result)) ->
-                    do
-                      writeFile logFilePath (Result.printFunctionSummary (Result.summary result))
-                      pure (getStats result)
-                  Right (Left unin) ->
-                    do
-                      (appCtx ^. log) Hi $ "Hit unimplemented feature in " <> Text.pack func
-                      writeFile logFilePath (Text.pack (displayException unin))
-                      pure
-                        ( mempty
-                            { unimplementedFreq = Map.singleton (panicComponent unin) 1
-                            }
-                        )
-                  Left () ->
-                    do
-                      (appCtx ^. log) Hi $ "Hit timeout in " <> Text.pack func
-                      writeFile logFilePath (Text.pack "Timeout - likely solver or Crucible bug")
-                      pure mempty -- TODO Record timeout
-              else do
-                (appCtx ^. log) Med $ "Skipping already-explored function " <> Text.pack func
-                pure mempty
+      for
+        (filter (`notElem` Config.skipFunctions ucOpts) functions)
+        $ exploreOne appCtx modCtx cruxOpts ucOpts halloc dir
     (appCtx ^. log) Low $ ppShow (ppStats (mconcat stats))
