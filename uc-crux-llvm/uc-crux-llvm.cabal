@@ -74,6 +74,7 @@ library
     parameterized-utils,
     prettyprinter >= 1.7.0,
     semigroupoids,
+    silently,
     simple-get-opt,
     text,
     vector,

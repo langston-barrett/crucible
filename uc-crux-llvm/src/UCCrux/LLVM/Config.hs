@@ -35,8 +35,10 @@ data UCCruxLLVMOptions = UCCruxLLVMOptions
   { ucLLVMOptions :: LLVMOptions,
     doExplore :: Bool,
     reExplore :: Bool,
-    entryPoints :: [String],
     exploreBudget :: Int,
+    exploreTimeout :: Int,
+    exploreThreads :: Int,
+    entryPoints :: [String],
     skipFunctions :: [String],
     verbosity :: Int
   }
@@ -85,15 +87,25 @@ ucCruxLLVMConfig = do
               False
               "Re-explore functions that have already been explored (i.e., have logs)"
             <*> Crux.section
-              "entry-points"
-              (Crux.listSpec Crux.stringSpec)
-              []
-              "Comma-separated list of functions to examine."
-            <*> Crux.section
               "explore-budget"
               Crux.numSpec
               8
               "Budget for exploration mode"
+            <*> Crux.section
+              "explore-timeout"
+              Crux.numSpec
+              5
+              "Hard timeout for exploration of a single function (seconds)"
+            <*> Crux.section
+              "explore-threads"
+              Crux.numSpec
+              0
+              "Number of threads to use while exploring (0 = explore serially)"
+            <*> Crux.section
+              "entry-points"
+              (Crux.listSpec Crux.stringSpec)
+              []
+              "Comma-separated list of functions to examine."
             <*> Crux.section
               "skip-functions"
               (Crux.listSpec Crux.stringSpec)
@@ -157,15 +169,6 @@ ucCruxLLVMConfig = do
                          opts {verbosity = v},
                  Crux.Option
                    []
-                   ["explore-budget"]
-                   "Budget for exploration mode"
-                   $ Crux.ReqArg
-                     "INT"
-                     $ Crux.parsePosNum
-                       "INT"
-                       $ \v opts -> opts {exploreBudget = v},
-                 Crux.Option
-                   []
                    ["skip-functions"]
                    "List of functions to skip during exploration"
                    $ Crux.ReqArg "FUN" $
@@ -181,6 +184,33 @@ ucCruxLLVMConfig = do
                    ["re-explore"]
                    "Re-explore functions that have already been explored (i.e., have logs)"
                    $ Crux.NoArg $
-                     \opts -> Right opts {reExplore = True}
+                     \opts -> Right opts {reExplore = True},
+                 Crux.Option
+                   []
+                   ["explore-budget"]
+                   "Budget for exploration mode"
+                   $ Crux.ReqArg
+                     "INT"
+                     $ Crux.parsePosNum
+                       "INT"
+                       $ \v opts -> opts {exploreBudget = v},
+                 Crux.Option
+                   []
+                   ["explore-timeout"]
+                   "Hard timeout for exploration of a single function (seconds)"
+                   $ Crux.ReqArg
+                     "INT"
+                     $ Crux.parsePosNum
+                       "INT"
+                       $ \v opts -> opts {exploreTimeout = v},
+                 Crux.Option
+                   []
+                   ["explore-threads"]
+                   "Number of threads to use while exploring (0 = explore serially)"
+                   $ Crux.ReqArg
+                     "INT"
+                     $ Crux.parsePosNum
+                       "INT"
+                       $ \v opts -> opts {exploreThreads = v}
                ]
       }

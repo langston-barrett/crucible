@@ -18,14 +18,16 @@ where
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log, writeFile)
 
+import           Control.Lens ((.~))
 import           Control.Concurrent (threadDelay )
-import           Control.Concurrent.Async (race)
+import           Control.Concurrent.Async (race, mapConcurrently)
 import           Control.Exception (displayException)
 import           Control.Lens ((^.))
+import           Data.Function ((&))
 import qualified Data.Map.Strict as Map
-import           Data.Traversable (for)
 import           Data.Text.IO (writeFile)
 import qualified Data.Text as Text
+import           Data.Traversable (for)
 import           Panic (panicComponent)
 import           System.Directory (doesPathExist, createDirectoryIfMissing)
 import           System.FilePath ((</>), (-<.>), takeFileName)
@@ -80,8 +82,8 @@ exploreOne appCtx modCtx cruxOpts ucOpts halloc dir func =
         (appCtx ^. log) Hi $ "Exploring " <> Text.pack func
         maybeResult <-
           withTimeout
-            -- TODO Make this configurable
-            5000000 -- 5s in microseconds
+            -- Seconds to microseconds
+            (Config.exploreTimeout ucOpts * 1000000)
             (loopOnFunction appCtx modCtx halloc cruxOpts ucOpts func)
         case maybeResult of
           Right (Right (SomeBugfindingResult result)) ->
@@ -131,8 +133,14 @@ explore appCtx modCtx cruxOpts ucOpts halloc =
             (take (Config.exploreBudget ucOpts) (L.modDefines (modCtx ^. llvmModule)))
     let dir = bldDir cruxOpts </> takeFileName (modCtx ^. moduleFilePath) -<.> ""
     createDirectoryIfMissing True dir
+    let funcsToExplore = filter (`notElem` Config.skipFunctions ucOpts) functions
+    let doExplore ac = exploreOne ac modCtx cruxOpts ucOpts halloc dir
     stats <-
-      for
-        (filter (`notElem` Config.skipFunctions ucOpts) functions)
-        $ exploreOne appCtx modCtx cruxOpts ucOpts halloc dir
+      if Config.exploreThreads ucOpts /= 0
+        then -- TODO(lb): Chunk based on exploreThreads
+
+          mapConcurrently
+            (doExplore (appCtx & log .~ (\_ _ -> pure ())))
+            funcsToExplore
+        else for funcsToExplore (doExplore appCtx)
     (appCtx ^. log) Low $ ppShow (ppStats (mconcat stats))
