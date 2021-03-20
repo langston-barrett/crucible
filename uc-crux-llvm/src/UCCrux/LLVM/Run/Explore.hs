@@ -18,6 +18,9 @@ where
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log, writeFile)
 
+
+import           Control.Concurrent (threadDelay )
+import           Control.Concurrent.Async (race)
 import           Control.Exception (displayException)
 import           Control.Lens ((^.))
 import qualified Data.Map.Strict as Map
@@ -88,20 +91,32 @@ explore appCtx modCtx cruxOpts ucOpts halloc =
             if not logExists || Config.reExplore ucOpts
               then do
                 (appCtx ^. log) Hi $ "Exploring " <> Text.pack func
-                maybeResult <- loopOnFunction appCtx modCtx halloc cruxOpts ucOpts func
+                maybeResult <-
+                  let timeout =
+                        threadDelay
+                          -- TODO Make this configurable
+                          5000000 -- 5s in microseconds
+                  in race timeout $
+                        loopOnFunction appCtx modCtx halloc cruxOpts ucOpts func
                 case maybeResult of
-                  Right (SomeBugfindingResult result) ->
+                  Right (Right (SomeBugfindingResult result)) ->
                     do
                       writeFile logFilePath (Result.printFunctionSummary (Result.summary result))
                       pure (getStats result)
-                  Left unin ->
+                  Right (Left unin) ->
                     do
+                      (appCtx ^. log) Hi $ "Hit unimplemented feature in " <> Text.pack func
                       writeFile logFilePath (Text.pack (displayException unin))
                       pure
                         ( mempty
                             { unimplementedFreq = Map.singleton (panicComponent unin) 1
                             }
                         )
+                  Left () ->
+                    do
+                      (appCtx ^. log) Hi $ "Hit timeout in " <> Text.pack func
+                      writeFile logFilePath (Text.pack "Timeout - likely solver or Crucible bug")
+                      pure mempty -- TODO Record timeout
               else do
                 (appCtx ^. log) Med $ "Skipping already-explored function " <> Text.pack func
                 pure mempty
