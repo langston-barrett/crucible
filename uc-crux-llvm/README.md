@@ -272,6 +272,25 @@ Uncertain results:
         - [ ] Addition
         - [ ] Subtraction
         - [ ] Multiplication
+  - [ ] (Unsound) overrides for common libc functions
+    - [ ] `fread`
+    - [ ] `fscanf`
+    - [ ] `gettimeofday`
+    - [ ] `memcmp`
+    - [ ] `pow`
+    - [ ] `sethostname`
+    - [ ] `sprintf`
+    - [ ] `stat`
+    - [ ] `strchr`
+    - [ ] `strcmp`
+    - [ ] `strcpy`
+    - [ ] `strdup`
+    - [ ] `strncmp`
+    - [ ] `strncpy`
+    - [ ] `tolower`
+    - [ ] `unlink`
+    - [x] `getenv`
+    - [x] `gethostname`
 - Goal: Robustness to unforeseen conditions
   - [ ] Setting to ignore or raise errors that have no applicable heuristics
   - [ ] Test suite
