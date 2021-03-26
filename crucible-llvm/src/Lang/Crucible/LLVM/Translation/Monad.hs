@@ -58,6 +58,7 @@ import           Data.Parameterized.NatRepr as NatRepr
 import           Data.Parameterized.Some
 
 import           Lang.Crucible.CFG.Generator
+import           Lang.Crucible.Panic ( panic )
 
 import           Lang.Crucible.LLVM.DataLayout
 import           Lang.Crucible.LLVM.Extension
@@ -126,11 +127,11 @@ mkLLVMContext halloc m = do
 -- to CFGs.
 type LLVMGenerator s arch ret a =
   (?lc :: TypeContext, HasPtrWidth (ArchWidth arch)) =>
-    Generator (LLVM arch) s (LLVMState arch) ret IO a
+    Generator LLVM s (LLVMState arch) ret IO a
 
 -- | @LLVMGenerator@ without the constraint, can be nested further inside monads.
 type LLVMGenerator' s arch ret =
-  Generator (LLVM arch) s (LLVMState arch) ret IO
+  Generator LLVM s (LLVMState arch) ret IO
 
 
 -- LLVMState
@@ -212,15 +213,20 @@ buildIdentMap ts True ctx asgn m =
 buildIdentMap [] _ ctx _ m
   | Ctx.null ctx = m
   | otherwise =
-      error "buildIdentMap: passed arguments do not match LLVM input signature"
+      panic "crucible-llvm:Translation.buildIdentMap"
+      [ "buildIdentMap: passed arguments do not match LLVM input signature" ]
 buildIdentMap (ti:ts) _ ctx asgn m = do
-  -- ?? FIXME, irrefutable pattern...
-  let Right ty = liftMemType (L.typedType ti)
+  let ty = case liftMemType (L.typedType ti) of
+             Right t -> t
+             Left err -> panic "crucible-llvm:Translation.buildIdentMap"
+                         [ "Error attempting to lift type " <> show ti
+                         , show err
+                         ]
   packType ty ctx asgn $ \x ctx' asgn' ->
      buildIdentMap ts False ctx' asgn' (Map.insert (L.typedValue ti) (Right x) m)
 
 -- | Build the initial LLVM generator state upon entry to to the entry point of a function.
-initialState :: (?lc :: TypeContext, HasPtrWidth wptr, wptr ~ ArchWidth arch)
+initialState :: (?lc :: TypeContext, HasPtrWidth wptr)
              => L.Define
              -> LLVMContext arch
              -> CtxRepr args

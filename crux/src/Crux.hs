@@ -34,9 +34,12 @@ import Data.Maybe ( fromMaybe )
 import Data.Proxy ( Proxy(..) )
 import qualified Data.Sequence as Seq
 import qualified Data.Text as T
+import qualified Data.Text.Lazy as TL
 import Data.Void
 import Control.Monad(when)
 import Prettyprinter
+import qualified Prettyprinter.Render.Text as PR
+import System.Console.Terminal.Size ( size, Window(..) )
 import System.Exit(exitSuccess, ExitCode(..), exitFailure, exitWith)
 import System.Directory(createDirectoryIfMissing)
 import System.FilePath((</>))
@@ -108,7 +111,7 @@ newtype SimulatorCallback
           IO (RunnableState sym, Maybe (GroundEvalFn t) -> LPred sym SimError -> IO (Doc Void))
     }
 
--- | Given the reuslt of a simulation and proof run, report the overall
+-- | Given the result of a simulation and proof run, report the overall
 --   status, generate user-consumable reports and compute the exit code.
 postprocessSimResult :: Logs => CruxOptions -> CruxSimulationResult -> IO ExitCode
 postprocessSimResult opts res =
@@ -161,7 +164,10 @@ loadOptions outCfg nm ver config cont =
         Nothing -> sayFail "Crux" (Ex.displayException e) >> exitFailure
 
 showHelp :: Logs => Text -> Config opts -> IO ()
-showHelp nm cfg = outputLn (show (configDocs nm cfg))
+showHelp nm cfg = do
+  outWidth <- maybe 80 (\(Window _ w) -> w) <$> size
+  let opts = LayoutOptions $ AvailablePerLine outWidth 0.98
+  outputLn (TL.unpack $ PR.renderLazy $ layoutPretty opts (configDocs nm cfg))
 
 showVersion :: Logs => Text -> Text -> IO ()
 showVersion nm ver =

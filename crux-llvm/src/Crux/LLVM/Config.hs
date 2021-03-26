@@ -4,14 +4,17 @@
 
 module Crux.LLVM.Config where
 
-import Control.Exception ( Exception, displayException, throwIO )
-import Control.Monad.State( liftIO, MonadIO )
+import           Control.Exception ( Exception, displayException, throwIO )
+import           Control.Monad.State ( liftIO, MonadIO )
+import           System.FilePath ( (</>) )
 
 import qualified Data.LLVM.BitCode as LLVM
 
-import Lang.Crucible.LLVM.MemModel ( MemOptions(..), laxPointerMemOptions )
+import           Lang.Crucible.LLVM.MemModel ( MemOptions(..), laxPointerMemOptions )
 
 import qualified Crux
+import           Paths_crux_llvm ( getDataDir )
+
 
 --
 -- LLVM specific errors
@@ -55,19 +58,23 @@ data LLVMOptions = LLVMOptions
   , clangOpts  :: [String]
   , libDir     :: FilePath
   , incDirs    :: [FilePath]
+  , targetArch :: Maybe String
   , ubSanitizers :: [String]
   , memOpts    :: MemOptions
   , laxArithmetic :: Bool
   , entryPoint :: String
   , lazyCompile :: Bool
+  , noCompile :: Bool
   , optLevel :: Int
   , loopMerge :: Bool
   }
 
-llvmCruxConfig :: Crux.Config LLVMOptions
-llvmCruxConfig =
-  Crux.Config
-  { Crux.cfgFile =
+llvmCruxConfig :: IO (Crux.Config LLVMOptions)
+llvmCruxConfig = do
+  ddir <- getDataDir
+  let libDirDefault = ddir </> "c-src"
+  return Crux.Config
+   { Crux.cfgFile =
       do clangBin <- Crux.section "clang" Crux.fileSpec "clang"
                      "Binary to use for `clang`."
 
@@ -78,12 +85,16 @@ llvmCruxConfig =
                                     (Crux.oneOrList Crux.stringSpec) []
                       "Additional options for `clang`."
 
-         libDir <- Crux.section "lib-dir" Crux.dirSpec "c-src"
+         libDir <- Crux.section "lib-dir" Crux.dirSpec libDirDefault
                    "Locations of `crux-llvm` support library."
 
          incDirs <- Crux.section "include-dirs"
                         (Crux.oneOrList Crux.dirSpec) []
                     "Additional include directories."
+
+         targetArch <- Crux.sectionMaybe "target-architecture" Crux.stringSpec
+                       "Target architecture to pass to LLVM build operations.\
+                       \ Default is no specification for current system architecture"
 
          memOpts <- do laxPointerOrdering <-
                          Crux.section "lax-pointer-ordering" Crux.yesOrNoSpec False
@@ -102,6 +113,9 @@ llvmCruxConfig =
          lazyCompile <- Crux.section "lazy-compile" Crux.yesOrNoSpec False
                            "Avoid compiling bitcode from source if intermediate files already exist"
 
+         noCompile <- Crux.section "no-compile" Crux.yesOrNoSpec False
+                        "Treat the input file as an LLVM module, do not compile it"
+
          ubSanitizers <- Crux.section "ub-sanitizers" (Crux.listSpec Crux.stringSpec) []
                            "Undefined Behavior sanitizers to enable in `clang`"
 
@@ -113,7 +127,7 @@ llvmCruxConfig =
 
          return LLVMOptions { .. }
 
-  , Crux.cfgEnv  =
+   , Crux.cfgEnv  =
       [ Crux.EnvVar "CLANG"      "Binary to use for `clang`."
         $ \v opts -> Right opts { clangBin = v }
 
@@ -122,13 +136,19 @@ llvmCruxConfig =
 
       , Crux.EnvVar "LLVM_LINK" "Use this binary to link LLVM bitcode (`llvm-link`)."
         $ \v opts -> Right opts { linkBin = v }
+
       ]
 
-  , Crux.cfgCmdLineFlag =
+   , Crux.cfgCmdLineFlag =
       [ Crux.Option ['I'] ["include-dirs"]
         "Additional include directories."
         $ Crux.ReqArg "DIR"
         $ \d opts -> Right opts { incDirs = d : incDirs opts }
+
+      , Crux.Option [] ["target"]
+        "Target architecture to pass to LLVM build operations"
+        $ Crux.OptArg "ARCH"
+        $ \a opts -> Right opts { targetArch = a }
 
       , Crux.Option [] ["lax-pointers"]
         "Turn on lax rules for pointer comparisons"
@@ -150,6 +170,11 @@ llvmCruxConfig =
         $ Crux.NoArg
         $ \opts -> Right opts{ lazyCompile = True }
 
+      , Crux.Option [] ["no-compile"]
+        "Treat the input file as an LLVM module, do not compile it"
+        $ Crux.NoArg
+        $ \opts -> Right opts{ noCompile = True }
+
       , Crux.Option [] ["entry-point"]
         "Name of the entry point to begin simulation"
         $ Crux.ReqArg "SYMBOL"
@@ -162,4 +187,4 @@ llvmCruxConfig =
         $ \v opts -> opts { optLevel = v }
 
       ]
-  }
+   }

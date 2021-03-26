@@ -47,13 +47,13 @@ import           Lang.Crucible.Utils.MonadVerbosity (showWarning)
 registerModuleFn
    :: (1 <= ArchWidth arch, HasPtrWidth (ArchWidth arch), IsSymInterface sym) =>
    LLVMContext arch ->
-   (L.Declare, AnyCFG (LLVM arch)) ->
-   OverrideSim p sym (LLVM arch) rtp l a ()
+   (L.Declare, AnyCFG ext) ->
+   OverrideSim p sym ext rtp l a ()
 registerModuleFn llvm_ctx (decl, AnyCFG cfg) = do
   let h = cfgHandle cfg
       s = UseCFG cfg (postdomInfo cfg)
   binds <- use (stateContext . functionBindings)
-  when (isJust $ lookupHandleMap h binds) $
+  when (isJust $ lookupHandleMap h $ fnBindings binds) $
     showWarning ("LLVM function handle registered twice: " ++ show (handleName h))
   bindFnHandle h s
   let mvar = llvmMemVar llvm_ctx
@@ -71,9 +71,9 @@ llvmGlobals ctx mem = emptyGlobals & insertGlobal var mem
   where var = llvmMemVar $ ctx
 
 llvmExtensionImpl ::
-  (HasPtrWidth (ArchWidth arch), HasLLVMAnn sym) =>
+  (HasLLVMAnn sym) =>
   MemOptions ->
-  ExtensionImpl p sym (LLVM arch)
+  ExtensionImpl p sym LLVM
 llvmExtensionImpl mo =
   let ?memOpts = mo in
   ExtensionImpl

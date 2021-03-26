@@ -93,7 +93,6 @@ import qualified Data.Map.Strict as Map
 import           Data.Maybe
 import           Data.String
 import qualified Data.Text   as Text
-import           System.FilePath
 
 import qualified Text.LLVM.AST as L
 
@@ -127,12 +126,12 @@ import           Lang.Crucible.Types
 ------------------------------------------------------------------------
 -- Translation results
 
-type ModuleCFGMap arch = Map L.Symbol (L.Declare, C.AnyCFG (LLVM arch))
+type ModuleCFGMap = Map L.Symbol (L.Declare, C.AnyCFG LLVM)
 
 -- | The result of translating an LLVM module into Crucible CFGs.
 data ModuleTranslation arch
    = ModuleTranslation
-      { cfgMap        :: ModuleCFGMap arch
+      { cfgMap        :: ModuleCFGMap
       , _transContext :: LLVMContext arch
       , globalInitMap :: GlobalInitializerMap
         -- ^ A map from global names to their (constant) values
@@ -259,9 +258,27 @@ setLocation (x:xs) =
  where
  getFile = Text.pack . maybe "" filenm . findFile
 
- filenm di
-   | isRelative (L.difFilename di) = L.difDirectory di </> L.difFilename di
-   | otherwise = L.difFilename di
+ -- The typical values available here will be something like:
+ --
+ -- > L.difDirectory = "/home/joeuser/work"
+ -- > L.difFilename  = "src/lib/foo.c"
+ --
+ -- At the present time, only the 'difFilename' is used for the
+ -- relative path because combining these to form an absolute path
+ -- would cause superfluous result differences (e.g. golden test
+ -- failures) and potentially leak information.
+ --
+ -- The downside is that relative paths may make it harder for various
+ -- tools (e.g. emacs) to locate the offending source file.  The
+ -- suggested method for handling this is to have the emacs compile
+ -- function emit an initial rooted directory location in the proper
+ -- syntax, but if this is problematic, a future direction would be to
+ -- add a config option to control whether an absolute or a relative
+ -- path is desired (defaulting to the latter).
+ --
+ -- [The previous implementation always generated absolute paths, but
+ -- was careful to check if `difFilename` was already absolute.]
+ filenm = L.difFilename
 
 findFile :: (?lc :: TypeContext) => L.ValMd -> Maybe L.DIFile
 findFile (L.ValMdRef x) = findFile =<< lookupMetadata x
@@ -312,7 +329,7 @@ defineLLVMBlock _ _ _ = fail "LLVM basic block has no label!"
 genDefn :: (?laxArith :: Bool)
         => L.Define
         -> TypeRepr ret
-        -> LLVMGenerator s arch ret (Expr (LLVM arch) s ret)
+        -> LLVMGenerator s arch ret (Expr ext s ret)
 genDefn defn retType =
   case L.defBody defn of
     [] -> fail "LLVM define with no blocks!"
@@ -344,7 +361,7 @@ transDefine :: forall arch wptr.
             => HandleAllocator
             -> LLVMContext arch
             -> L.Define
-            -> IO (L.Symbol, (L.Declare, C.AnyCFG (LLVM arch)))
+            -> IO (L.Symbol, (L.Declare, C.AnyCFG LLVM))
 transDefine halloc ctx d = do
   let ?lc = ctx^.llvmTypeCtx
   let decl = declareFromDefine d
@@ -353,7 +370,7 @@ transDefine halloc ctx d = do
 
   llvmDeclToFunHandleRepr' decl $ \(argTypes :: CtxRepr args) (retType :: TypeRepr ret) -> do
     h <- mkHandle' halloc fn_name argTypes retType
-    let def :: FunctionDef (LLVM arch) (LLVMState arch) args ret IO
+    let def :: FunctionDef LLVM (LLVMState arch) args ret IO
         def inputs = (s, f)
             where s = initialState d ctx argTypes inputs
                   f = genDefn d retType
