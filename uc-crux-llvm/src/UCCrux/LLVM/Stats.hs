@@ -30,7 +30,7 @@ import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 import qualified Prettyprinter.Render.Text as PP
 
-import           UCCrux.LLVM.Classify.Types (TruePositiveTag, MissingPreconditionTag, partitionUncertainty, diagnose, ppTruePositiveTag, truePositiveTag, Unfixable, ppUnfixable, Unfixed, ppUnfixed, doc)
+import           UCCrux.LLVM.Classify.Types (MissingPreconditionTag, partitionUncertainty, diagnose, ppLocatedTruePositive, Unfixable, ppUnfixable, Unfixed, ppUnfixed, doc)
 import           UCCrux.LLVM.Run.Result (BugfindingResult(..), FunctionSummaryTag)
 import qualified UCCrux.LLVM.Run.Result as Result
 import           UCCrux.LLVM.Errors.Unimplemented (Unimplemented, ppUnimplemented)
@@ -40,7 +40,7 @@ data Stats = Stats
   { missingAnnotation :: !Word,
     symbolicallyFailedAssert :: !Word,
     timeouts :: !Word,
-    truePositiveFreq :: Map TruePositiveTag Word,
+    truePositiveFreq :: Map Text Word,
     unclassifiedFreq :: Map Text Word,
     missingPreconditionFreq :: Map MissingPreconditionTag Word,
     unimplementedFreq :: Map Unimplemented Word,
@@ -62,7 +62,7 @@ getStats result =
           timeouts = fromIntegral $ length timeouts',
           truePositiveFreq =
             case Result.summary result of
-              Result.FoundBugs bugs -> frequencies (map truePositiveTag (toList bugs))
+              Result.FoundBugs bugs -> frequencies (map ppLocatedTruePositive (toList bugs))
               _ -> Map.empty,
           unclassifiedFreq =
             frequencies (map (^. doc . to (PP.layoutPretty PP.defaultLayoutOptions) . to PP.renderStrict . to trunc) unclass),
@@ -89,7 +89,7 @@ ppStats stats =
     [ ppFreq "Overall results:" (PP.pretty . Result.ppFunctionSummaryTag) (summaries stats),
       ppFreq
         "True positives:"
-        (PP.pretty . ppTruePositiveTag)
+        PP.pretty
         (truePositiveFreq stats),
       ppFreq
         "Missing preconditions:"
