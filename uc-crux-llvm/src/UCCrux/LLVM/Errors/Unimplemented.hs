@@ -36,7 +36,6 @@ data Unimplemented
   | MetadataType
   | GeneratingArrays
   | IndexCursor
-  | ConstrainGlobal
   | GetHostNameNegativeSize
   | GetHostNameSmallSize
   | NonEmptyUnboundedSizeArrays
@@ -55,7 +54,6 @@ ppUnimplemented =
     MetadataType -> "LLVM metadata types in globals or arguments"
     GeneratingArrays -> "Arrays in globals or arguments"
     IndexCursor -> "Deduced preconditions on array elements"
-    ConstrainGlobal -> "Constraints on a global variable"
     GetHostNameNegativeSize -> "`gethostname` called with a negative length"
     GetHostNameSmallSize -> "`gethostname` called with a small length"
     NonEmptyUnboundedSizeArrays -> "Generating arrays with unbounded size"

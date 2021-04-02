@@ -46,7 +46,7 @@ module UCCrux.LLVM.Constraints
 where
 
 {- ORMOLU_DISABLE -}
-import           Control.Lens (Simple, Lens, lens, (%~), (%%~), (.~), (^.))
+import           Control.Lens (Simple, Lens, lens, (%~), (%%~), (.~), (^.), at, to)
 import           Data.Bifunctor (first)
 import           Data.BitVector.Sized (BV)
 import qualified Data.BitVector.Sized as BV
@@ -59,6 +59,7 @@ import qualified Data.Map as Map
 import           Data.Maybe (catMaybes)
 import           Data.Text (Text)
 import qualified Data.Text as Text
+import           Data.Type.Equality ((:~:)(Refl), testEquality)
 import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import           Data.Void as Void
@@ -76,11 +77,14 @@ import           Data.Parameterized.TraversableFC (allFC, fmapFC, toListFC)
 
 import           Lang.Crucible.LLVM.DataLayout (Alignment, fromAlignment)
 
-import           UCCrux.LLVM.Cursor (Selector(..), SomeInSelector(SomeInSelector), seekType)
+import           UCCrux.LLVM.Context.Module (ModuleContext, moduleTypes, globalTypes)
+import           UCCrux.LLVM.Cursor (Cursor, Selector(..), SomeInSelector(SomeInSelector), seekType, checkCompatibility)
 import           UCCrux.LLVM.Errors.Unimplemented (unimplemented)
 import qualified UCCrux.LLVM.Errors.Unimplemented as Unimplemented
 import           UCCrux.LLVM.Shape (Shape, ShapeSeekError)
 import qualified UCCrux.LLVM.Shape as Shape
+import           UCCrux.LLVM.FullType.CrucibleType (lookupGlobalType)
+import           UCCrux.LLVM.FullType.Tag (FullTypeTag(..), FullTypeTagRepr(..), FullTypeToTag, checkTag)
 import           UCCrux.LLVM.FullType.Type (FullType(..), FullTypeRepr(FTPtrRepr), ModuleTypes, asFullType)
 
 -- See comment in below block of CPP
@@ -100,15 +104,15 @@ import           UCCrux.LLVM.Errors.Panic (panic)
 -- more memory, it will return one of these to indicate that the appropriate
 -- memory model operation should happen next time in
 -- "UCCrux.LLVM.Classify.generate".
-data ShapeConstraint (m :: Type) (atTy :: FullType m) where
+data ShapeConstraint (m :: Type) (atTy :: FullTypeTag) where
   -- | This pointer is not null, and has space for at least this many elements
   --
   -- Invariant: argument should be positive.
-  Allocated :: !Int -> ShapeConstraint m ('FTPtr ft)
+  Allocated :: !Int -> ShapeConstraint m 'FTPtrTag
   -- | This pointer points to initialized memory with at least this many elements
   --
   -- Invariant: argument should be positive.
-  Initialized :: !Int -> ShapeConstraint m ('FTPtr ft)
+  Initialized :: !Int -> ShapeConstraint m 'FTPtrTag
 
 deriving instance Eq (ShapeConstraint m atTy)
 
@@ -118,17 +122,33 @@ deriving instance Eq (ShapeConstraint m atTy)
 -- 'UCCrux.LLVM.Classify.classifyBadBehavior', and are then turned into
 -- predicates when generating those arguments in
 -- "UCCrux.LLVM.Classify.generate", and assumed in "UCCrux.LLVM.Run.Simulate".
-data Constraint (m :: Type) (atTy :: FullType m) where
+data Constraint (m :: Type) (atTy :: FullTypeTag) where
   -- | This pointer has at least this alignment
-  Aligned :: !Alignment -> Constraint m ('FTPtr ft)
+  Aligned :: !Alignment -> Constraint m 'FTPtrTag
   -- | This comparison holds.
-  BVCmp :: (1 <= w) => !L.ICmpOp -> !(NatRepr w) -> !(BV w) -> Constraint m ('FTInt w)
+  BVCmp :: (1 <= w) => !L.ICmpOp -> !(NatRepr w) -> !(BV w) -> Constraint m 'FTIntTag
 
 instance Eq (Constraint m atTy) where
   c1 == c2 =
     case (c1, c2) of
       (Aligned n1, Aligned n2) -> n1 == n2
-      (BVCmp op1 _ bv1, BVCmp op2 _ bv2) -> op1 == op2 && bv1 == bv2
+      (BVCmp op1 nat1 bv1, BVCmp op2 nat2 bv2) ->
+        op1 == op2
+          && case testEquality nat1 nat2 of
+            Just Refl -> bv1 == bv2
+            Nothing -> False
+
+shapeConstraintTag :: ShapeConstraint m atTy -> FullTypeTagRepr atTy
+shapeConstraintTag =
+  \case
+    Allocated {} -> FTPtrTagRepr
+    Initialized {} -> FTPtrTagRepr
+
+constraintTag :: Constraint m atTy -> FullTypeTagRepr atTy
+constraintTag =
+  \case
+    Aligned {} -> FTPtrTagRepr
+    BVCmp {} -> FTIntTagRepr
 
 ppConstraint :: Constraint m ft -> Doc Void
 ppConstraint =
@@ -174,6 +194,12 @@ data RelationalConstraint m (argTypes :: Ctx (FullType m))
 
 -- * Collections of constraints
 
+data ConstrainedGlobal m = forall ft.
+  ConstrainedGlobal
+  { constrainedGlobalType :: FullTypeRepr m ft,
+    constrainedGlobalShape :: ConstrainedShape m ft
+  }
+
 -- | A collection of constraints on the state of a program. These are used to
 -- hold function preconditions deduced by
 -- "UCCrux.LLVM.Classify.classifyBadBehavior".
@@ -182,14 +208,14 @@ data RelationalConstraint m (argTypes :: Ctx (FullType m))
 -- compatibility.
 data Constraints m (argTypes :: Ctx (FullType m)) = Constraints
   { _argConstraints :: Ctx.Assignment (ConstrainedShape m) argTypes,
-    _globalConstraints :: Map L.Symbol (Some (ConstrainedShape m)),
+    _globalConstraints :: Map L.Symbol (ConstrainedGlobal m),
     _relationalConstraints :: [RelationalConstraint m argTypes]
   }
 
 argConstraints :: Simple Lens (Constraints m argTypes) (Ctx.Assignment (ConstrainedShape m) argTypes)
 argConstraints = lens _argConstraints (\s v -> s {_argConstraints = v})
 
-globalConstraints :: Simple Lens (Constraints m globalTypes) (Map L.Symbol (Some (ConstrainedShape m)))
+globalConstraints :: Simple Lens (Constraints m globalTypes) (Map L.Symbol (ConstrainedGlobal m))
 globalConstraints = lens _globalConstraints (\s v -> s {_globalConstraints = v})
 
 relationalConstraints :: Simple Lens (Constraints m argTypes) [RelationalConstraint m argTypes]
@@ -206,7 +232,7 @@ emptyArgConstraints argTypes =
   fmapFC
     ( \argType ->
         ConstrainedShape
-          (fmapFC (\_ -> Compose []) $ Shape.minimal argType)
+          (fmapFC (\_ -> ConstraintList []) $ Shape.minimal argType)
     )
     argTypes
 
@@ -264,12 +290,12 @@ ppConstraints (Constraints args globCs relCs) =
         ]
     )
   where
-    ppConstraints' (Compose constraints) = PP.vsep (map ppConstraint constraints)
+    ppConstraints' (ConstraintList constraints) = PP.vsep (map ppConstraint constraints)
     nestSep = PP.nest 2 . PP.vsep
 
 isEmpty :: Constraints m argTypes -> Bool
 isEmpty (Constraints args globs rels) =
-  allFC (Shape.isMinimal (null . getCompose) . getConstrainedShape) args
+  allFC (Shape.isMinimal (null . getConstraintList) . getConstrainedShape) args
     && Map.null globs
     && null rels
 
@@ -277,17 +303,20 @@ isEmpty (Constraints args globs rels) =
 
 -- * 'ConstrainedShape'
 
+newtype ConstraintList m (ft :: FullType m) = ConstraintList
+  {getConstraintList :: [Constraint m (FullTypeToTag ft)]}
+
 -- | A specification of the shape (memory layout) of a value and constraints on
 -- it. See also the comment on 'Constraint'.
 --
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
 newtype ConstrainedShape m (ft :: FullType m) = ConstrainedShape
-  {getConstrainedShape :: Shape m (Compose [] (Constraint m)) ft}
+  {getConstrainedShape :: Shape m (ConstraintList m) ft}
 
 instance Eq (ConstrainedShape m ft) where
   ConstrainedShape shape1 == ConstrainedShape shape2 =
-    Shape.eqShape (\(Compose c1) (Compose c2) -> c1 == c2) shape1 shape2
+    Shape.eqShape (\(ConstraintList c1) (ConstraintList c2) -> c1 == c2) shape1 shape2
 
 joinLeft :: (a -> b) -> Either a (Either b c) -> Either b c
 joinLeft f =
@@ -324,7 +353,7 @@ expand ::
   ModuleTypes m ->
   (forall ft'. tag ft') ->
   FullTypeRepr m ft ->
-  ShapeConstraint m ft ->
+  ShapeConstraint m (FullTypeToTag ft) ->
   Shape m tag ft ->
   (Maybe RedundantExpansion, Shape m tag ft)
 expand mts minimalTag ftRepr shapeConstraint shape =
@@ -406,23 +435,63 @@ ppExpansionError =
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
 data NewConstraint m (argTypes :: Ctx (FullType m))
-  = forall atTy. NewShapeConstraint (SomeInSelector m argTypes atTy) (ShapeConstraint m atTy)
-  | forall atTy. NewConstraint (SomeInSelector m argTypes atTy) (Constraint m atTy)
+  = forall atTy.
+    NewShapeConstraint
+      (SomeInSelector m argTypes atTy)
+      (ShapeConstraint m (FullTypeToTag atTy))
+  | forall atTy.
+    NewConstraint
+      (SomeInSelector m argTypes atTy)
+      (Constraint m (FullTypeToTag atTy))
   | NewRelationalConstraint (RelationalConstraint m argTypes)
 
 -- | Add a newly-deduced constraint to an existing set of constraints.
 addConstraint ::
-  Ctx.Assignment (FullTypeRepr m) argTypes ->
   ModuleTypes m ->
+  Ctx.Assignment (FullTypeRepr m) argTypes ->
   Constraints m argTypes ->
   NewConstraint m argTypes ->
   Either ExpansionError (Constraints m argTypes)
-addConstraint argTypes mts constraints =
+addConstraint mts argTypes constraints =
   \case
-    NewConstraint (SomeInSelector (SelectGlobal _symbol _cursor)) _constraint ->
-      unimplemented "addConstraint" Unimplemented.ConstrainGlobal
-    NewShapeConstraint (SomeInSelector (SelectGlobal _symbol _cursor)) _shapeConstraint ->
-      unimplemented "addConstraint" Unimplemented.ConstrainGlobal
+    NewConstraint (SomeInSelector (SelectGlobal symbol cursor)) constraint ->
+      constraints & globalConstraints . at symbol
+        %%~ \case
+          Nothing -> panic "addConstraint" ["Global not found"]
+          Just (ConstrainedGlobal ft (ConstrainedShape shape)) ->
+            case checkTag (constraintTag constraint) ft of
+              Nothing -> panic "addConstraint" ["Ill-typed global constraint"]
+              Just Refl ->
+                case checkCompatibility mts cursor ft of
+                  Nothing -> panic "addConstraint" ["Ill-typed global cursor"]
+                  Just cursor' ->
+                    Just
+                      . ConstrainedGlobal ft
+                      . ConstrainedShape
+                      <$> addOneConstraint
+                        shape
+                        cursor'
+                        constraint
+    NewShapeConstraint (SomeInSelector (SelectGlobal symbol cursor)) shapeConstraint ->
+      constraints & globalConstraints . at symbol
+        %%~ \case
+          Nothing -> panic "addConstraint" ["Global not found"]
+          Just (ConstrainedGlobal ft (ConstrainedShape shape)) ->
+            case checkTag (shapeConstraintTag shapeConstraint) ft of
+              Nothing -> panic "addConstraint" ["Ill-typed global constraint"]
+              Just Refl ->
+                case checkCompatibility mts cursor ft of
+                  Nothing -> panic "addConstraint" ["Ill-typed global cursor"]
+                  Just cursor' ->
+                    Just
+                      . ConstrainedGlobal ft
+                      . ConstrainedShape
+                      <$> _
+    -- <$> addOneShapeConstraint
+    --   (seekType mts cursor ft)
+    --   shape
+    --   cursor'
+    --   shapeConstraint
     NewConstraint (SomeInSelector SelectReturn {}) _constraint ->
       unimplemented "addConstraint" Unimplemented.ConstrainReturnValue
     NewShapeConstraint (SomeInSelector SelectReturn {}) _constraint ->
@@ -431,25 +500,54 @@ addConstraint argTypes mts constraints =
       constraints & argConstraints . ixF' idx
         %%~ ( \(ConstrainedShape shape) ->
                 ConstrainedShape
-                  <$> first
-                    ExpShapeSeekError
-                    (fst <$> Shape.modifyTag (coerce (constraint :)) shape cursor)
+                  <$> addOneConstraint
+                    shape
+                    cursor
+                    constraint
             )
     NewShapeConstraint (SomeInSelector (SelectArgument idx cursor)) shapeConstraint ->
       constraints & argConstraints . ixF' idx
         %%~ ( \(ConstrainedShape shape) ->
                 ConstrainedShape
-                  <$> joinLeft
-                    ExpShapeSeekError
-                    ( let doExpand shape' =
-                            case expand mts (Compose []) (seekType mts cursor (argTypes ^. ixF' idx)) shapeConstraint shape' of
-                              -- TODO(lb): Maybe warn here, there's a risk of an
-                              -- infinite loop if there's a bug in
-                              -- classification.
-                              (Just _redundant, result) -> Right result
-                              (Nothing, result) -> Right result
-                       in Shape.modifyA' doExpand shape cursor
-                    )
+                  <$> addOneShapeConstraint
+                    (seekType mts cursor (argTypes ^. ixF' idx))
+                    shape
+                    cursor
+                    shapeConstraint
             )
     NewRelationalConstraint relationalConstraint ->
       Right $ constraints & relationalConstraints %~ (relationalConstraint :)
+  where
+    addOneConstraint ::
+      Shape m (ConstraintList m) ft ->
+      Cursor m ft atTy ->
+      Constraint m (FullTypeToTag atTy) ->
+      Either ExpansionError (Shape m (ConstraintList m) ft)
+    addOneConstraint shape cursor constraint =
+      first
+        ExpShapeSeekError
+        (fst <$> Shape.modifyTag (coerce (constraint :)) shape cursor)
+
+    -- addOneShapeConstraint ::
+    --   FullTypeRepr m atTy ->
+    --   Shape m (ConstraintList m) ft ->
+    --   Cursor m ft atTy ->
+    --   ShapeConstraint m (FullTypeToTag atTy) ->
+    --   Either ExpansionError (Shape m (ConstraintList m) ft)
+    addOneShapeConstraint ftRepr shape cursor shapeConstraint =
+      joinLeft
+        ExpShapeSeekError
+        ( let doExpand shape' =
+                case expand
+                  mts
+                  (ConstraintList [])
+                  ftRepr
+                  shapeConstraint
+                  shape' of
+                  -- TODO(lb): Maybe warn here, there's a risk of an
+                  -- infinite loop if there's a bug in
+                  -- classification.
+                  (Just _redundant, result) -> Right result
+                  (Nothing, result) -> Right result
+           in Shape.modifyA' doExpand shape cursor
+        )
