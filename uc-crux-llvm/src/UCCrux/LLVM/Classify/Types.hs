@@ -47,6 +47,8 @@ import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 import qualified Prettyprinter.Render.Text as PP
 
+import qualified Text.LLVM.AST as L
+
 import           Data.Parameterized.Ctx (Ctx)
 
 import qualified What4.ProgramLoc as What4
@@ -83,6 +85,7 @@ data TruePositiveTag
   | TagReadUninitializedHeap
   | TagCallNonFunctionPointer
   | TagFloatToPointer
+  | TagDerefFunctionPointer
   deriving (Eq, Ord)
 
 data TruePositive
@@ -99,6 +102,7 @@ data TruePositive
   | ReadUninitializedHeap !String -- program location of allocation
   | CallNonFunctionPointer !String -- program location of allocation
   | FloatToPointer
+  | DerefFunctionPointer !L.Symbol -- Name of function
   deriving (Eq, Ord)
 
 data LocatedTruePositive = LocatedTruePositive
@@ -131,6 +135,7 @@ truePositiveTag =
     ReadUninitializedHeap {} -> TagReadUninitializedHeap
     CallNonFunctionPointer {} -> TagCallNonFunctionPointer
     FloatToPointer {} -> TagFloatToPointer
+    DerefFunctionPointer {} -> TagDerefFunctionPointer
 
 ppTruePositiveTag :: TruePositiveTag -> Text
 ppTruePositiveTag =
@@ -148,6 +153,7 @@ ppTruePositiveTag =
     TagReadUninitializedHeap -> "Read from uninitialized heap allocation"
     TagCallNonFunctionPointer -> "Called a pointer that wasn't a function pointer"
     TagFloatToPointer -> "Treated float as pointer"
+    TagDerefFunctionPointer -> "Dereferenced function pointer"
 
 ppTruePositive :: TruePositive -> Text
 ppTruePositive =
