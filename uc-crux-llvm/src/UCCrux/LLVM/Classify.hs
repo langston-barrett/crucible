@@ -126,9 +126,11 @@ elemsFromOffset dl mts offset partType =
 unclass ::
   (MonadIO f, What4.IsExpr (What4.SymExpr sym)) =>
   AppContext ->
+  -- | Simulation error (for the source position)
+  Crucible.SimError ->
   LLVMErrors.BadBehavior sym ->
   f (Explanation m arch argTypes)
-unclass appCtx badBehavior =
+unclass appCtx simError badBehavior =
   do
     liftIO $ (appCtx ^. log) Hi ("Couldn't classify error." :: Text)
     pure $
@@ -136,9 +138,11 @@ unclass appCtx badBehavior =
         UUnclassified $
           case badBehavior of
             LLVMErrors.BBUndefinedBehavior ub ->
-              UnclassifiedUndefinedBehavior (UB.explain ub) (Some ub)
+              UnclassifiedUndefinedBehavior loc (UB.explain ub) (Some ub)
             LLVMErrors.BBMemoryError memoryError ->
-              UnclassifiedMemoryError (MemError.explain memoryError)
+              UnclassifiedMemoryError loc (MemError.explain memoryError)
+  where
+    loc = Crucible.simErrorLoc simError
 
 unfixed ::
   MonadIO f => AppContext -> Unfixed -> f (Explanation m arch argTypes)
@@ -245,7 +249,7 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
               do
                 int <- liftIO $ getConcretePointerBlock ptr
                 case int of
-                  Nothing -> unclass appCtx badBehavior
+                  Nothing -> unclass appCtx simError badBehavior
                   Just _ ->
                     do
                       let diagnosis = Diagnosis DiagnoseFreeBadOffset (selectWhere selector)
@@ -314,7 +318,7 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                                 "(" <> Text.pack (show (LLVMPtr.ppPtr ptr)) <> ")"
                               ]
                         unfixable appCtx tag
-            _ -> unclass appCtx badBehavior
+            _ -> unclass appCtx simError badBehavior
     LLVMErrors.BBUndefinedBehavior
       (UB.MemsetInvalidRegion (Crucible.RV ptr) _fillByte (Crucible.RV len)) ->
         do
@@ -337,12 +341,12 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                                   (elemsFromOffset' concreteLen partTypeRepr)
                               )
                           )
-            _ -> unclass appCtx badBehavior
+            _ -> unclass appCtx simError badBehavior
     LLVMErrors.BBUndefinedBehavior
       (UB.PoisonValueCreated poison) ->
         classifyPoison appCtx sym annotations poison
           >>= \case
-            Nothing -> unclass appCtx badBehavior
+            Nothing -> unclass appCtx simError badBehavior
             Just expl -> pure expl
     LLVMErrors.BBMemoryError
       ( MemError.MemoryError
@@ -368,7 +372,7 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                           -- TODO: This should probably be an error, it definitely *can*
                           -- arise from a use-after-free of an argument see
                           -- test/programs/use_after_free.c
-                          unclass appCtx badBehavior
+                          unclass appCtx simError badBehavior
                         Right False ->
                           do
                             let diagnosis =
@@ -385,7 +389,7 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                 notPtr <- liftIO $ notAPointer sym ptr
                 case notPtr of
                   Just True -> truePositive WriteNonPointer
-                  _ -> unclass appCtx badBehavior
+                  _ -> unclass appCtx simError badBehavior
             -- If the "pointer" concretely wasn't a pointer, it's a bug.
             _ -> requirePossiblePointer WriteNonPointer ptr
     LLVMErrors.BBMemoryError
@@ -451,10 +455,10 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                       -- variable.
                       if Set.null skipped
                         then truePositive (ReadUninitializedStack loc)
-                        else unclass appCtx badBehavior
+                        else unclass appCtx simError badBehavior
                   Just (G.AllocInfo G.HeapAlloc _sz _mut _align loc) ->
                     if loc == mallocLocation
-                      then unclass appCtx badBehavior
+                      then unclass appCtx simError badBehavior
                       else truePositive (ReadUninitializedHeap loc)
                   Just (G.AllocInfo G.GlobalAlloc _sz _mut _align _loc) ->
                     case flip Map.lookup (LLVMMem.memImplSymbolMap memImpl) =<< blk of
@@ -502,10 +506,10 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                       truePositive (CallNonFunctionPointer loc)
                   Just (G.AllocInfo G.HeapAlloc _sz _mut _align loc) ->
                     if loc == mallocLocation
-                      then unclass appCtx badBehavior
+                      then unclass appCtx simError badBehavior
                       else truePositive (CallNonFunctionPointer loc)
-                  _ -> unclass appCtx badBehavior
-    _ -> unclass appCtx badBehavior
+                  _ -> unclass appCtx simError badBehavior
+    _ -> unclass appCtx simError badBehavior
   where
     expectPointerType ::
       FullTypeRepr m ft ->
@@ -614,7 +618,7 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
                           oneConstraint selector (BVCmp L.Ine w (BV.mkBV w 0))
                         )
                   _ -> panic "classify" ["Expected integer type"]
-            _ -> unclass appCtx badBehavior
+            _ -> unclass appCtx simError badBehavior
         Just _ -> truePositive truePos
 
     argName :: Ctx.Index argTypes tp -> String
@@ -694,4 +698,4 @@ classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.
         notPtr <- liftIO $ notAPointer sym ptr
         case (notPtr, null (getAnyPtrOffsetAnn ptr)) of
           (Just True, True) -> truePositive pos
-          _ -> unclass appCtx badBehavior
+          _ -> unclass appCtx simError badBehavior
