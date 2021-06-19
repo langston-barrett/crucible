@@ -43,7 +43,7 @@ import Crux.Log (OutputConfig(..))
 import Crux.LLVM.Config (throwCError, CError(MissingFun), memOpts)
 import Crux.LLVM.Overrides
 
-import           UCCrux.LLVM.Classify.Types (Explanation, partitionExplanations)
+import           UCCrux.LLVM.Classify.Types (Located(locatedValue), Explanation, partitionExplanations)
 import           UCCrux.LLVM.Config (UCCruxLLVMOptions)
 import qualified UCCrux.LLVM.Config as Config
 import           UCCrux.LLVM.Constraints (Constraints, NewConstraint, ppConstraints, emptyConstraints, addConstraint, ppExpansionError)
@@ -90,7 +90,7 @@ bugfindingLoop appCtx modCtx funCtx cfg cruxOpts memOptions halloc =
             simResult <- runSim constraints
             let newExpls = Sim.explanations simResult
             let (_, newConstraints, _, _) = partitionExplanations newExpls
-            let (_, newConstraints') = unzip newConstraints
+            let (_, newConstraints') = unzip (map locatedValue newConstraints)
             let allConstraints = addConstraints constraints (concat newConstraints')
             let allUnsoundness = unsoundness <> Sim.unsoundness simResult
             let allResults = simResult : results
@@ -126,12 +126,16 @@ bugfindingLoop appCtx modCtx funCtx cfg cruxOpts memOptions halloc =
 
     -- Given these results from simulation, should we continue looping?
     shouldStop ::
-      [Explanation m arch argTypes] ->
+      [Located (Explanation m arch argTypes)] ->
       Bool
     shouldStop expls =
       let (truePositives, constraints, uncertain, resourceExhausted) =
             partitionExplanations expls
-       in case (null constraints, truePositives, not (null uncertain), not (null resourceExhausted)) of
+       in case ( null constraints,
+                 truePositives,
+                 not (null uncertain),
+                 not (null resourceExhausted)
+               ) of
             (True, [], False, _) ->
               -- No new constraints were learned, nor were any bugs found, nor
               -- was there any uncertain results. The code is conditionally
@@ -145,13 +149,13 @@ bugfindingLoop appCtx modCtx funCtx cfg cruxOpts memOptions halloc =
 
     makeResult ::
       Constraints m argTypes ->
-      [Explanation m arch argTypes] ->
+      [Located (Explanation m arch argTypes)] ->
       Unsoundness ->
       BugfindingResult m arch argTypes
     makeResult constraints expls unsoundness =
       let (truePositives, newConstraints, uncertain, resourceExhausted) =
             partitionExplanations expls
-          (precondTags, _) = unzip newConstraints
+          (precondTags, _) = unzip (map locatedValue newConstraints)
        in BugfindingResult
             uncertain
             precondTags
