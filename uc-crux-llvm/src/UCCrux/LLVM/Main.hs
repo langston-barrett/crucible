@@ -90,6 +90,7 @@ import           UCCrux.LLVM.Run.EntryPoints (makeEntryPointsOrThrow)
 import           UCCrux.LLVM.Run.Explore (explore)
 import           UCCrux.LLVM.Run.Result (BugfindingResult(..), SomeBugfindingResult(..))
 import qualified UCCrux.LLVM.Run.Result as Result
+import           UCCrux.LLVM.Run.Simulate (noSetupAction)
 import           UCCrux.LLVM.Run.Loop (loopOnFunctions)
 {- ORMOLU_ENABLE -}
 
@@ -179,6 +180,7 @@ mainWithConfigs appCtx cruxOpts topConf =
              loopOnFunctions
                appCtx
                modCtx
+               noSetupAction
                halloc
                cruxOpts
                llOpts

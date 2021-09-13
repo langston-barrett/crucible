@@ -58,6 +58,7 @@ import           UCCrux.LLVM.Run.Explore.Config (ExploreConfig)
 import qualified UCCrux.LLVM.Run.Explore.Config as ExConfig
 import           UCCrux.LLVM.Run.Result (SomeBugfindingResult(..))
 import qualified UCCrux.LLVM.Run.Result as Result
+import           UCCrux.LLVM.Run.Simulate (noSetupAction)
 import           UCCrux.LLVM.Run.Loop (loopOnFunction)
 import           UCCrux.LLVM.Stats (Stats(unimplementedFreq), getStats, ppStats)
 {- ORMOLU_ENABLE -}
@@ -93,7 +94,7 @@ exploreOne appCtx modCtx cruxOpts llOpts exOpts halloc dir defnSym =
         maybeResult <-
           withTimeout
             (secondsToMicroseconds (ExConfig.exploreTimeout exOpts))
-            (loopOnFunction appCtx modCtx halloc cruxOpts llOpts defnSym)
+            (loopOnFunction appCtx modCtx noSetupAction halloc cruxOpts llOpts defnSym)
         case maybeResult of
           Right (Right (SomeBugfindingResult result _trace)) ->
             do

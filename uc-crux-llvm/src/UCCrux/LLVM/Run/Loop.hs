@@ -43,9 +43,7 @@ import qualified Lang.Crucible.CFG.Core as Crucible
 import qualified Lang.Crucible.FunctionHandle as Crucible
 
 -- crucible-llvm
-import Lang.Crucible.LLVM.MemModel (withPtrWidth)
 import Lang.Crucible.LLVM.Extension( LLVM )
-import Lang.Crucible.LLVM.Translation (llvmPtrWidth, transContext)
 
 -- crux
 import Crux.Config.Common
@@ -60,7 +58,7 @@ import           UCCrux.LLVM.Constraints (Constraints, NewConstraint, ppConstrai
 import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName, functionNameToString)
 import           UCCrux.LLVM.Context.App (AppContext, log)
 import           UCCrux.LLVM.Context.Function (FunctionContext, argumentFullTypes, makeFunctionContext, functionName, ppFunctionContextError)
-import           UCCrux.LLVM.Context.Module (ModuleContext, moduleTranslation, CFGWithTypes(..), findFun, llvmModule, defnTypes)
+import           UCCrux.LLVM.Context.Module (ModuleContext, CFGWithTypes(..), findFun, llvmModule, defnTypes, withModulePtrWidth)
 import           UCCrux.LLVM.Errors.Panic (panic)
 import           UCCrux.LLVM.Errors.Unimplemented (Unimplemented, catchUnimplemented)
 import           UCCrux.LLVM.Logging (Verbosity(Hi))
@@ -85,15 +83,16 @@ bugfindingLoop ::
   AppContext ->
   ModuleContext m arch ->
   FunctionContext m arch argTypes ->
+  Sim.SetupAction ->
   Crucible.CFG LLVM blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   LLVMOptions ->
   Crucible.HandleAllocator ->
   IO (BugfindingResult m arch argTypes, Seq (Sim.UCCruxSimulationResult m arch argTypes))
-bugfindingLoop appCtx modCtx funCtx cfg cruxOpts llvmOpts halloc =
+bugfindingLoop appCtx modCtx funCtx setupAction cfg cruxOpts llvmOpts halloc =
   do
     let runSim preconds =
-          Sim.runSimulator appCtx modCtx funCtx halloc preconds cfg cruxOpts llvmOpts
+          Sim.runSimulator appCtx modCtx funCtx halloc preconds setupAction cfg cruxOpts llvmOpts
 
     -- Loop, learning preconditions and reporting errors
     let loop constraints results unsoundness =
@@ -191,36 +190,34 @@ loopOnFunction ::
   Crux.SupportsCruxLogMessage msgs =>
   AppContext ->
   ModuleContext m arch ->
+  Sim.SetupAction ->
   Crucible.HandleAllocator ->
   CruxOptions ->
   LLVMOptions ->
   DefnSymbol m ->
   IO (Either (Panic Unimplemented) Result.SomeBugfindingResult)
-loopOnFunction appCtx modCtx halloc cruxOpts llOpts fn =
+loopOnFunction appCtx modCtx setupAction halloc cruxOpts llOpts fn =
   catchUnimplemented $
-    llvmPtrWidth
-      (modCtx ^. moduleTranslation . transContext)
-      ( \ptrW ->
-          withPtrWidth
-            ptrW
-            ( do
-                CFGWithTypes cfg argFTys _retTy _varArgs <-
-                  pure (findFun modCtx (FuncDefnSymbol fn))
-                case makeFunctionContext modCtx fn argFTys (Crucible.cfgArgTypes cfg) of
-                  Left err -> panic "loopOnFunction" [Text.unpack (ppFunctionContextError err)]
-                  Right funCtx ->
-                    do
-                      (appCtx ^. log) Hi $ "Checking function " <> (funCtx ^. functionName)
-                      uncurry SomeBugfindingResult
-                        <$> bugfindingLoop
-                          appCtx
-                          modCtx
-                          funCtx
-                          cfg
-                          cruxOpts
-                          llOpts
-                          halloc
-            )
+    withModulePtrWidth
+      modCtx
+      ( do
+          CFGWithTypes cfg argFTys _retTy _varArgs <-
+            pure (findFun modCtx (FuncDefnSymbol fn))
+          case makeFunctionContext modCtx fn argFTys (Crucible.cfgArgTypes cfg) of
+            Left err -> panic "loopOnFunction" [Text.unpack (ppFunctionContextError err)]
+            Right funCtx ->
+              do
+                (appCtx ^. log) Hi $ "Checking function " <> (funCtx ^. functionName)
+                uncurry SomeBugfindingResult
+                  <$> bugfindingLoop
+                    appCtx
+                    modCtx
+                    funCtx
+                    setupAction
+                    cfg
+                    cruxOpts
+                    llOpts
+                    halloc
       )
 
 -- | Postcondition: The keys of the returned map are exactly the input function
@@ -230,25 +227,22 @@ loopOnFunctions ::
   Crux.SupportsCruxLogMessage msgs =>
   AppContext ->
   ModuleContext m arch ->
+  Sim.SetupAction ->
   Crucible.HandleAllocator ->
   CruxOptions ->
   LLVMOptions ->
   EntryPoints m ->
   IO (Map.Map String SomeBugfindingResult)
-loopOnFunctions appCtx modCtx halloc cruxOpts llOpts entries =
-  Map.fromList
-    <$> llvmPtrWidth
-      (modCtx ^. moduleTranslation . transContext)
-      ( \ptrW ->
-          withPtrWidth
-            ptrW
-            ( for (getEntryPoints entries) $
-                \entry ->
-                  let L.Symbol name = getDefnSymbol entry
-                  in (name,) . either throw id
-                       <$> loopOnFunction appCtx modCtx halloc cruxOpts llOpts entry
-            )
-      )
+loopOnFunctions appCtx modCtx setupAction halloc cruxOpts llOpts entries =
+  Map.fromList <$>
+    withModulePtrWidth
+      modCtx
+        ( for (getEntryPoints entries) $
+            \entry ->
+              let L.Symbol name = getDefnSymbol entry
+              in (name,) . either throw id
+                    <$> loopOnFunction appCtx modCtx setupAction halloc cruxOpts llOpts entry
+        )
 
 -- | Given two modules, run the bugfinding loop on the specified functions
 -- (which need to be present in both modules), or if @--explore@ was set, run the
@@ -259,13 +253,14 @@ zipResults ::
   AppContext ->
   ModuleContext m1 arch1 ->
   ModuleContext m2 arch2 ->
+  Sim.SetupAction ->
   Crucible.HandleAllocator ->
   CruxOptions ->
   LLVMOptions ->
   -- | Entry points. If empty, check functions that are in both modules.
   [FunctionName] ->
   IO (Map.Map String (SomeBugfindingResult, SomeBugfindingResult))
-zipResults appCtx modCtx1 modCtx2 halloc cruxOpts llOpts entries =
+zipResults appCtx modCtx1 modCtx2 setupAction halloc cruxOpts llOpts entries =
   do
     let getFuncs modc =
           Set.fromList
@@ -291,8 +286,8 @@ zipResults appCtx modCtx1 modCtx2 halloc cruxOpts llOpts entries =
                else map functionNameToString entries)
     entries1 <- makeEntries modCtx1
     entries2 <- makeEntries modCtx2
-    results1 <- loopOnFunctions appCtx modCtx1 halloc cruxOpts llOpts entries1
-    results2 <- loopOnFunctions appCtx modCtx2 halloc cruxOpts llOpts entries2
+    results1 <- loopOnFunctions appCtx modCtx1 setupAction halloc cruxOpts llOpts entries1
+    results2 <- loopOnFunctions appCtx modCtx2 setupAction halloc cruxOpts llOpts entries2
     pure $
       -- Note: It's a postcondition of loopOnFunctions that these two maps
       -- have the same keys.

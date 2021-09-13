@@ -66,7 +66,7 @@ import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName)
 import           UCCrux.LLVM.Context.App (AppContext, log)
 import           UCCrux.LLVM.Context.Module (ModuleContext)
 import           UCCrux.LLVM.Logging (Verbosity(Low))
-import           UCCrux.LLVM.Run.Simulate (UCCruxSimulationResult, explanations)
+import           UCCrux.LLVM.Run.Simulate (UCCruxSimulationResult, explanations, noSetupAction)
 import           UCCrux.LLVM.Run.Result (SomeBugfindingResult(..))
 import           UCCrux.LLVM.Run.Loop (zipResults)
 {- ORMOLU_ENABLE -}
@@ -210,6 +210,7 @@ getCrashDiffs appCtx modCtx1 modCtx2 halloc cruxOpts llOpts entries =
         appCtx
         modCtx1
         modCtx2
+        noSetupAction
         halloc
         cruxOpts
         llOpts

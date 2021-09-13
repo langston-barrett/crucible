@@ -86,6 +86,8 @@ import           UCCrux.LLVM.Overrides.Skip (SkipOverrideName, unsoundSkipOverri
 import           UCCrux.LLVM.Overrides.Unsound (UnsoundOverrideName, unsoundOverrides)
 import           UCCrux.LLVM.FullType.Type (FullType, MapToCrucibleType)
 import           UCCrux.LLVM.PP (ppRegMap)
+import           UCCrux.LLVM.Run.Simulate.InitState (InitState)
+import qualified UCCrux.LLVM.Run.Simulate.InitState as InitState
 import           UCCrux.LLVM.Run.Unsoundness (Unsoundness(Unsoundness))
 import           UCCrux.LLVM.Setup (setupExecution, SetupResult(SetupResult))
 import           UCCrux.LLVM.Setup.Assume (assume)
@@ -101,10 +103,12 @@ simulateLLVM ::
   IORef (Set SkipOverrideName) ->
   IORef (Set UnsoundOverrideName) ->
   Constraints m argTypes ->
+  -- | Additional setup action (e.g. to install additional overrides)
+  InitState m ->
   Crucible.CFG LLVM blocks (MapToCrucibleType arch argTypes) ret ->
   LLVMOptions ->
   Crux.SimulatorCallback msgs
-simulateLLVM appCtx modCtx funCtx halloc explRef skipOverrideRef unsoundOverrideRef constraints cfg llvmOpts =
+simulateLLVM appCtx modCtx funCtx halloc explRef skipOverrideRef unsoundOverrideRef constraints initState cfg llvmOpts =
   Crux.SimulatorCallback $ \sym _maybeOnline ->
     do
       let trans = modCtx ^. moduleTranslation
@@ -165,6 +169,10 @@ simulateLLVM appCtx modCtx funCtx halloc explRef skipOverrideRef unsoundOverride
                     []
                     (uOverrides ++ sOverrides)
                     llvmCtxt
+                  InitState.run
+                    initState
+                    modCtx
+                    sym
                   liftIO $ (appCtx ^. log) Hi $ "Running " <> funCtx ^. functionName <> " on arguments..."
                   printed <- ppRegMap modCtx funCtx sym mem args
                   mapM_ (liftIO . (appCtx ^. log) Hi . Text.pack . show) printed
@@ -245,11 +253,13 @@ runSimulator ::
   FunctionContext m arch argTypes ->
   Crucible.HandleAllocator ->
   Constraints m argTypes ->
+  -- | Additional setup action (e.g. to install additional overrides)
+  InitState m ->
   Crucible.CFG LLVM blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   LLVMOptions ->
   IO (UCCruxSimulationResult m arch argTypes)
-runSimulator appCtx modCtx funCtx halloc preconditions cfg cruxOpts llvmOpts =
+runSimulator appCtx modCtx funCtx halloc preconditions setupAction cfg cruxOpts llvmOpts =
   do
     explRef <- newIORef []
     skipOverrideRef <- newIORef Set.empty
@@ -266,6 +276,7 @@ runSimulator appCtx modCtx funCtx halloc preconditions cfg cruxOpts llvmOpts =
             skipOverrideRef
             unsoundOverrideRef
             preconditions
+            setupAction
             cfg
             llvmOpts
         )

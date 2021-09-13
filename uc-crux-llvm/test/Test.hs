@@ -39,7 +39,6 @@ currently \"unclassified\", the current state of the code isn't wrong per se,
 but may be imprecise. If that's not the current state, such a comment indicates
 a very real bug.
 -}
-{-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -80,11 +79,14 @@ import           UCCrux.LLVM.FullType (FullType(..), FullTypeRepr(..))
 import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName, functionNameFromString)
 import           UCCrux.LLVM.Overrides.Skip (SkipOverrideName(..))
 import           UCCrux.LLVM.Overrides.Unsound (UnsoundOverrideName(..))
-import           UCCrux.LLVM.Run.EntryPoints (makeEntryPointsOrThrow)
+import qualified UCCrux.LLVM.Run.EntryPoints as EntryPoints
+import           UCCrux.LLVM.Run.Loop (loopOnFunction)
 import           UCCrux.LLVM.Run.Result (DidHitBounds(DidHitBounds, DidntHitBounds))
 import qualified UCCrux.LLVM.Run.Result as Result
 import           UCCrux.LLVM.Run.Unsoundness (Unsoundness(..))
 
+-- Tests
+import qualified Check
 import qualified Utils
 {- ORMOLU_ENABLE -}
 
@@ -121,7 +123,7 @@ findBugs llvmModule file fns =
         halloc
         cruxOpts
         llOpts
-        =<< makeEntryPointsOrThrow (modCtx ^. defnTypes) fns
+        =<< EntryPoints.makeEntryPointsOrThrow (modCtx ^. defnTypes) fns
 
 getCrashDiff ::
   FilePath ->
@@ -1524,7 +1526,8 @@ main =
   TT.defaultMain $
     TT.testGroup
       "uc-crux-llvm"
-      [ inFileTests,
+      [ Check.checkOverrideTests,
+        inFileTests,
         moduleTests,
         isUnimplemented
           "read_extern_global_unsized_array.c"

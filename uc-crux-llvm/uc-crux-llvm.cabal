@@ -47,10 +47,10 @@ library
     UCCrux.LLVM.FullType.CrucibleType
     UCCrux.LLVM.FullType.MemType
     UCCrux.LLVM.FullType.Memory
-    UCCrux.LLVM.FullType.Translation
-    UCCrux.LLVM.FullType.Type
     UCCrux.LLVM.FullType.ReturnType
     UCCrux.LLVM.FullType.StorageType
+    UCCrux.LLVM.FullType.Translation
+    UCCrux.LLVM.FullType.Type
     UCCrux.LLVM.FullType.VarArgs
     UCCrux.LLVM.Logging
     UCCrux.LLVM.Main
@@ -59,6 +59,8 @@ library
     UCCrux.LLVM.Module
     UCCrux.LLVM.Newtypes.FunctionName
     UCCrux.LLVM.Newtypes.Seconds
+    UCCrux.LLVM.Overrides.Basic
+    UCCrux.LLVM.Overrides.Check
     UCCrux.LLVM.Overrides.Skip
     UCCrux.LLVM.Overrides.Unsound
     UCCrux.LLVM.PP
@@ -68,6 +70,7 @@ library
     UCCrux.LLVM.Run.Loop
     UCCrux.LLVM.Run.Result
     UCCrux.LLVM.Run.Simulate
+    UCCrux.LLVM.Run.Simulate.InitState
     UCCrux.LLVM.Run.Unsoundness
     UCCrux.LLVM.Setup
     UCCrux.LLVM.Setup.Assume
@@ -94,6 +97,10 @@ library
     crucible-llvm,
     crux,
     crux-llvm,
+    -- crucible-llvm depends on 'extra', but this package uses just a few
+    -- functions from it; so if crucible-llvm ever drops that dependency, it
+    -- might be worth working around it here.
+    extra,
     directory,
     filepath,
     indexed-traversable,
@@ -142,6 +149,7 @@ test-suite uc-crux-llvm-test
 
   main-is: Test.hs
   other-modules:
+    Check
     Logging
     Paths_uc_crux_llvm
     Utils

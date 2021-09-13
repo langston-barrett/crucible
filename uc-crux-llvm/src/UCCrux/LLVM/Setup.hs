@@ -45,6 +45,7 @@ import qualified Text.LLVM.AST as L
 
 import           Data.Parameterized.Classes (IxedF' (ixF'))
 import qualified Data.Parameterized.Context as Ctx
+import qualified Data.Parameterized.Fin as Fin
 import           Data.Parameterized.NatRepr (NatRepr, type (<=), type (+), LeqProof(LeqProof))
 import qualified Data.Parameterized.NatRepr as NatRepr
 import           Data.Parameterized.Some (Some(Some))
@@ -244,7 +245,7 @@ generate sym modCtx ftRepr selector (ConstrainedShape shape) =
                     selector'
                     (ConstrainedShape
                       (vec `Seq.index`
-                        fromIntegral (PVec.indexValue i)))
+                        fromIntegral (Fin.finToNat i)))
                 annotatedPtrAtOffset <-
                   store
                     sym
