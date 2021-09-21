@@ -96,6 +96,7 @@ library
     crux-llvm,
     directory,
     filepath,
+    indexed-traversable,
     lens,
     llvm-pretty,
     lumberjack >= 1.0 && < 1.1,
