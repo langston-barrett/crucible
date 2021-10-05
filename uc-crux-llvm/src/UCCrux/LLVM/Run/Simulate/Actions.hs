@@ -20,8 +20,10 @@ module UCCrux.LLVM.Run.Simulate.Actions
     bindIO,
     PreSimulation(..),
     liftPre,
+    lmapIOPre,
     PostSimulation(..),
     liftIOPost,
+    lmapIOPost,
     PrePost(..),
     ForAllSymInterface(..),
     ForAllSymInterface1(..),
@@ -29,11 +31,18 @@ module UCCrux.LLVM.Run.Simulate.Actions
     SimActions(..),
     SomeSimActions(..),
     andThen,
+    shim,
+    shimIO,
+    addDataIO,
+    passViaIORef,
   )
 where
 
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log)
+import           Control.Monad.IO.Class (liftIO)
+import           Data.IORef (IORef)
+import qualified Data.IORef as IORef
 import           Data.Profunctor (Profunctor(lmap, rmap))
 
 import qualified What4.Expr.Builder as What4
@@ -54,23 +63,23 @@ import           Lang.Crucible.LLVM.TypeContext (TypeContext)
 {- ORMOLU_ENABLE -}
 
 
-newtype MakeArguments argTypes sym a
+newtype MakeArguments argTypes sym b
   = MakeArguments
       { runMakeArguments ::
           sym ->
           IO ( RegMap sym argTypes
              , MemImpl sym
-             , a
+             , b
              )
       }
   deriving (Functor)
 
 bindIO ::
-  MakeArguments argTypes sym a ->
-  (a -> IO b) ->
-  MakeArguments argTypes sym b
+  MakeArguments argTypes sym b ->
+  (b -> IO c) ->
+  MakeArguments argTypes sym c
 bindIO (MakeArguments f) g =
-  MakeArguments (\sym -> f sym >>= \(r, m, a) -> (r, m,) <$> g a)
+  MakeArguments (\sym -> f sym >>= \(r, m, b) -> (r, m,) <$> g b)
 
 -- TODO profunctor
 newtype PreSimulation p sym b a
@@ -122,6 +131,12 @@ instance Profunctor (PreSimulation p sym) where
   lmap f (PreSimulation g) = PreSimulation (\sym a -> g sym (f a))
   rmap = fmap
 
+lmapIOPre ::
+  (c -> IO b) ->
+  PreSimulation p sym b a ->
+  PreSimulation p sym c a
+lmapIOPre f (PreSimulation g) = PreSimulation (\sym c -> g sym =<< liftIO (f c))
+
 -- TODO profunctor
 newtype PostSimulation sym b a
   = PostSimulation
@@ -155,20 +170,33 @@ instance Monad (PostSimulation sym b) where
 liftIOPost :: IO a -> PostSimulation sym b a
 liftIOPost comp = PostSimulation (\_ _ _ _ -> comp)
 
-data PrePost sym b a =
+lmapIOPost ::
+  (c -> IO b) ->
+  PostSimulation sym b a ->
+  PostSimulation sym c a
+lmapIOPost f (PostSimulation g) =
+  PostSimulation (\sym c bb gl ->
+                    do b <- liftIO (f c)
+                       g sym b bb gl)
+
+data PrePost p sym b a =
   PrePost
     { -- | Additional setup actions (e.g. registering overrides)
-      pre :: forall personality. PreSimulation (personality sym) sym b a,
+      pre :: PreSimulation p sym b a,
       -- | What to do after simulation ends
       post :: PostSimulation sym b a
     }
   deriving (Functor)
 
-data SimActions argTypes sym b =
+instance Profunctor (PrePost p sym) where
+  lmap f (PrePost pr po) = PrePost (lmap f pr) (lmap f po)
+  rmap f (PrePost pr po) = PrePost (rmap f pr) (rmap f po)
+
+data SimActions argTypes p sym b =
   SimActions
     { -- | Setup arguments and memory
       makeArguments :: MakeArguments argTypes sym b,
-      prePost :: PrePost sym b ()
+      prePost :: PrePost p sym b ()
     }
 
 -- TODO
@@ -176,7 +204,7 @@ data SimActions argTypes sym b =
 --   SimActions a argTypes sym ->
 --   sym ->
 --   Crucible.OverrideSim
---     (personality sym)
+--     (p sym)
 --     sym
 --     LLVM
 --     (Crucible.RegEntry sym CrucibleTypes.UnitType)
@@ -185,52 +213,112 @@ data SimActions argTypes sym b =
 --     ()
 -- executePre = _
 
-data SomeSimActions argTypes sym =
-  forall b. SomeSimActions (SimActions argTypes sym b)
+data SomeSimActions argTypes p sym =
+  forall b. SomeSimActions (SimActions argTypes p sym b)
+
+-- NOTE(lb): It's a wart that the below types need the sym ~ ExprBuilder
+-- constraint, made necessary by the use of 'asApp' in UCCrux.LLVM.Classify.
+-- We should look into whether the necessary functionality could be more
+-- elegantly exposed from crucible-llvm+What4.
 
 newtype ForAllSymInterface f =
   ForAllSymInterface
     { withSymInterface ::
-        forall sym t s x.
+        forall personality sym t s x.
         (sym ~ What4.ExprBuilder t s x) =>
         IsSymInterface sym =>
         HasLLVMAnn sym =>
-        f sym
+        f (personality sym) sym
     }
 
 newtype ForAllSymInterface1 f a =
   ForAllSymInterface1
     { withSymInterface1 ::
-        forall sym t s x.
+        forall personality sym t s x.
         (sym ~ What4.ExprBuilder t s x) =>
         IsSymInterface sym =>
         HasLLVMAnn sym =>
-        f sym a
+        f (personality sym) sym a
     }
 
 newtype ForAllSymInterface2 f b a =
   ForAllSymInterface2
     { withSymInterface2 ::
-        forall sym t s x.
+        forall personality sym t s x.
         (sym ~ What4.ExprBuilder t s x) =>
         IsSymInterface sym =>
         HasLLVMAnn sym =>
-        f sym b a
+        f (personality sym) sym b a
     }
 
 andThen ::
-  ForAllSymInterface1 (SimActions argTypes) b ->
-  ForAllSymInterface2 PrePost b () ->
-  ForAllSymInterface1 (SimActions argTypes) b
-andThen as pp =
-  ForAllSymInterface1 $
-    case (as, pp) of
-      (ForAllSymInterface1 actions, ForAllSymInterface2 (PrePost pre' post')) ->
-        actions
-          { prePost =
-              let PrePost pre'' post'' = prePost actions
-              in PrePost
-                   { pre = pre'' >> pre',
-                     post = post'' >> post'
-                   }
-          }
+  SimActions argTypes p sym b ->
+  PrePost p sym b () ->
+  SimActions argTypes p sym b
+andThen actions (PrePost pre' post') =
+  actions
+    { prePost =
+        let PrePost pre'' post'' = prePost actions
+        in PrePost
+             { pre = pre'' >> pre',
+               post = post'' >> post'
+             }
+    }
+
+shim ::
+  (b -> c) ->
+  (c -> b) ->
+  SimActions argTypes p sym b ->
+  SimActions argTypes p sym c
+shim forwards backwards actions =
+  actions
+    { makeArguments = forwards <$> makeArguments actions,
+      prePost = lmap backwards (prePost actions)
+    }
+
+shimIO ::
+  (b -> IO c) ->
+  (c -> IO b) ->
+  SimActions argTypes p sym b ->
+  SimActions argTypes p sym c
+shimIO forwards backwards actions =
+  actions
+    { makeArguments =
+        makeArguments actions `bindIO` forwards,
+      prePost = PrePost { pre = lmapIOPre backwards (pre (prePost actions)),
+                          post = lmapIOPost backwards (post (prePost actions))
+                        }
+    }
+
+addDataIO ::
+  (b -> IO c) ->
+  SimActions argTypes p sym b ->
+  SimActions argTypes p sym (b, c)
+addDataIO f = shimIO (\b -> (b,) <$> f b) (return . fst)
+
+-- | Create a fresh IORef in the 'MakeArguments', fill it in the
+-- 'PreSimulation', and consume it in the 'PostSimulation'.
+passViaIORef ::
+  c ->
+  MakeArguments argTypes sym b ->
+  PreSimulation p sym b c ->
+  (c -> PostSimulation sym b ()) ->
+  SimActions argTypes p sym (b, IORef c)
+passViaIORef c0 makeArgs (PreSimulation pr) po =
+  SimActions
+    { makeArguments =
+        makeArgs `bindIO` \b -> (b,) <$> IORef.newIORef c0,
+      prePost =
+        PrePost { pre =
+                    PreSimulation $
+                      \sym (b, ref) ->
+                        (liftIO . IORef.writeIORef ref) =<< pr sym b,
+                  post =
+                    PostSimulation $
+                      \sym (b, ref) bb gl ->
+                        do c <- liftIO (IORef.readIORef ref)
+                           case po c of
+                             PostSimulation f ->
+                               f sym b bb gl
+                }
+    }

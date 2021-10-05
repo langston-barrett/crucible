@@ -109,7 +109,7 @@ unsoundSkipOverrides ::
   -- | Postconditions of each override (constraints on return values)
   Map (FuncSymbol m) (ConstrainedTypedValue m) ->
   [L.Declare] ->
-  OverM personality sym LLVM [OverrideTemplate (personality sym) sym arch rtp l a]
+  OverM personality sym LLVM [OverrideTemplate p sym arch rtp l a]
 unsoundSkipOverrides modCtx sym mtrans usedRef annotationRef postconditions decls =
   do
     let llvmCtx = mtrans ^. transContext
@@ -148,7 +148,7 @@ unsoundSkipOverrides modCtx sym mtrans usedRef annotationRef postconditions decl
 -- function would probably need to take an IORef in which to insert annotations
 -- for values it creates.
 createSkipOverride ::
-  forall m arch sym argTypes personality rtp l a.
+  forall m arch sym argTypes p rtp l a.
   ( IsSymInterface sym,
     HasLLVMAnn sym,
     ArchOk arch,
@@ -162,7 +162,7 @@ createSkipOverride ::
   Maybe (ConstrainedTypedValue m) ->
   L.Declare ->
   FuncSymbol m ->
-  Maybe (OverrideTemplate (personality sym) sym arch rtp l a)
+  Maybe (OverrideTemplate p sym arch rtp l a)
 createSkipOverride modCtx sym usedRef annotationRef postcondition decl funcSym =
   llvmDeclToFunHandleRepr' decl $
     \args ret ->
