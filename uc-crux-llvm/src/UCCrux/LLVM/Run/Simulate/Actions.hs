@@ -5,12 +5,19 @@ Copyright    : (c) Galois, Inc 2021
 License      : BSD3
 Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
+
+This interface is complex, but is intended to allow API consumers to do things
+like set up different overrides for different runs of the symbolic simulator,
+and to pass data between the steps that set up simulation and the steps that
+analyze the outcome of simulation.
 -}
 
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TupleSections #-}
@@ -22,7 +29,6 @@ module UCCrux.LLVM.Run.Simulate.Actions
     liftPre,
     lmapIOPre,
     PostSimulation(..),
-    liftIOPost,
     lmapIOPost,
     PrePost(..),
     ForAllSymInterface(..),
@@ -30,17 +36,22 @@ module UCCrux.LLVM.Run.Simulate.Actions
     ForAllSymInterface2(..),
     SimActions(..),
     SomeSimActions(..),
+    mapSomeSimActions,
     andThen,
+    andThen_,
     shim,
     shimIO,
     addDataIO,
-    passViaIORef,
+    andThenWithIORef,
+    andThenWithIORefs,
+    addPost,
   )
 where
 
 {- ORMOLU_DISABLE -}
 import           Prelude hiding (log)
-import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.IO.Class (MonadIO(liftIO))
+import           Control.Monad.Reader (MonadReader(ask, local))
 import           Data.IORef (IORef)
 import qualified Data.IORef as IORef
 import           Data.Profunctor (Profunctor(lmap, rmap))
@@ -48,8 +59,9 @@ import           Data.Profunctor (Profunctor(lmap, rmap))
 import qualified What4.Expr.Builder as What4
 import qualified What4.LabeledPred as What4
 import qualified What4.Interface as What4
+import           What4.InterpretedFloatingPoint (IsInterpretedFloatExprBuilder)
 
-import           Lang.Crucible.Backend (IsSymInterface)
+import           Lang.Crucible.Backend (IsSymInterface, IsBoolSolver)
 import qualified Lang.Crucible.Simulator.OverrideSim as Crucible
 import qualified Lang.Crucible.Simulator.SimError as Crucible
 import           Lang.Crucible.Simulator.RegMap (RegMap)
@@ -62,7 +74,9 @@ import           Lang.Crucible.LLVM.Intrinsics (IntrinsicsOptions)
 import           Lang.Crucible.LLVM.TypeContext (TypeContext)
 {- ORMOLU_ENABLE -}
 
-
+-- | Set up the arguments and memory state for execution. Additionally, create
+-- any data or references that need to be shared between subsequent steps (type
+-- parameter @b@).
 newtype MakeArguments argTypes sym b
   = MakeArguments
       { runMakeArguments ::
@@ -81,7 +95,10 @@ bindIO ::
 bindIO (MakeArguments f) g =
   MakeArguments (\sym -> f sym >>= \(r, m, b) -> (r, m,) <$> g b)
 
--- TODO profunctor
+-- | Perform actions such as registering overrides or modifying memory just
+-- before executing the CFG.
+--
+-- Has access to data from @MakeArguments@ (type parameter @b@).
 newtype PreSimulation p sym b a
   = PreSimulation
       { runPreSimulation ::
@@ -137,7 +154,9 @@ lmapIOPre ::
   PreSimulation p sym c a
 lmapIOPre f (PreSimulation g) = PreSimulation (\sym c -> g sym =<< liftIO (f c))
 
--- TODO profunctor
+-- | Perform actions in Crux's \"error continuation\".
+--
+-- Has access to data from @MakeArguments@ (type parameter @b@).
 newtype PostSimulation sym b a
   = PostSimulation
       { runPostSimulation ::
@@ -167,8 +186,13 @@ instance Monad (PostSimulation sym b) where
                         let PostSimulation h = f x
                         h sym b ann p)
 
-liftIOPost :: IO a -> PostSimulation sym b a
-liftIOPost comp = PostSimulation (\_ _ _ _ -> comp)
+instance MonadIO (PostSimulation sym b) where
+  liftIO comp = PostSimulation (\_ _ _ _ -> comp)
+
+instance MonadReader b (PostSimulation sym b) where
+  ask = PostSimulation $ \_sym b _bb _gl -> return b
+  local fb (PostSimulation comp) =
+    PostSimulation $ \sym b bb gl -> comp sym (fb b) bb gl
 
 lmapIOPost ::
   (c -> IO b) ->
@@ -182,7 +206,7 @@ lmapIOPost f (PostSimulation g) =
 data PrePost p sym b a =
   PrePost
     { -- | Additional setup actions (e.g. registering overrides)
-      pre :: PreSimulation p sym b a,
+      pre :: PreSimulation p sym b (),
       -- | What to do after simulation ends
       post :: PostSimulation sym b a
     }
@@ -190,31 +214,29 @@ data PrePost p sym b a =
 
 instance Profunctor (PrePost p sym) where
   lmap f (PrePost pr po) = PrePost (lmap f pr) (lmap f po)
-  rmap f (PrePost pr po) = PrePost (rmap f pr) (rmap f po)
+  rmap f (PrePost pr po) = PrePost pr (rmap f po)
 
-data SimActions argTypes p sym b =
+-- | Actions to execute to set up symbolic execution and interpret any errors.
+--
+-- See comments on 'MakeArguments', 'PreSimulation', and 'PostSimulation'.
+data SimActions argTypes p sym b a =
   SimActions
-    { -- | Setup arguments and memory
-      makeArguments :: MakeArguments argTypes sym b,
-      prePost :: PrePost p sym b ()
+    { makeArguments :: MakeArguments argTypes sym b,
+      prePost :: PrePost p sym b a
     }
+  deriving (Functor)
 
--- TODO
--- executePre ::
---   SimActions a argTypes sym ->
---   sym ->
---   Crucible.OverrideSim
---     (p sym)
---     sym
---     LLVM
---     (Crucible.RegEntry sym CrucibleTypes.UnitType)
---     CrucibleTypes.EmptyCtx
---     CrucibleTypes.UnitType
---     ()
--- executePre = _
+-- | Somewhat awkward ordering of type variables to work with
+-- 'ForAllSymInterface'.
+data SomeSimActions argTypes a p sym =
+  forall b. SomeSimActions (SimActions argTypes p sym b a)
 
-data SomeSimActions argTypes p sym =
-  forall b. SomeSimActions (SimActions argTypes p sym b)
+mapSomeSimActions ::
+  (forall b. SimActions argTypes p sym b a -> SimActions argTypes p sym b c) ->
+  SomeSimActions argTypes a p sym ->
+  SomeSimActions argTypes c p sym
+mapSomeSimActions f (SomeSimActions actions) =
+  SomeSimActions (f actions)
 
 -- NOTE(lb): It's a wart that the below types need the sym ~ ExprBuilder
 -- constraint, made necessary by the use of 'asApp' in UCCrux.LLVM.Classify.
@@ -225,6 +247,8 @@ newtype ForAllSymInterface f =
   ForAllSymInterface
     { withSymInterface ::
         forall personality sym t s x.
+        IsBoolSolver sym =>
+        IsInterpretedFloatExprBuilder sym =>
         (sym ~ What4.ExprBuilder t s x) =>
         IsSymInterface sym =>
         HasLLVMAnn sym =>
@@ -235,41 +259,44 @@ newtype ForAllSymInterface1 f a =
   ForAllSymInterface1
     { withSymInterface1 ::
         forall personality sym t s x.
+        IsBoolSolver sym =>
+        IsInterpretedFloatExprBuilder sym =>
         (sym ~ What4.ExprBuilder t s x) =>
         IsSymInterface sym =>
         HasLLVMAnn sym =>
         f (personality sym) sym a
     }
 
-newtype ForAllSymInterface2 f b a =
-  ForAllSymInterface2
-    { withSymInterface2 ::
-        forall personality sym t s x.
-        (sym ~ What4.ExprBuilder t s x) =>
-        IsSymInterface sym =>
-        HasLLVMAnn sym =>
-        f (personality sym) sym b a
-    }
-
+-- | The essence of the 'SimActions' API: combine multiple actions to be
+-- executed before and after symbolic execution.
 andThen ::
-  SimActions argTypes p sym b ->
-  PrePost p sym b () ->
-  SimActions argTypes p sym b
-andThen actions (PrePost pre' post') =
+  (a -> c -> d) ->
+  SimActions argTypes p sym b a ->
+  PrePost p sym b c ->
+  SimActions argTypes p sym b d
+andThen f actions (PrePost pre' post') =
   actions
     { prePost =
         let PrePost pre'' post'' = prePost actions
         in PrePost
              { pre = pre'' >> pre',
-               post = post'' >> post'
+               post = f <$> post'' <*> post'
+
              }
     }
 
+andThen_ ::
+  SimActions argTypes p sym b a ->
+  PrePost p sym b () ->
+  SimActions argTypes p sym b a
+andThen_ = andThen const
+
+-- | Pipe-fitting.
 shim ::
   (b -> c) ->
   (c -> b) ->
-  SimActions argTypes p sym b ->
-  SimActions argTypes p sym c
+  SimActions argTypes p sym b a ->
+  SimActions argTypes p sym c a
 shim forwards backwards actions =
   actions
     { makeArguments = forwards <$> makeArguments actions,
@@ -279,8 +306,8 @@ shim forwards backwards actions =
 shimIO ::
   (b -> IO c) ->
   (c -> IO b) ->
-  SimActions argTypes p sym b ->
-  SimActions argTypes p sym c
+  SimActions argTypes p sym b a ->
+  SimActions argTypes p sym c a
 shimIO forwards backwards actions =
   actions
     { makeArguments =
@@ -292,33 +319,40 @@ shimIO forwards backwards actions =
 
 addDataIO ::
   (b -> IO c) ->
-  SimActions argTypes p sym b ->
-  SimActions argTypes p sym (b, c)
+  SimActions argTypes p sym b a ->
+  SimActions argTypes p sym (b, c) a
 addDataIO f = shimIO (\b -> (b,) <$> f b) (return . fst)
 
--- | Create a fresh IORef in the 'MakeArguments', fill it in the
--- 'PreSimulation', and consume it in the 'PostSimulation'.
-passViaIORef ::
-  c ->
-  MakeArguments argTypes sym b ->
-  PreSimulation p sym b c ->
-  (c -> PostSimulation sym b ()) ->
-  SimActions argTypes p sym (b, IORef c)
-passViaIORef c0 makeArgs (PreSimulation pr) po =
-  SimActions
-    { makeArguments =
-        makeArgs `bindIO` \b -> (b,) <$> IORef.newIORef c0,
-      prePost =
-        PrePost { pre =
-                    PreSimulation $
-                      \sym (b, ref) ->
-                        (liftIO . IORef.writeIORef ref) =<< pr sym b,
-                  post =
-                    PostSimulation $
-                      \sym (b, ref) bb gl ->
-                        do c <- liftIO (IORef.readIORef ref)
-                           case po c of
-                             PostSimulation f ->
-                               f sym b bb gl
-                }
-    }
+-- | Add an 'IORef'.
+andThenWithIORef ::
+  d ->
+  SimActions argTypes p sym b a ->
+  PrePost p sym (IORef d) c ->
+  SimActions argTypes p sym (b, IORef d) (a, c)
+andThenWithIORef d actions prPo =
+  andThen
+    (,)
+    (addDataIO (const (IORef.newIORef d)) actions)
+    (lmap snd prPo)
+
+-- | Add two 'IORef'.
+andThenWithIORefs ::
+  d ->
+  e ->
+  SimActions argTypes p sym b a ->
+  PrePost p sym (IORef d, IORef e) c ->
+  SimActions argTypes p sym (b, (IORef d, IORef e)) (a, c)
+andThenWithIORefs d e actions prPo =
+  andThen
+    (,)
+    (addDataIO (const ((,) <$> IORef.newIORef d <*> IORef.newIORef e)) actions)
+    (lmap snd prPo)
+
+-- | Tack on another task to execute when interpreting errors.
+addPost ::
+  (a -> c -> d) ->
+  SimActions argTypes p sym b a ->
+  PostSimulation sym b c ->
+  SimActions argTypes p sym b d
+addPost f actions po =
+  andThen f actions (PrePost { pre = return (), post = po })
