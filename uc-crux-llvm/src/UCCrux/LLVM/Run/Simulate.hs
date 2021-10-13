@@ -34,6 +34,7 @@ import           Control.Lens ((^.), view, to)
 import           Control.Monad (void, unless)
 import           Control.Monad.IO.Class (liftIO)
 import           Control.Monad.Reader (ask)
+import           Data.Foldable (for_)
 import           Data.IORef (IORef)
 import qualified Data.IORef as IORef
 import           Data.List (isInfixOf)
@@ -64,7 +65,8 @@ import qualified Lang.Crucible.Types as CrucibleTypes
 -- crucible-llvm
 import           Lang.Crucible.LLVM (llvmGlobalsToCtx)
 import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
-import           Lang.Crucible.LLVM.Intrinsics (OverrideTemplate, register_llvm_overrides)
+import           Lang.Crucible.LLVM.Intrinsics (OverrideTemplate)
+import qualified Lang.Crucible.LLVM.Intrinsics as LLVMIntrinsics
 import           Lang.Crucible.LLVM.MemModel (MemImpl, HasLLVMAnn, LLVMAnnMap)
 import           Lang.Crucible.LLVM.Translation (transContext, llvmMemVar, llvmTypeCtx)
 
@@ -111,14 +113,15 @@ import           UCCrux.LLVM.Shape (Shape)
 -- 'IORef'.
 mkCallback ::
   ArchOk arch =>
+  Semigroup onError =>
   AppContext ->
   ModuleContext m arch ->
   FunctionContext m arch argTypes ->
   Crucible.HandleAllocator ->
-  -- | Where to store the results of the actions
-  IORef [a] ->
+  -- | Where to store the results of analyzing errors
+  IORef onError ->
   -- | Actions to run before and after simulation
-  Actions.ForAllSymInterface (Actions.SomeSimActions (MapToCrucibleType arch argTypes) a) ->
+  Actions.ForAllSymInterface (Actions.SomeSimActions (MapToCrucibleType arch argTypes) onError a) ->
   -- | Function to execute
   Crucible.CFG LLVM blocks (MapToCrucibleType arch argTypes) ret ->
   LLVMOptions ->
@@ -170,9 +173,9 @@ mkCallback appCtx modCtx funCtx halloc resultRef actions0 cfg llvmOpts =
       -- outer loop
       let explainFailure _ gl =
             do bb <- IORef.readIORef bbMapRef
-               let post = Actions.post (Actions.prePost actions)
-               result <- Actions.runPostSimulation post sym extra bb gl
-               IORef.modifyIORef resultRef (result:)
+               let onError = Actions.onError (Actions.prePost actions)
+               result <- Actions.runOnError onError sym extra bb gl
+               IORef.modifyIORef resultRef (result <>)
                return mempty
 
       return (Crux.RunnableState initSt, explainFailure)
@@ -184,17 +187,18 @@ simulateCFG ::
   ArchOk arch =>
   Crux.Logs msgs =>
   Crux.SupportsCruxLogMessage msgs =>
+  Monoid onError =>
   AppContext ->
   ModuleContext m arch ->
   FunctionContext m arch argTypes ->
   Crucible.HandleAllocator ->
-  Actions.ForAllSymInterface (Actions.SomeSimActions (MapToCrucibleType arch argTypes) a) ->
+  Actions.ForAllSymInterface (Actions.SomeSimActions (MapToCrucibleType arch argTypes) onError a) ->
   Crucible.CFG LLVM blocks (MapToCrucibleType arch argTypes) ret ->
   CruxOptions ->
   LLVMOptions ->
-  IO (Crux.CruxSimulationResult, [a])
-simulateCFG appCtx modCtx funCtx halloc actions cfg cruxOpts llvmOpts =
-  do resultRef <- IORef.newIORef []
+  IO (Crux.CruxSimulationResult, onError)
+simulateCFG appCtx modCtx funCtx halloc actions0 cfg cruxOpts llvmOpts =
+  do onErrorRef <- IORef.newIORef mempty
      cruxResult <-
        Crux.runSimulator
          cruxOpts
@@ -203,13 +207,16 @@ simulateCFG appCtx modCtx funCtx halloc actions cfg cruxOpts llvmOpts =
              modCtx
              funCtx
              halloc
-             resultRef
-             actions
+             onErrorRef
+             actions0
              cfg
              llvmOpts
          )
-     result <- IORef.readIORef resultRef
-     return (cruxResult, result)
+     onError <- IORef.readIORef onErrorRef
+     Actions.ForAllSymInterface (Actions.SomeSimActions actions) <-
+       return actions0
+     Actions.runPostSimulation (Actions.post (Actions.prePost actions)) onError _
+     return (cruxResult, onError)
 
 makeArgumentsFromConstraints ::
   Crucible.IsSymInterface sym =>
@@ -246,6 +253,7 @@ registerOverridesPre ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  AppContext ->
   ModuleContext m arch ->
   [ OverrideTemplate
       (personality sym)
@@ -256,24 +264,38 @@ registerOverridesPre ::
       CrucibleTypes.UnitType
   ] ->
   Actions.PreSimulation (personality sym) sym b ()
-registerOverridesPre modCtx overrides =
+registerOverridesPre appCtx modCtx overrides =
   Actions.PreSimulation $
     \_ _ ->
-      register_llvm_overrides
-        (modCtx ^. llvmModule . to getModule)
-        []
-        overrides
-        (modCtx ^. moduleTranslation . transContext)
+      do for_ overrides $
+           \override ->
+             liftIO $
+               (appCtx ^. log) Hi $
+                 Text.unwords
+                   [ "Registering override for",
+                     case LLVMIntrinsics.overrideTemplateMatcher override of
+                       LLVMIntrinsics.ExactMatch nm -> Text.pack nm
+                       LLVMIntrinsics.PrefixMatch nm ->
+                         "functions with prefix " <> Text.pack nm
+                       LLVMIntrinsics.SubstringsMatch nms ->
+                         "functions with names containing " <> Text.pack (show nms)
+                   ] 
+         LLVMIntrinsics.register_llvm_overrides
+           (modCtx ^. llvmModule . to getModule)
+           []
+           overrides
+           (modCtx ^. moduleTranslation . transContext)
 
 registerBasicOverridesPre ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  AppContext ->
   ModuleContext m arch ->
   [BasicLLVMOverride arch] ->
   Actions.PreSimulation (personality sym) sym b ()
-registerBasicOverridesPre modCtx overrides =
-  registerOverridesPre modCtx (map getBasicLLVMOverride overrides)
+registerBasicOverridesPre appCtx modCtx overrides =
+  registerOverridesPre appCtx modCtx (map getBasicLLVMOverride overrides)
 
 -- | Create overrides that skip execution of declared (but not defined)
 -- functions and track information about their usage and return values in an
@@ -282,6 +304,7 @@ registerSkipOverrides ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  AppContext ->
   ModuleContext m arch ->
   Constraints m argTypes ->
   Actions.PreSimulation
@@ -294,12 +317,13 @@ registerSkipOverrides ::
           (Some (TypedSelector m arch argTypes)))
     )
     ()
-registerSkipOverrides modCtx constraints =
+registerSkipOverrides appCtx modCtx constraints =
   do let trans = modCtx ^. moduleTranslation
      sOverrides <-
        Actions.PreSimulation $
          \sym (skipOverrideRef, skipReturnValueAnnotations) ->
            unsoundSkipOverrides
+             appCtx
              modCtx
              sym
              trans
@@ -307,44 +331,46 @@ registerSkipOverrides modCtx constraints =
              skipReturnValueAnnotations
              (constraints ^. returnConstraints)
              (L.modDeclares (modCtx ^. llvmModule . to getModule))
-     registerOverridesPre modCtx sOverrides
+     registerOverridesPre appCtx modCtx sOverrides
 
 useSkipOverrides ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  Monoid onError =>
+  AppContext ->
   ModuleContext m arch ->
   Constraints m argTypes ->
   Actions.PrePost
     (personality sym)
     sym
+    onError
     ( IORef (Set SkipOverrideName)
     , IORef
         (Map.Map
           (Some (What4.SymAnnotation sym))
           (Some (TypedSelector m arch argTypes)))
     )
-    ( Set SkipOverrideName
-    , Map.Map
-        (Some (What4.SymAnnotation sym))
-        (Some (TypedSelector m arch argTypes))
-    )
-useSkipOverrides modCtx constraints =
+    (Set SkipOverrideName)
+useSkipOverrides appCtx modCtx constraints =
   Actions.PrePost
-    { Actions.pre = registerSkipOverrides modCtx constraints,
+    { Actions.pre = registerSkipOverrides appCtx modCtx constraints,
+      Actions.onError = return mempty,
       Actions.post =
-        do (usedRef, annRef) <- ask
-           liftIO ((,) <$> IORef.readIORef usedRef <*> IORef.readIORef annRef)
+        do (usedRef, _) <- ask
+           -- liftIO $ putStrLn . ("SKIP " ++) . show =<< IORef.readIORef usedRef
+           liftIO (IORef.readIORef usedRef)
     }
 
 registerUnsoundOverrides ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  AppContext ->
   ModuleContext m arch ->
   Actions.PreSimulation (personality sym) sym (IORef (Set UnsoundOverrideName)) ()
-registerUnsoundOverrides modCtx =
-  registerBasicOverridesPre modCtx =<<
+registerUnsoundOverrides appCtx modCtx =
+  registerBasicOverridesPre appCtx modCtx =<<
     (Actions.PreSimulation $
       \_sym unsoundOverrideRef ->
         return (unsoundOverrides (modCtx ^. moduleTranslation) unsoundOverrideRef))
@@ -353,15 +379,19 @@ useUnsoundOverrides ::
   Crucible.IsSymInterface sym =>
   HasLLVMAnn sym =>
   ArchOk arch =>
+  Monoid onError =>
+  AppContext ->
   ModuleContext m arch ->
   Actions.PrePost
     (personality sym)
     sym
+    onError
     (IORef (Set UnsoundOverrideName))
     (Set UnsoundOverrideName)
-useUnsoundOverrides modCtx =
+useUnsoundOverrides appCtx modCtx =
   Actions.PrePost
-    { Actions.pre = registerUnsoundOverrides modCtx,
+    { Actions.pre = registerUnsoundOverrides appCtx modCtx,
+      Actions.onError = return mempty,
       Actions.post = liftIO . IORef.readIORef =<< ask
     }
 
@@ -374,7 +404,7 @@ doClassify ::
   AppContext ->
   ModuleContext m arch ->
   FunctionContext m arch argTypes ->
-  Actions.PostSimulation
+  Actions.OnError
     sym
     ( Crucible.RegMap sym (MapToCrucibleType arch argTypes)
     , MemImpl sym
@@ -390,7 +420,7 @@ doClassify ::
     )
     (Located (Explanation m arch argTypes))
 doClassify appCtx modCtx funCtx =
-  Actions.PostSimulation $
+  Actions.OnError $
     \sym (args, mem, argAnnotations, argShapes, skipOverrideRef, skipReturnValueAnnotations) bb gl ->
       do
         let loc = gl ^. Crucible.labeledPredMsg . to Crucible.simErrorLoc
@@ -428,6 +458,7 @@ doClassify appCtx modCtx funCtx =
 
               liftIO $ (appCtx ^. log) Hi ("Explaining error: " <> Text.pack (show (LLVMErrors.explainBB badBehavior)))
               skipped <- IORef.readIORef skipOverrideRef
+              liftIO $ (appCtx ^. log) Hi ("Skipped functions: " <> Text.pack (show skipped))
               retAnns <- IORef.readIORef skipReturnValueAnnotations
               classifyBadBehavior
                 appCtx
@@ -465,6 +496,7 @@ defaultActions ::
     (MapToCrucibleType arch argTypes)
     (personality sym)
     sym
+    [Located (Explanation m arch argTypes)]
     ( Crucible.RegMap sym (MapToCrucibleType arch argTypes)
     , MemImpl sym
     , Map.Map
@@ -480,9 +512,9 @@ defaultActions ::
     )
     ( Set UnsoundOverrideName
     , Set SkipOverrideName
-    , Located (Explanation m arch argTypes)
     )
-defaultActions appCtx modCtx funCtx constraints = actions
+defaultActions appCtx modCtx funCtx constraints =
+  (\(((), unsound), skip) -> (unsound, skip)) <$> actions
   where
     -- Start by constructing arguments from the given constraints
     mkArgs =
@@ -502,7 +534,7 @@ defaultActions appCtx modCtx funCtx constraints = actions
       Actions.andThenWithIORef
         Set.empty
         mkArgs
-        (useUnsoundOverrides modCtx)
+        (useUnsoundOverrides appCtx modCtx)
 
     -- Then register overrides for declared functions and record which ones get
     -- used
@@ -511,18 +543,17 @@ defaultActions appCtx modCtx funCtx constraints = actions
         Set.empty
         Map.empty
         unsound
-        (useSkipOverrides modCtx constraints)
+        (useSkipOverrides appCtx modCtx constraints)
 
     -- Do a bunch of pipe-fitting to make the types line up and mix in
     -- classification.
     actions =
-      Actions.addPost
-        (\(((), unsoundOs), (skipOs, _)) expl -> (unsoundOs, skipOs, expl))
+      Actions.addOnError
         (let reassoc1 (((a, b, c, d), e), (f, g)) = (a, b, c, d, e, f, g)
              reassoc2 (a, b, c, d, e, f, g) = (((a, b, c, d), e), (f, g))
          in Actions.shim reassoc1 reassoc2 unsoundAndSkip)
         (let dropOne (a, b, c, d, _e, f, g) = (a, b, c, d, f, g)
-         in Profunctor.lmap dropOne (doClassify appCtx modCtx funCtx))
+         in Profunctor.lmap dropOne ((:[]) <$> doClassify appCtx modCtx funCtx))
 
 runSimulator ::
   Crux.Logs msgs =>

@@ -10,6 +10,15 @@ This interface is complex, but is intended to allow API consumers to do things
 like set up different overrides for different runs of the symbolic simulator,
 and to pass data between the steps that set up simulation and the steps that
 analyze the outcome of simulation.
+
+There are four hooks provided:
+
+* 'MakeArguments': Setting up the initial LLVM memory and CFG (function)
+  arguments
+* 'PreSimulation': Registering overrides and other 'Crucible.OverrideSim'
+* 'OnError': Analyzing errors that occur during simulation
+* 'PostSimulation': Analyzing the outcome of simulation and providing final
+  results.
 -}
 
 {-# LANGUAGE DeriveFunctor #-}
@@ -29,11 +38,11 @@ module UCCrux.LLVM.Run.Simulate.Actions
     liftPre,
     lmapIOPre,
     PostSimulation(..),
-    lmapIOPost,
+    OnError(..),
+    lmapIOOnError,
     PrePost(..),
     ForAllSymInterface(..),
     ForAllSymInterface1(..),
-    ForAllSymInterface2(..),
     SimActions(..),
     SomeSimActions(..),
     mapSomeSimActions,
@@ -44,7 +53,7 @@ module UCCrux.LLVM.Run.Simulate.Actions
     addDataIO,
     andThenWithIORef,
     andThenWithIORefs,
-    addPost,
+    addOnError,
   )
 where
 
@@ -157,9 +166,9 @@ lmapIOPre f (PreSimulation g) = PreSimulation (\sym c -> g sym =<< liftIO (f c))
 -- | Perform actions in Crux's \"error continuation\".
 --
 -- Has access to data from @MakeArguments@ (type parameter @b@).
-newtype PostSimulation sym b a
-  = PostSimulation
-      { runPostSimulation ::
+newtype OnError sym b a
+  = OnError
+      { runOnError ::
           sym ->
           b ->
           LLVMAnnMap sym ->
@@ -168,73 +177,117 @@ newtype PostSimulation sym b a
       }
   deriving (Functor)
 
-instance Profunctor (PostSimulation sym) where
+instance Profunctor (OnError sym) where
+  lmap f (OnError g) = OnError (\sym a -> g sym (f a))
+  rmap = fmap
+
+-- | Combination of the reader and IO applicatives
+instance Applicative (OnError sym b) where
+  pure a = OnError (\_ _ _ _ -> return a)
+  (OnError f) <*> (OnError g) =
+    OnError (\sym b ann p -> f sym b ann p <*> g sym b ann p)
+
+-- | Combination of the reader and IO monads
+instance Monad (OnError sym b) where
+  (OnError g) >>= f =
+    OnError (\sym b ann p ->
+                     do x <- g sym b ann p
+                        let OnError h = f x
+                        h sym b ann p)
+
+instance MonadIO (OnError sym b) where
+  liftIO comp = OnError (\_ _ _ _ -> comp)
+
+instance MonadReader b (OnError sym b) where
+  ask = OnError $ \_sym b _bb _gl -> return b
+  local fb (OnError comp) =
+    OnError $ \sym b bb gl -> comp sym (fb b) bb gl
+
+lmapIOOnError ::
+  (c -> IO b) ->
+  OnError sym b a ->
+  OnError sym c a
+lmapIOOnError f (OnError g) =
+  OnError (\sym c bb gl ->
+                    do b <- liftIO (f c)
+                       g sym b bb gl)
+
+-- | Perform actions after symbolic execution
+newtype PostSimulation onError b a
+  = PostSimulation { runPostSimulation :: onError -> b -> IO a }
+  deriving (Functor)
+
+instance Profunctor (PostSimulation onError) where
   lmap f (PostSimulation g) = PostSimulation (\sym a -> g sym (f a))
   rmap = fmap
 
 -- | Combination of the reader and IO applicatives
-instance Applicative (PostSimulation sym b) where
-  pure a = PostSimulation (\_ _ _ _ -> return a)
+instance Applicative (PostSimulation onError b) where
+  pure a = PostSimulation (\_ _ -> return a)
   (PostSimulation f) <*> (PostSimulation g) =
-    PostSimulation (\sym b ann p -> f sym b ann p <*> g sym b ann p)
+    PostSimulation (\errs b -> f errs b <*> g errs b)
 
 -- | Combination of the reader and IO monads
-instance Monad (PostSimulation sym b) where
+instance Monad (PostSimulation onError b) where
   (PostSimulation g) >>= f =
-    PostSimulation (\sym b ann p ->
-                     do x <- g sym b ann p
+    PostSimulation (\errs b ->
+                     do x <- g errs b
                         let PostSimulation h = f x
-                        h sym b ann p)
+                        h errs b)
 
-instance MonadIO (PostSimulation sym b) where
-  liftIO comp = PostSimulation (\_ _ _ _ -> comp)
+instance MonadIO (PostSimulation onError b) where
+  liftIO comp = PostSimulation (\_ _ -> comp)
 
-instance MonadReader b (PostSimulation sym b) where
-  ask = PostSimulation $ \_sym b _bb _gl -> return b
+instance MonadReader b (PostSimulation onError b) where
+  ask = PostSimulation $ \_errs b -> return b
   local fb (PostSimulation comp) =
-    PostSimulation $ \sym b bb gl -> comp sym (fb b) bb gl
+    PostSimulation $ \errs b -> comp errs (fb b)
 
 lmapIOPost ::
   (c -> IO b) ->
-  PostSimulation sym b a ->
-  PostSimulation sym c a
+  PostSimulation onError b a ->
+  PostSimulation onError c a
 lmapIOPost f (PostSimulation g) =
-  PostSimulation (\sym c bb gl ->
+  PostSimulation (\errs c ->
                     do b <- liftIO (f c)
-                       g sym b bb gl)
+                       g errs b)
 
-data PrePost p sym b a =
+data PrePost p sym onError b a =
   PrePost
     { -- | Additional setup actions (e.g. registering overrides)
       pre :: PreSimulation p sym b (),
+      -- | What to do when simulation encounters undefined behavior
+      onError :: OnError sym b onError,
       -- | What to do after simulation ends
-      post :: PostSimulation sym b a
+      post :: PostSimulation onError b a
     }
   deriving (Functor)
 
-instance Profunctor (PrePost p sym) where
-  lmap f (PrePost pr po) = PrePost (lmap f pr) (lmap f po)
-  rmap f (PrePost pr po) = PrePost pr (rmap f po)
+instance Profunctor (PrePost p sym onError) where
+  lmap f (PrePost pr oe po) = PrePost (lmap f pr) (lmap f oe) (lmap f po)
+  rmap f (PrePost pr oe po) = PrePost pr oe (rmap f po)
 
 -- | Actions to execute to set up symbolic execution and interpret any errors.
 --
--- See comments on 'MakeArguments', 'PreSimulation', and 'PostSimulation'.
-data SimActions argTypes p sym b a =
+-- See comments on 'MakeArguments', 'PreSimulation', and 'OnError'.
+data SimActions argTypes p sym onError b a =
   SimActions
     { makeArguments :: MakeArguments argTypes sym b,
-      prePost :: PrePost p sym b a
+      prePost :: PrePost p sym onError b a
     }
   deriving (Functor)
 
 -- | Somewhat awkward ordering of type variables to work with
 -- 'ForAllSymInterface'.
-data SomeSimActions argTypes a p sym =
-  forall b. SomeSimActions (SimActions argTypes p sym b a)
+data SomeSimActions argTypes onError a p sym =
+  forall b. SomeSimActions (SimActions argTypes p sym onError b a)
 
 mapSomeSimActions ::
-  (forall b. SimActions argTypes p sym b a -> SimActions argTypes p sym b c) ->
-  SomeSimActions argTypes a p sym ->
-  SomeSimActions argTypes c p sym
+  (forall b onError.
+   SimActions argTypes p sym onError b a ->
+   SimActions argTypes p sym onError b c) ->
+  SomeSimActions argTypes onError a p sym ->
+  SomeSimActions argTypes onError c p sym
 mapSomeSimActions f (SomeSimActions actions) =
   SomeSimActions (f actions)
 
@@ -270,33 +323,35 @@ newtype ForAllSymInterface1 f a =
 -- | The essence of the 'SimActions' API: combine multiple actions to be
 -- executed before and after symbolic execution.
 andThen ::
+  Semigroup onError =>
   (a -> c -> d) ->
-  SimActions argTypes p sym b a ->
-  PrePost p sym b c ->
-  SimActions argTypes p sym b d
-andThen f actions (PrePost pre' post') =
+  SimActions argTypes p sym onError b a ->
+  PrePost p sym onError b c ->
+  SimActions argTypes p sym onError b d
+andThen f actions (PrePost pre' onError' post') =
   actions
     { prePost =
-        let PrePost pre'' post'' = prePost actions
+        let PrePost pre'' onError'' post'' = prePost actions
         in PrePost
              { pre = pre'' >> pre',
+               onError = (<>) <$> onError'' <*> onError',
                post = f <$> post'' <*> post'
-
              }
     }
 
 andThen_ ::
-  SimActions argTypes p sym b a ->
-  PrePost p sym b () ->
-  SimActions argTypes p sym b a
+  Semigroup onError =>
+  SimActions argTypes p sym onError b a ->
+  PrePost p sym onError b () ->
+  SimActions argTypes p sym onError b a
 andThen_ = andThen const
 
 -- | Pipe-fitting.
 shim ::
   (b -> c) ->
   (c -> b) ->
-  SimActions argTypes p sym b a ->
-  SimActions argTypes p sym c a
+  SimActions argTypes p sym onError b a ->
+  SimActions argTypes p sym onError c a
 shim forwards backwards actions =
   actions
     { makeArguments = forwards <$> makeArguments actions,
@@ -306,29 +361,31 @@ shim forwards backwards actions =
 shimIO ::
   (b -> IO c) ->
   (c -> IO b) ->
-  SimActions argTypes p sym b a ->
-  SimActions argTypes p sym c a
+  SimActions argTypes p sym onError b a ->
+  SimActions argTypes p sym onError c a
 shimIO forwards backwards actions =
   actions
     { makeArguments =
         makeArguments actions `bindIO` forwards,
       prePost = PrePost { pre = lmapIOPre backwards (pre (prePost actions)),
+                          onError = lmapIOOnError backwards (onError (prePost actions)),
                           post = lmapIOPost backwards (post (prePost actions))
                         }
     }
 
 addDataIO ::
   (b -> IO c) ->
-  SimActions argTypes p sym b a ->
-  SimActions argTypes p sym (b, c) a
+  SimActions argTypes p sym onError b a ->
+  SimActions argTypes p sym onError (b, c) a
 addDataIO f = shimIO (\b -> (b,) <$> f b) (return . fst)
 
 -- | Add an 'IORef'.
 andThenWithIORef ::
+  Semigroup onError =>
   d ->
-  SimActions argTypes p sym b a ->
-  PrePost p sym (IORef d) c ->
-  SimActions argTypes p sym (b, IORef d) (a, c)
+  SimActions argTypes p sym onError b a ->
+  PrePost p sym onError (IORef d) c ->
+  SimActions argTypes p sym onError (b, IORef d) (a, c)
 andThenWithIORef d actions prPo =
   andThen
     (,)
@@ -337,11 +394,12 @@ andThenWithIORef d actions prPo =
 
 -- | Add two 'IORef'.
 andThenWithIORefs ::
+  Monoid onError =>
   d ->
   e ->
-  SimActions argTypes p sym b a ->
-  PrePost p sym (IORef d, IORef e) c ->
-  SimActions argTypes p sym (b, (IORef d, IORef e)) (a, c)
+  SimActions argTypes p sym onError b a ->
+  PrePost p sym onError (IORef d, IORef e) c ->
+  SimActions argTypes p sym onError (b, (IORef d, IORef e)) (a, c)
 andThenWithIORefs d e actions prPo =
   andThen
     (,)
@@ -349,10 +407,20 @@ andThenWithIORefs d e actions prPo =
     (lmap snd prPo)
 
 -- | Tack on another task to execute when interpreting errors.
+addOnError ::
+  Monoid onError =>
+  SimActions argTypes p sym onError b a ->
+  OnError sym b onError ->
+  SimActions argTypes p sym onError b a
+addOnError actions oe =
+  andThen const actions (PrePost { pre = return (), onError = oe, post = return () })
+
+-- | Tack on another task to execute after simulation.
 addPost ::
+  Monoid onError =>
   (a -> c -> d) ->
-  SimActions argTypes p sym b a ->
-  PostSimulation sym b c ->
-  SimActions argTypes p sym b d
+  SimActions argTypes p sym onError b a ->
+  PostSimulation onError b c ->
+  SimActions argTypes p sym onError b d
 addPost f actions po =
-  andThen f actions (PrePost { pre = return (), post = po })
+  andThen f actions (PrePost { pre = return (), onError = return mempty, post = po })

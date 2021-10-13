@@ -22,6 +22,8 @@ module UCCrux.LLVM.Overrides.Skip
 where
 
 {- ORMOLU_DISABLE -}
+import           Prelude hiding (log)
+
 import           Control.Lens ((^.), use, to)
 import           Control.Monad.IO.Class (liftIO)
 import           Data.IORef (IORef, modifyIORef)
@@ -65,11 +67,13 @@ import           Crux.LLVM.Overrides (ArchOk)
 
 -- uc-crux-llvm
 import           UCCrux.LLVM.Constraints (ConstrainedTypedValue(..), minimalConstrainedShape)
+import           UCCrux.LLVM.Context.App (AppContext, log)
 import           UCCrux.LLVM.Context.Module (ModuleContext, funcTypes)
 import           UCCrux.LLVM.Cursor (Selector(SelectReturn), Cursor(Here))
 import           UCCrux.LLVM.Errors.Panic (panic)
 import           UCCrux.LLVM.FullType.CrucibleType (toCrucibleType)
 import           UCCrux.LLVM.FullType.Translation (FunctionTypes, ftRetType)
+import           UCCrux.LLVM.Logging (Verbosity(Hi))
 import           UCCrux.LLVM.Module (FuncSymbol, funcSymbol, makeFuncSymbol, isDebug)
 import           UCCrux.LLVM.Setup (SymValue(getSymValue), generate)
 import           UCCrux.LLVM.Setup.Assume (assume)
@@ -99,6 +103,7 @@ unsoundSkipOverrides ::
     ArchOk arch,
     ?lc :: TypeContext
   ) =>
+  AppContext ->
   ModuleContext m arch ->
   sym ->
   ModuleTranslation arch ->
@@ -110,7 +115,7 @@ unsoundSkipOverrides ::
   Map (FuncSymbol m) (ConstrainedTypedValue m) ->
   [L.Declare] ->
   OverM personality sym LLVM [OverrideTemplate p sym arch rtp l a]
-unsoundSkipOverrides modCtx sym mtrans usedRef annotationRef postconditions decls =
+unsoundSkipOverrides appCtx modCtx sym mtrans usedRef annotationRef postconditions decls =
   do
     let llvmCtx = mtrans ^. transContext
     let ?lc = llvmCtx ^. llvmTypeCtx
@@ -128,6 +133,7 @@ unsoundSkipOverrides modCtx sym mtrans usedRef annotationRef postconditions decl
                 ["Precondition violation: Declaration not in module"]
             Just funcSym ->
               createSkipOverride
+                appCtx
                 modCtx
                 sym
                 usedRef
@@ -154,6 +160,7 @@ createSkipOverride ::
     ArchOk arch,
     ?lc :: TypeContext
   ) =>
+  AppContext ->
   ModuleContext m arch ->
   sym ->
   IORef (Set SkipOverrideName) ->
@@ -163,7 +170,7 @@ createSkipOverride ::
   L.Declare ->
   FuncSymbol m ->
   Maybe (OverrideTemplate p sym arch rtp l a)
-createSkipOverride modCtx sym usedRef annotationRef postcondition decl funcSym =
+createSkipOverride appCtx modCtx sym usedRef annotationRef postcondition decl funcSym =
   llvmDeclToFunHandleRepr' decl $
     \args ret ->
       Just $
@@ -175,6 +182,7 @@ createSkipOverride modCtx sym usedRef annotationRef postcondition decl funcSym =
               llvmOverride_def =
                 \mvar _sym _args ->
                   do
+                    liftIO $ (appCtx ^. log) Hi $ "Skipping execution of " <> name
                     liftIO $
                       modifyIORef usedRef (Set.insert (SkipOverrideName name))
                     Override.modifyGlobal mvar $ \mem ->
