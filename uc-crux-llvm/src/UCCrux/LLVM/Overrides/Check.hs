@@ -34,7 +34,10 @@ presence of bugs (when the contract really *should* hold).
 module UCCrux.LLVM.Overrides.Check
   ( CheckOverrideName (..),
     createCheckOverride,
-    checkOverrideFromResult
+    checkOverrideFromResult,
+    CheckedConstraint(..),
+    SomeCheckedConstraint(..),
+    SomeCheckedConstraint'(..)
   )
 where
 
@@ -137,6 +140,10 @@ data CheckedConstraint m sym (argTypes :: Ctx (FullType m)) inTy atTy
 data SomeCheckedConstraint m sym (argTypes :: Ctx (FullType m)) =
   forall inTy atTy.
     SomeCheckedConstraint (CheckedConstraint m sym argTypes inTy atTy)
+
+data SomeCheckedConstraint' m =
+  forall sym argTypes inTy atTy.
+    SomeCheckedConstraint' (CheckedConstraint m sym argTypes inTy atTy)
 
 -- TODO: Alignment...?
 doLoad ::

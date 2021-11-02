@@ -30,6 +30,7 @@ import           Control.Exception (throw)
 import           Data.Foldable (toList)
 import           Data.Function ((&))
 import qualified Data.Map.Strict as Map
+import           Data.Map.Strict (Map)
 import qualified Data.Map.Merge.Strict as Map
 import qualified Data.Set as Set
 import           Data.Sequence (Seq)
@@ -41,7 +42,7 @@ import           Panic (Panic)
 import qualified Text.LLVM.AST as L
 
 import qualified Lang.Crucible.CFG.Core as Crucible
-import qualified Lang.Crucible.FunctionHandle as Crucible
+import qualified Lang.Crucible.FunctionHandle as Crucible (HandleAllocator)
 
 -- crucible-llvm
 import Lang.Crucible.LLVM.MemModel (withPtrWidth)
@@ -49,13 +50,14 @@ import Lang.Crucible.LLVM.Extension( LLVM )
 import Lang.Crucible.LLVM.Translation (llvmPtrWidth, transContext)
 
 -- crux
-import Crux.Config.Common
-import Crux.Log as Crux
+import           Crux.Config.Common (CruxOptions)
+import           Crux.Log as Crux
+
+-- crux-llvm
+import           Crux.LLVM.Config (LLVMOptions, throwCError, CError(MissingFun))
+import           Crux.LLVM.Overrides
 
  -- local
-import Crux.LLVM.Config (LLVMOptions, throwCError, CError(MissingFun))
-import Crux.LLVM.Overrides
-
 import           UCCrux.LLVM.Classify.Types (Located(locatedValue), Explanation, partitionExplanations)
 import           UCCrux.LLVM.Constraints (Constraints, NewConstraint, ppConstraints, emptyConstraints, addConstraint, ppExpansionError)
 import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName, functionNameToString, functionNameFromString)
@@ -260,7 +262,7 @@ loopOnFunctions ::
   CruxOptions ->
   LLVMOptions ->
   EntryPoints m ->
-  IO (Map.Map (DefnSymbol m) SomeBugfindingResult)
+  IO (Map (DefnSymbol m) SomeBugfindingResult)
 loopOnFunctions appCtx modCtx halloc cruxOpts llOpts entries =
   Map.fromList
     <$> llvmPtrWidth
