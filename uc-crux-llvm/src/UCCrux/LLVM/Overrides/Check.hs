@@ -37,7 +37,8 @@ module UCCrux.LLVM.Overrides.Check
     checkOverrideFromResult,
     CheckedConstraint(..),
     SomeCheckedConstraint(..),
-    SomeCheckedConstraint'(..)
+    SomeCheckedConstraint'(..),
+    CheckOverrideResult(..),
   )
 where
 
@@ -50,8 +51,6 @@ import           Data.Function ((&))
 import           Data.Foldable.WithIndex (FoldableWithIndex, ifoldrM)
 import           Data.Functor.Compose (Compose(Compose))
 import           Data.IORef (IORef, modifyIORef)
-import           Data.Map (Map)
-import qualified Data.Map as Map
 import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import           Data.Text (Text)
@@ -68,6 +67,7 @@ import           Data.Parameterized.Classes (IndexF)
 import           Data.Parameterized.Ctx (Ctx)
 import qualified Data.Parameterized.Context as Ctx
 import qualified Data.Parameterized.Fin as Fin
+import           Data.Parameterized.TraversableFC (fmapFC)
 import           Data.Parameterized.TraversableFC.WithIndex (FoldableFCWithIndex, ifoldrMFC)
 import           Data.Parameterized.Some (Some(Some), viewSome)
 import qualified Data.Parameterized.Vector as PVec
@@ -144,6 +144,14 @@ data SomeCheckedConstraint m sym (argTypes :: Ctx (FullType m)) =
 data SomeCheckedConstraint' m =
   forall sym argTypes inTy atTy.
     SomeCheckedConstraint' (CheckedConstraint m sym argTypes inTy atTy)
+
+data CheckOverrideResult m sym arch argTypes =
+  CheckOverrideResult
+    { checkedInContext :: Stack sym,
+      -- | Function arguments
+      checkedArgs :: Ctx.Assignment (Crucible.RegValue' sym) (MapToCrucibleType arch argTypes),
+      checkedConstraints :: Seq (SomeCheckedConstraint m sym argTypes)
+    }
 
 -- TODO: Alignment...?
 doLoad ::
@@ -325,7 +333,7 @@ createCheckOverride ::
   AppContext ->
   ModuleContext m arch ->
   -- | Predicates checked during simulation
-  IORef (Map CheckOverrideName [(Stack sym, Seq (SomeCheckedConstraint m sym argTypes))]) ->
+  IORef [CheckOverrideResult m sym arch argTypes] ->
   -- | Function argument types
   Ctx.Assignment (FullTypeRepr m) argTypes ->
   -- | Function contract to check
@@ -356,10 +364,9 @@ createCheckOverride appCtx modCtx usedRef argFTys constraints cfg funcSym =
                      argCs <- liftIO $ getArgConstraints sym mem args
                      globCs <- liftIO $ getGlobalConstraints sym mem
                      let cs = argCs <> globCs
-                     let nm = CheckOverrideName name
+                     let args' = fmapFC (Crucible.RV . Crucible.regValue) args
                      liftIO $
-                       modifyIORef usedRef $
-                         Map.alter (Just . maybe [] ((stack, cs):)) nm
+                       modifyIORef usedRef (CheckOverrideResult stack args' cs:)
                      retEntry <- Crucible.callCFG cfg (Crucible.RegMap args)
                      return (Crucible.regValue retEntry, mem)
            }
@@ -411,7 +418,7 @@ checkOverrideFromResult ::
   AppContext ->
   ModuleContext m arch ->
   -- | Predicates checked during simulation
-  IORef (Map CheckOverrideName [(Stack sym, Seq (SomeCheckedConstraint m sym argTypes))]) ->
+  IORef [CheckOverrideResult m sym arch argTypes] ->
   -- | Function argument types
   Ctx.Assignment (FullTypeRepr m) argTypes ->
   -- | Function implementation

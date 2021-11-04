@@ -5,6 +5,9 @@ Copyright    : (c) Galois, Inc 2021
 License      : BSD3
 Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
+
+TODO: Rename this module (and the functions in it) to something more useful,
+like \"Infer\".
 -}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}

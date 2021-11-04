@@ -40,10 +40,11 @@ import qualified Prettyprinter as PP
 import qualified Prettyprinter.Render.Text as PP
 
 import           Data.Parameterized.Ctx (Ctx)
+import           Data.Parameterized.Context (Assignment)
 
 import           UCCrux.LLVM.Classify.Types (Located, ppLocated, TruePositive, ppTruePositive, Uncertainty, ppUncertainty, Diagnosis)
 import           UCCrux.LLVM.Constraints (isEmpty, ppConstraints, Constraints(..))
-import           UCCrux.LLVM.FullType.Type (FullType)
+import           UCCrux.LLVM.FullType.Type (FullType, FullTypeRepr)
 import           UCCrux.LLVM.Run.Simulate (UCCruxSimulationResult)
 import           UCCrux.LLVM.Run.Unsoundness (Unsoundness, ppUnsoundness)
 {- ORMOLU_ENABLE -}
@@ -77,6 +78,9 @@ ppFunctionSummaryTag =
 
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
+--
+-- TODO: It would be great to have more provenance information for the
+-- 'Constraints'. What bug does a given constraint help avoid? On what line?
 data FunctionSummary m (argTypes :: Ctx (FullType m))
   = Unclear (NonEmpty (Located Uncertainty))
   | FoundBugs (NonEmpty (Located TruePositive))
@@ -87,6 +91,7 @@ data FunctionSummary m (argTypes :: Ctx (FullType m))
 data SomeBugfindingResult
   = forall m arch argTypes.
     SomeBugfindingResult
+      (Assignment (FullTypeRepr m) argTypes )
       (BugfindingResult m arch argTypes)
       (Seq (UCCruxSimulationResult m arch argTypes))
 
