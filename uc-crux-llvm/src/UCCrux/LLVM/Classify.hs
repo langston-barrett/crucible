@@ -63,11 +63,13 @@ import qualified Lang.Crucible.LLVM.Errors as LLVMErrors
 import qualified Lang.Crucible.LLVM.Errors.MemoryError as MemError
 import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as UB
 import qualified Lang.Crucible.LLVM.MemModel as LLVMMem
+import           Lang.Crucible.LLVM.MemModel.CallStack (CallStack)
 import           Lang.Crucible.LLVM.MemModel.Generic (Mem, AllocInfo)
 import qualified Lang.Crucible.LLVM.MemModel.Generic as G
 import qualified Lang.Crucible.LLVM.MemModel.Pointer as LLVMPtr
 import           Lang.Crucible.LLVM.MemType (memTypeSize)
 
+import           UCCrux.LLVM.Bug (makeBug)
 import           UCCrux.LLVM.Classify.Poison
 import           UCCrux.LLVM.Classify.Types
 import           UCCrux.LLVM.Context.App (AppContext, log)
@@ -80,6 +82,7 @@ import           UCCrux.LLVM.FullType.MemType (toMemType)
 import           UCCrux.LLVM.Logging (Verbosity(Hi))
 import           UCCrux.LLVM.Module (makeFuncSymbol, makeGlobalSymbol, globalSymbol)
 import           UCCrux.LLVM.Overrides.Skip (SkipOverrideName)
+import           UCCrux.LLVM.PP (ppProgramLoc)
 import           UCCrux.LLVM.Setup (SymValue)
 import           UCCrux.LLVM.Setup.Monad (TypedSelector(..), mallocLocation)
 import           UCCrux.LLVM.Shape (Shape)
@@ -103,19 +106,12 @@ classifyAssertion ::
   What4.IsExpr (What4.SymExpr sym) =>
   sym ->
   What4.Pred sym ->
-  What4.ProgramLoc ->
-  Located (Explanation m arch argTypes)
-classifyAssertion _sym predicate loc =
+  Explanation m arch argTypes
+classifyAssertion _sym predicate =
   case What4.asConstantPred predicate of
     Just True -> panic "classifyAssertionFailure" ["Concretely true assertion failure??"]
-    Just False ->
-      Located
-        loc
-        (ExTruePositive ConcretelyFailingAssert)
-    Nothing ->
-      Located
-        loc
-        (ExUncertain UFailedAssert)
+    Just False -> ExTruePositive ConcretelyFailingAssert
+    Nothing -> ExUnclassified UnclassifiedFailedAssert
 
 elemsFromOffset ::
   DataLayout ->
@@ -134,21 +130,16 @@ unclass ::
   LLVMErrors.BadBehavior sym ->
   -- | Source position where error occurred
   What4.ProgramLoc ->
+  CallStack ->
   f (Explanation m arch argTypes)
-unclass appCtx badBehavior errorLoc =
+unclass appCtx badBehavior errorLoc callStack =
   do
     liftIO $
       (appCtx ^. log)
         Hi
         ("Couldn't classify error. At: " <> ppProgramLoc errorLoc)
-    pure $
-      ExUncertain $
-        UUnclassified $
-          case badBehavior of
-            LLVMErrors.BBUndefinedBehavior ub ->
-              UnclassifiedUndefinedBehavior errorLoc (UB.explain ub) (Some ub)
-            LLVMErrors.BBMemoryError memoryError ->
-              UnclassifiedMemoryError errorLoc (MemError.explain memoryError)
+    let bug = makeBug badBehavior errorLoc callStack
+    pure $ ExUnclassified $ UnclassifiedOther bug
 
 unfixed ::
   MonadIO f =>
@@ -165,7 +156,7 @@ unfixed appCtx tag errorLoc =
         ( "Prognosis: Fixable, but the fix is not yet implemented. At: "
             <> ppProgramLoc errorLoc
         )
-    pure $ ExUncertain (UUnfixed tag)
+    pure $ ExUnclassified (UnclassifiedUnfixed tag)
 
 unfixable ::
   MonadIO f =>
@@ -182,7 +173,7 @@ unfixable appCtx tag errorLoc =
         ( "Prognosis: Don't know how to fix this error. At: "
             <> ppProgramLoc errorLoc
         )
-    pure $ ExUncertain (UUnfixable tag)
+    pure $ ExUnclassified (UnclassifiedUnfixable tag)
 
 notAPointer ::
   Crucible.IsSymInterface sym =>
@@ -197,48 +188,6 @@ notAPointer sym ptr =
 -- true or false positive. If it is a false positive, deduce further
 -- preconditions.
 classifyBadBehavior ::
-  forall f m sym arch argTypes t st fs.
-  ( Crucible.IsSymInterface sym,
-    sym ~ What4.ExprBuilder t st fs, -- needed for asApp
-    MonadIO f,
-    ShowF (What4.SymAnnotation sym)
-  ) =>
-  AppContext ->
-  ModuleContext m arch ->
-  FunctionContext m arch argTypes ->
-  sym ->
-  -- | Initial LLVM memory (containing globals and functions)
-  LLVMMem.MemImpl sym ->
-  -- | Functions skipped during execution
-  Set SkipOverrideName ->
-  -- | Simulation error (including source position)
-  Crucible.SimError ->
-  -- | Function arguments
-  Crucible.RegMap sym (MapToCrucibleType arch argTypes) ->
-  -- | Term annotations (origins), see comment on
-  -- 'UCCrux.LLVM.Setup.Monad.resultAnnotations'.
-  Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes)) ->
-  -- | The arguments that were passed to the function
-  Ctx.Assignment (Shape m (SymValue sym arch)) argTypes ->
-  -- | Data about the error that occurred
-  LLVMErrors.BadBehavior sym ->
-  f (Located (Explanation m arch argTypes))
-classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError args annotations argShapes badBehavior =
-  Located (Crucible.simErrorLoc simError)
-    <$> doClassifyBadBehavior
-      appCtx
-      modCtx
-      funCtx
-      sym
-      memImpl
-      skipped
-      simError
-      args
-      annotations
-      argShapes
-      badBehavior
-
-doClassifyBadBehavior ::
   forall f m sym arch argTypes t st fs.
   ( Crucible.IsSymInterface sym,
     sym ~ What4.ExprBuilder t st fs, -- needed for asApp
@@ -264,8 +213,10 @@ doClassifyBadBehavior ::
   Ctx.Assignment (Shape m (SymValue sym arch)) argTypes ->
   -- | Data about the error that occurred
   LLVMErrors.BadBehavior sym ->
+  -- | Context in which error occurred
+  CallStack ->
   f (Explanation m arch argTypes)
-doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.RegMap _args) annotations argShapes badBehavior =
+classifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucible.RegMap _args) annotations argShapes badBehavior callStack =
   case badBehavior of
     LLVMErrors.BBUndefinedBehavior (UB.UDivByZero _dividend (Crucible.RV divisor)) ->
       handleDivRemByZero UDivByConcreteZero divisor
@@ -317,7 +268,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
               do
                 int <- liftIO $ getConcretePointerBlock ptr
                 case int of
-                  Nothing -> unclass appCtx badBehavior errorLoc
+                  Nothing -> unclass appCtx badBehavior errorLoc callStack
                   Just _ ->
                     do
                       let diagnosis = Diagnosis DiagnoseFreeBadOffset (selectWhere selector)
@@ -386,7 +337,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                                 "(" <> Text.pack (show (LLVMPtr.ppPtr ptr)) <> ")"
                               ]
                         unfixable appCtx tag errorLoc
-            _ -> unclass appCtx badBehavior errorLoc
+            _ -> unclass appCtx badBehavior errorLoc callStack
     LLVMErrors.BBUndefinedBehavior
       (UB.MemsetInvalidRegion (Crucible.RV ptr) _fillByte (Crucible.RV len)) ->
         do
@@ -409,12 +360,12 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                                   (elemsFromOffset' concreteLen partTypeRepr)
                               )
                           )
-            _ -> unclass appCtx badBehavior errorLoc
+            _ -> unclass appCtx badBehavior errorLoc callStack
     LLVMErrors.BBUndefinedBehavior
       (UB.PoisonValueCreated poison) ->
         classifyPoison appCtx sym annotations poison
           >>= \case
-            Nothing -> unclass appCtx badBehavior errorLoc
+            Nothing -> unclass appCtx badBehavior errorLoc callStack
             Just expl -> pure expl
     LLVMErrors.BBMemoryError
       ( MemError.MemoryError
@@ -440,7 +391,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                           -- TODO: This should probably be an error, it definitely *can*
                           -- arise from a use-after-free of an argument see
                           -- test/programs/use_after_free.c
-                          unclass appCtx badBehavior errorLoc
+                          unclass appCtx badBehavior errorLoc callStack
                         Right False ->
                           do
                             let diagnosis =
@@ -457,7 +408,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                 notPtr <- liftIO $ notAPointer sym ptr
                 case notPtr of
                   Just True -> truePositive WriteNonPointer
-                  _ -> unclass appCtx badBehavior errorLoc
+                  _ -> unclass appCtx badBehavior errorLoc callStack
             -- If the "pointer" concretely wasn't a pointer, it's a bug.
             _ -> requirePossiblePointer WriteNonPointer ptr
     LLVMErrors.BBMemoryError
@@ -523,10 +474,10 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                       -- variable.
                       if Set.null skipped
                         then truePositive (ReadUninitializedStack loc)
-                        else unclass appCtx badBehavior errorLoc
+                        else unclass appCtx badBehavior errorLoc callStack
                   Just (G.AllocInfo G.HeapAlloc _sz _mut _align loc) ->
                     if loc == mallocLocation
-                      then unclass appCtx badBehavior errorLoc
+                      then unclass appCtx badBehavior errorLoc callStack
                       else truePositive (ReadUninitializedHeap loc)
                   Just (G.AllocInfo G.GlobalAlloc _sz _mut _align _loc) ->
                     case flip Map.lookup (LLVMMem.memImplSymbolMap memImpl) =<< blk of
@@ -542,7 +493,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                                 unimplemented
                                   "classify"
                                   Unimplemented.NonEmptyUnboundedSizeArrays
-                              _ -> unclass appCtx badBehavior errorLoc
+                              _ -> unclass appCtx badBehavior errorLoc callStack
                           _ ->
                             panic
                               "classify"
@@ -574,10 +525,10 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                       truePositive (CallNonFunctionPointer loc)
                   Just (G.AllocInfo G.HeapAlloc _sz _mut _align loc) ->
                     if loc == mallocLocation
-                      then unclass appCtx badBehavior errorLoc
+                      then unclass appCtx badBehavior errorLoc callStack
                       else truePositive (CallNonFunctionPointer loc)
-                  _ -> unclass appCtx badBehavior errorLoc
-    _ -> unclass appCtx badBehavior errorLoc
+                  _ -> unclass appCtx badBehavior errorLoc callStack
+    _ -> unclass appCtx badBehavior errorLoc callStack
   where
     errorLoc = Crucible.simErrorLoc simError
 
@@ -688,7 +639,7 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
                           oneConstraint selector (BVCmp L.Ine w (BV.mkBV w 0))
                         )
                   _ -> panic "classify" ["Expected integer type"]
-            _ -> unclass appCtx badBehavior errorLoc
+            _ -> unclass appCtx badBehavior errorLoc callStack
         Just _ -> truePositive truePos
 
     argName :: Ctx.Index argTypes tp -> String
@@ -763,4 +714,4 @@ doClassifyBadBehavior appCtx modCtx funCtx sym memImpl skipped simError (Crucibl
         notPtr <- liftIO $ notAPointer sym ptr
         case (notPtr, null (getAnyPtrOffsetAnn ptr)) of
           (Just True, True) -> truePositive pos
-          _ -> unclass appCtx badBehavior errorLoc
+          _ -> unclass appCtx badBehavior errorLoc callStack

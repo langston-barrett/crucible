@@ -17,7 +17,6 @@ module UCCrux.LLVM.Stats
 where
 
 {- ORMOLU_DISABLE -}
-import           Control.Lens ((^.), to)
 import           Data.Foldable (toList)
 import qualified Data.Map.Strict as Map
 import           Data.Map.Strict (Map)
@@ -30,9 +29,10 @@ import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
 import qualified Prettyprinter.Render.Text as PP
 
-import           UCCrux.LLVM.Classify.Types (Located(..), ppLocated, DiagnosisTag, partitionUncertainty, diagnoseTag, TruePositive, ppTruePositive, Unfixable, ppUnfixable, Unfixed, ppUnfixed, doc, diagnosisTag)
+import           UCCrux.LLVM.Classify.Types (Located(..), ppLocated, DiagnosisTag, diagnoseTag, TruePositive, ppTruePositive, diagnosisTag, ppUnclassified)
 import           UCCrux.LLVM.Run.Result (BugfindingResult(..), FunctionSummaryTag)
 import qualified UCCrux.LLVM.Run.Result as Result
+import           UCCrux.LLVM.Run.Simulate.Uncertainty (partitionUncertainty)
 import           UCCrux.LLVM.Errors.Unimplemented (Unimplemented, ppUnimplemented)
 {- ORMOLU_ENABLE -}
 
@@ -44,8 +44,6 @@ data Stats = Stats
     unclassifiedFreq :: Map Text Word,
     diagnosisFreq :: Map DiagnosisTag Word,
     unimplementedFreq :: Map Unimplemented Word,
-    unfixableFreq :: Map Unfixable Word,
-    unfixedFreq :: Map Unfixed Word,
     summaries :: Map FunctionSummaryTag Word
   }
   deriving (Eq, Ord)
@@ -55,22 +53,25 @@ frequencies = foldr (\tag mp -> Map.insertWith (+) tag 1 mp) Map.empty
 
 getStats :: BugfindingResult m arch argTypes -> Stats
 getStats result =
-  let (missingAnns, failedAsserts, unimplementeds, unclass, unfixed, unfixable, timeouts') = partitionUncertainty (uncertainResults result)
+  let (missingAnns, failedAsserts, unimplementeds, timeouts', _) = partitionUncertainty (uncertainResults result)
+      unclass =
+        case Result.summary result of
+          Result.Unclear un -> toList un
+          _ -> []
    in Stats
         { missingAnnotation = toEnum $ length missingAnns,
           symbolicallyFailedAssert = toEnum $ length failedAsserts,
           timeouts = toEnum $ length timeouts',
           truePositiveFreq =
             case Result.summary result of
-              Result.FoundBugs bugs -> frequencies (toList bugs)
+              Result.LikelyBugs _imprecision bugs -> frequencies (toList bugs)
               _ -> Map.empty,
           unclassifiedFreq =
-            frequencies (map (^. to locatedValue . doc . to render . to trunc) unclass),
+            frequencies
+              (map (trunc . render . ppUnclassified . locatedValue) unclass),
           diagnosisFreq =
             frequencies (map diagnosisTag (deducedPreconditions result)),
           unimplementedFreq = frequencies (map (panicComponent . locatedValue) unimplementeds),
-          unfixedFreq = frequencies (map locatedValue unfixed),
-          unfixableFreq = frequencies (map locatedValue unfixable),
           summaries = Map.singleton (Result.functionSummaryTag (Result.summary result)) 1
         }
   where
@@ -105,8 +106,6 @@ ppStats stats =
         $ PP.vsep
           [ PP.pretty ("Uncertain results:" :: Text),
             PP.pretty ("Timeouts:" :: Text) PP.<+> PP.viaShow (timeouts stats),
-            ppFreq "Unfixable errors:" (PP.pretty . ppUnfixable) (unfixableFreq stats),
-            ppFreq "Unfixed errors:" (PP.pretty . ppUnfixed) (unfixedFreq stats),
             ppFreq
               "Unclassified errors:"
               PP.pretty
@@ -139,8 +138,6 @@ instance Semigroup Stats where
             truePositiveFreq = unionWithPlus truePositiveFreq,
             diagnosisFreq = unionWithPlus diagnosisFreq,
             unimplementedFreq = unionWithPlus unimplementedFreq,
-            unfixedFreq = unionWithPlus unfixedFreq,
-            unfixableFreq = unionWithPlus unfixableFreq,
             summaries = Map.unionWith (+) (summaries stats1) (summaries stats2)
           }
 
@@ -154,7 +151,5 @@ instance Monoid Stats where
         truePositiveFreq = Map.empty,
         diagnosisFreq = Map.empty,
         unimplementedFreq = Map.empty,
-        unfixedFreq = Map.empty,
-        unfixableFreq = Map.empty,
         summaries = Map.empty
       }

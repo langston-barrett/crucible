@@ -318,12 +318,10 @@ inferThenCheck appCtx modCtx halloc cruxOpts llOpts toInfer entries =
       Maybe (Some (TypedConstraints m'))
     getConstraints (Result.SomeBugfindingResult types result _) =
       case Result.summary result of
-        Result.AlwaysSafe {} -> Nothing
-        Result.FoundBugs {} -> Nothing
-        Result.SafeUpToBounds {} -> Nothing
+        Result.LikelySafe {} -> Nothing
+        Result.LikelyBugs {} -> Nothing
         Result.Unclear {} -> Nothing
-        Result.SafeWithPreconditions Result.DidHitBounds _ _ -> Nothing
-        Result.SafeWithPreconditions Result.DidntHitBounds _unsound cs ->
+        Result.SafeWithPreconditions _unsound cs ->
           Just (Some (TypedConstraints cs types))
 
 ppSomeCheckResult ::

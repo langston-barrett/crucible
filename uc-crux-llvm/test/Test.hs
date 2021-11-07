@@ -72,7 +72,6 @@ import           Data.Parameterized.NatRepr (NatRepr, knownNat)
 import           UCCrux.LLVM.Main (loopOnFunctions)
 import           UCCrux.LLVM.Context.App (AppContext)
 import           UCCrux.LLVM.Context.Module (defnTypes)
-import           UCCrux.LLVM.Equivalence (NonEmptyCrashDiff, reportDiffs, getCrashDiffs)
 import           UCCrux.LLVM.Errors.Unimplemented (catchUnimplemented)
 import           UCCrux.LLVM.Cursor (Cursor(..))
 import           UCCrux.LLVM.Classify.Types (partitionUncertainty)
@@ -82,7 +81,7 @@ import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName, functionNameFr
 import           UCCrux.LLVM.Overrides.Skip (SkipOverrideName(..))
 import           UCCrux.LLVM.Overrides.Unsound (UnsoundOverrideName(..))
 import           UCCrux.LLVM.Run.EntryPoints (makeEntryPointsOrThrow)
-import           UCCrux.LLVM.Run.Result (SomeBugfindingResult', DidHitBounds(DidHitBounds, DidntHitBounds))
+import           UCCrux.LLVM.Run.Result (SomeBugfindingResult')
 import qualified UCCrux.LLVM.Run.Result as Result
 import           UCCrux.LLVM.Run.Unsoundness (Unsoundness(..))
 
@@ -147,41 +146,6 @@ getCrashDiff path1 mod1 path2 mod2 =
                llOpts
                [] -- All functions in the intersection of both modules
 
-checkCrashDiff ::
-  FilePath ->
-  L.Module ->
-  FilePath ->
-  L.Module ->
-  -- | Should the check be for strict equivalence?
-  Bool ->
-  -- | Should the result be inverted?
-  Bool ->
-  TT.TestTree
-checkCrashDiff path1 mod1 path2 mod2 equivalent invert =
-  TH.testCase
-    ( unwords
-        [ path1,
-          if equivalent
-            then "is crash-equivalent to"
-            else "crashes less than",
-          path2
-        ]
-    )
-    $ do
-      (appCtx, (diffs12, diffs21)) <- getCrashDiff path1 mod1 path2 mod2
-      let diffs21' = if equivalent then diffs21 else []
-      reportDiffs appCtx diffs12 diffs21'
-      unless ((if invert then not else id) (null diffs12 && null diffs21')) $
-        TH.assertFailure
-          ( unwords
-              [ "Expected",
-                path1,
-                "and",
-                path2,
-                "to",
-                (if invert then "not " else "") ++ "be crash-equivalent."
-              ]
-          )
 
 inFile :: FilePath -> [(String, String -> SomeBugfindingResult' -> IO ())] -> TT.TestTree
 inFile file specs =
@@ -1491,37 +1455,7 @@ moduleTests =
       inModule
         "srem_neg2_right.c"
         sremNeg2Right
-        [("srem_neg2_right", isSafeWithPreconditions mempty DidntHitBounds)],
-      -- This one passes because they share no functions to be tested for
-      -- equivalence:
-      checkCrashDiff "add1_left.c" add1Left "udiv0_left.c" udiv0Left True False,
-      -- This one passes because add1_left.c doesn't crash, whereas udiv0_left.c
-      -- does, so the latter's crashes are a superset of the former's. We have to
-      -- rename the function in add1_left.c to match, though.
-      checkCrashDiff
-        "udiv0_left.c"
-        udiv0Left
-        "add1_left.c"
-        (oneArithLeft "udiv0_left" i32 (L.ValInteger 1) (L.Add False False))
-        False
-        False,
-      -- This is the inverse of the above: udiv0_left.c *isn't* crash-less-than
-      -- add1_left.c.
-      checkCrashDiff
-        "add1_left.c"
-        (oneArithLeft "udiv0_left" i32 (L.ValInteger 1) (L.Add False False))
-        "udiv0_left.c"
-        udiv0Left
-        True
-        True,
-      TQ.testProperty "Crash equivalence is reflexive" $
-        \(ArithModule llvmModule) ->
-          TQ.ioProperty $
-            do
-              (appCtx, (diffs12, diffs21)) <-
-                getCrashDiff "fake1" llvmModule "fake2" llvmModule
-              reportDiffs appCtx diffs12 diffs21
-              pure (null diffs12 && null diffs21)
+        [("srem_neg2_right", isSafeWithPreconditions mempty DidntHitBounds)]
     ]
 
 main :: IO ()

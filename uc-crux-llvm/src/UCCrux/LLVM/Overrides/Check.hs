@@ -452,7 +452,7 @@ checkOverrideFromResult ::
   Maybe (PolymorphicLLVMOverride arch p sym)
 checkOverrideFromResult appCtx modCtx ref argFTys cfg f result =
   case Result.summary result of
-    Result.SafeWithPreconditions _bounds _unsound constraints ->
+    Result.SafeWithPreconditions _unsound constraints ->
       Just $
         createCheckOverride
           appCtx

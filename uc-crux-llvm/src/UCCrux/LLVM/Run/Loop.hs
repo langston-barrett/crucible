@@ -76,7 +76,9 @@ import           UCCrux.LLVM.Run.EntryPoints (EntryPoints, getEntryPoints, makeE
 import           UCCrux.LLVM.Run.Result (BugfindingResult(..), SomeBugfindingResult(..))
 import qualified UCCrux.LLVM.Run.Result as Result
 import qualified UCCrux.LLVM.Run.Simulate as Sim
-import           UCCrux.LLVM.Run.Unsoundness (Unsoundness)
+import           UCCrux.LLVM.Run.Simulate.Imprecision (Imprecision)
+import           UCCrux.LLVM.Run.Simulate.Uncertainty (Uncertainty)
+import           UCCrux.LLVM.Run.Simulate.Unsoundness (Unsoundness)
 {- ORMOLU_ENABLE -}
 
 -- | Run the simulator in a loop, creating a 'BugfindingResult'
@@ -104,33 +106,39 @@ bugfindingLoopWithCallbacks appCtx modCtx funCtx cfg cruxOpts llvmOpts halloc ca
           Sim.runSimulatorWithCallbacks appCtx modCtx funCtx halloc preconds cfg cruxOpts llvmOpts callbacks
 
     -- Loop, learning preconditions and reporting errors
-    let loop constraints results unsoundness =
+    let loop constraints results unsoundness imprecision =
           do
             -- TODO(lb) We basically ignore symbolic assertion failures. Maybe
             -- configurably don't?
             (simResult, r) <- runSim constraints
-            let newExpls = Sim.explanations simResult
-            let (_, newConstraints, _, _) =
-                  partitionExplanations locatedValue newExpls
+            let newResults = Sim.explanations simResult
+            let newUncertainty = Sim.uncertainty simResult
+            let (_, newConstraints, _) =
+                  partitionExplanations locatedValue newResults
             let (_, newConstraints') = unzip (map locatedValue newConstraints)
             let allConstraints = addConstraints constraints (concat newConstraints')
             let allUnsoundness = unsoundness <> Sim.unsoundness simResult
+            let allImprecision = imprecision <> Sim.imprecision simResult
             let allResults = results Seq.|> (simResult, r)
-            if shouldStop newExpls
+            if shouldStop newUncertainty newResults
               then
                 pure
                   ( makeResult
                       allConstraints
-                      (concatMap (Sim.explanations . fst) (toList allResults))
-                      allUnsoundness,
+                      -- It suffices to use the latest uncertainty, because we
+                      -- stop if there's any.
+                      (toList newUncertainty)
+                      (concatMap (Sim.explanations . fst) allResults)
+                      allUnsoundness
+                      allImprecision,
                     allResults
                   )
               else do
                 (appCtx ^. log) Hi "New preconditions:"
                 (appCtx ^. log) Hi $ Text.pack (show (ppConstraints allConstraints))
-                loop allConstraints allResults allUnsoundness
+                loop allConstraints allResults allUnsoundness allImprecision
 
-    loop (emptyConstraints (funCtx ^. argumentFullTypes)) Seq.empty mempty
+    loop (emptyConstraints (funCtx ^. argumentFullTypes)) Seq.empty mempty mempty
   where
     addConstraints ::
       Constraints m argTypes ->
@@ -150,34 +158,31 @@ bugfindingLoopWithCallbacks appCtx modCtx funCtx cfg cruxOpts llvmOpts halloc ca
 
     -- Given these results from simulation, should we continue looping?
     shouldStop ::
+      [Located Uncertainty] ->
       [Located (Explanation m arch argTypes)] ->
       Bool
-    shouldStop expls =
-      let (truePositives, constraints, uncertain, resourceExhausted) =
+    shouldStop uncertain expls =
+      let (truePositives, constraints, unclassified) =
             partitionExplanations locatedValue expls
-       in case ( null constraints,
-                 truePositives,
-                 not (null uncertain),
-                 not (null resourceExhausted)
-               ) of
-            (True, [], False, _) ->
-              -- No new constraints were learned, nor were any bugs found, nor
-              -- was there any uncertain results. The code is conditionally
-              -- safe, we can stop here.
-              True
-            (noNewConstraints, _, isUncertain, isExhausted) ->
-              -- We can't proceed if (1) new input constraints weren't learned,
-              -- (2) uncertainty was encountered, or (3) resource bounds were
-              -- exhausted.
-              noNewConstraints || isUncertain || isExhausted
+       in
+        -- If there was any uncertainty (timeouts, etc.) stop here
+        not (null uncertain) ||
+          -- If the heuristic couldn't classify any errors, stop here
+          not (null unclassified) ||
+          -- No new constraints were learned, nor were any bugs found, nor
+          -- was there any uncertain results. The code is conditionally
+          -- safe, we can stop here.
+          (null truePositives && null constraints)
 
     makeResult ::
       Constraints m argTypes ->
+      [Located Uncertainty] ->
       [Located (Explanation m arch argTypes)] ->
       Unsoundness ->
+      Imprecision ->
       BugfindingResult m arch argTypes
-    makeResult constraints expls unsoundness =
-      let (truePositives, newConstraints, uncertain, resourceExhausted) =
+    makeResult constraints uncertain expls unsoundness imprecision =
+      let (truePositives, newConstraints, unclassified) =
             partitionExplanations locatedValue (toList expls)
           (precondTags, _) = unzip (map locatedValue newConstraints)
        in BugfindingResult
@@ -185,13 +190,10 @@ bugfindingLoopWithCallbacks appCtx modCtx funCtx cfg cruxOpts llvmOpts halloc ca
             precondTags
             ( Result.makeFunctionSummary
                 constraints
-                uncertain
                 truePositives
-                ( if null resourceExhausted
-                    then Result.DidntHitBounds
-                    else Result.DidHitBounds
-                )
+                unclassified
                 unsoundness
+                imprecision
             )
 
 -- | Run the simulator in a loop, creating a 'BugfindingResult'

@@ -39,7 +39,6 @@ import           Crux.LLVM.Config (LLVMOptions, llvmCruxConfig)
 import           CruxLLVMMain (processLLVMOptions)
 
 import           UCCrux.LLVM.Context.App (AppContext, makeAppContext)
-import qualified UCCrux.LLVM.Equivalence.Config as EqConfig
 import qualified UCCrux.LLVM.Run.Explore.Config as ExConfig
 import           UCCrux.LLVM.Logging (verbosityFromInt)
 import           UCCrux.LLVM.Main.Config.Type (TopLevelConfig)
@@ -125,26 +124,14 @@ processUCCruxLLVMOptions (initCOpts, initUCOpts) =
                 case entries of
                   Just ents -> Config.RunOn ents (checkFrom initUCOpts)
                   Nothing ->
-                    if doExplore initUCOpts
-                    then
-                      Config.Explore
-                        (ExConfig.ExploreConfig
-                          { ExConfig.exploreAgain = reExplore initUCOpts,
-                            ExConfig.exploreBudget = exploreBudget initUCOpts,
-                            ExConfig.exploreTimeout = exploreTimeout initUCOpts,
-                            ExConfig.exploreParallel = exploreParallel initUCOpts,
-                            ExConfig.exploreSkipFunctions = skipFunctions initUCOpts
-                          })
-                    else
-                      Config.CrashEquivalence
-                        (EqConfig.EquivalenceConfig
-                          { EqConfig.equivOrOrder =
-                              if crashEquivalence initUCOpts
-                              then EqConfig.Equivalence
-                              else EqConfig.Order,
-                            EqConfig.equivModule = crashOrder initUCOpts,
-                            EqConfig.equivEntryPoints = entryPoints initUCOpts
-                          })
+                    Config.Explore
+                      (ExConfig.ExploreConfig
+                        { ExConfig.exploreAgain = reExplore initUCOpts,
+                          ExConfig.exploreBudget = exploreBudget initUCOpts,
+                          ExConfig.exploreTimeout = exploreTimeout initUCOpts,
+                          ExConfig.exploreParallel = exploreParallel initUCOpts,
+                          ExConfig.exploreSkipFunctions = skipFunctions initUCOpts
+                        })
             }
 
     return (appCtx, finalCOpts, topConf)

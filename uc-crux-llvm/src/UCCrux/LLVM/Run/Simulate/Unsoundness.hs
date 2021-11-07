@@ -1,14 +1,16 @@
 {-
-Module       : UCCrux.LLVM.Run.Unsoundness
+Module       : UCCrux.LLVM.Run.Simulate.Unsoundness
 Description  : Tracking sources of unsoundness
 Copyright    : (c) Galois, Inc 2021
 License      : BSD3
 Maintainer   : Langston Barrett <langston@galois.com>
 Stability    : provisional
+
+See also "UCCrux.LLVM.Run.Simulate.Imprecision".
 -}
 {-# LANGUAGE DeriveFunctor #-}
 
-module UCCrux.LLVM.Run.Unsoundness
+module UCCrux.LLVM.Run.Simulate.Unsoundness
   ( Unsoundness (..),
     WithUnsoundness (..),
     ppUnsoundness,
@@ -18,7 +20,6 @@ where
 {- ORMOLU_DISABLE -}
 import           Data.Set (Set)
 import qualified Data.Set as Set
-import           Data.Void (Void)
 
 import           Prettyprinter (Doc)
 import qualified Prettyprinter as PP
@@ -34,13 +35,15 @@ data WithUnsoundness a = WithUnsoundness
   }
   deriving (Eq, Functor, Ord, Show)
 
+-- | 'Unsoundness' are under-approximations of the set of all possible runtime
+-- behaviors of the program.
 data Unsoundness = Unsoundness
   { unsoundOverridesUsed :: Set UnsoundOverrideName,
     unsoundSkipOverridesUsed :: Set SkipOverrideName
   }
   deriving (Eq, Ord, Show)
 
-ppUnsoundness :: Unsoundness -> Doc Void
+ppUnsoundness :: Unsoundness -> Doc ann
 ppUnsoundness u =
   PP.nest 2 $
     PP.vcat $

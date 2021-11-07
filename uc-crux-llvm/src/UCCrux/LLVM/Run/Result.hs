@@ -20,7 +20,6 @@ module UCCrux.LLVM.Run.Result
     SomeBugfindingResult' (..),
     FunctionSummary (..),
     FunctionSummaryTag (..),
-    DidHitBounds (..),
     functionSummaryTag,
     ppFunctionSummaryTag,
     makeFunctionSummary,
@@ -43,39 +42,37 @@ import qualified Prettyprinter.Render.Text as PP
 import           Data.Parameterized.Ctx (Ctx)
 import           Data.Parameterized.Context (Assignment)
 
-import           UCCrux.LLVM.Classify.Types (Located, ppLocated, TruePositive, ppTruePositive, Uncertainty, ppUncertainty, Diagnosis)
+import           UCCrux.LLVM.Classify.Types (Located(..), ppLocated, TruePositive, ppTruePositive, Diagnosis, Unclassified, ppUnclassified)
 import           UCCrux.LLVM.Constraints (isEmpty, ppConstraints, Constraints(..))
 import           UCCrux.LLVM.FullType.Type (FullType, FullTypeRepr)
 import           UCCrux.LLVM.Run.Simulate (UCCruxSimulationResult)
-import           UCCrux.LLVM.Run.Unsoundness (Unsoundness, ppUnsoundness)
+import           UCCrux.LLVM.Run.Simulate.Uncertainty (Uncertainty(..))
+import           UCCrux.LLVM.Run.Simulate.Imprecision (Imprecision, ppImprecision)
+import           UCCrux.LLVM.Run.Simulate.Unsoundness (Unsoundness, ppUnsoundness)
 {- ORMOLU_ENABLE -}
 
 data FunctionSummaryTag
   = TagUnclear
-  | TagFoundBugs
+  | TagLikelyBugs
   | TagSafeWithPreconditions
-  | TagSafeUpToBounds
-  | TagAlwaysSafe
+  | TagLikelySafe
   deriving (Bounded, Enum, Eq, Ord)
 
 functionSummaryTag :: FunctionSummary m argTypes -> FunctionSummaryTag
 functionSummaryTag =
   \case
     Unclear {} -> TagUnclear
-    FoundBugs {} -> TagFoundBugs
+    LikelyBugs {} -> TagLikelyBugs
     SafeWithPreconditions {} -> TagSafeWithPreconditions
-    SafeUpToBounds {} -> TagSafeUpToBounds
-    AlwaysSafe {} -> TagAlwaysSafe
+    LikelySafe {} -> TagLikelySafe
 
 ppFunctionSummaryTag :: FunctionSummaryTag -> Text
 ppFunctionSummaryTag =
   \case
-    TagUnclear ->
-      "Unclear result, errors are either false or true positives (or timeouts were hit)"
-    TagFoundBugs -> "Found likely bugs"
+    TagUnclear -> "Unclear result, couldn't tell if errors are feasible"
+    TagLikelyBugs -> "Found likely bugs"
     TagSafeWithPreconditions -> "Function is safe if deduced preconditions are met"
-    TagSafeUpToBounds -> "Function is safe up to the specified bounds on loops/recursion"
-    TagAlwaysSafe -> "Function is always safe"
+    TagLikelySafe -> "Function is always safe"
 
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
@@ -83,11 +80,10 @@ ppFunctionSummaryTag =
 -- TODO: It would be great to have more provenance information for the
 -- 'Constraints'. What bug does a given constraint help avoid? On what line?
 data FunctionSummary m (argTypes :: Ctx (FullType m))
-  = Unclear (NonEmpty (Located Uncertainty))
-  | FoundBugs (NonEmpty (Located TruePositive))
-  | SafeWithPreconditions DidHitBounds Unsoundness (Constraints m argTypes)
-  | SafeUpToBounds Unsoundness
-  | AlwaysSafe Unsoundness
+  = Unclear (NonEmpty (Located Unclassified))
+  | LikelyBugs Imprecision (NonEmpty (Located TruePositive))
+  | SafeWithPreconditions Unsoundness (Constraints m argTypes)
+  | LikelySafe Unsoundness
 
 -- | The result of running the bugfinding/contract inference main loop. Contains
 -- both the final, summary result ('BugfindingResult'), as well as the sequence
@@ -115,28 +111,27 @@ ppFunctionSummary :: FunctionSummary m argTypes -> Doc Void
 ppFunctionSummary fs =
   PP.pretty (ppFunctionSummaryTag (functionSummaryTag fs))
     <> case fs of
-      Unclear uncertainties ->
+      Unclear unclass ->
         PP.pretty $
           ":\n"
             <> Text.intercalate
               "\n----------\n"
-              (toList (fmap (ppLocated ppUncertainty) uncertainties))
-      FoundBugs bugs ->
-        PP.pretty $
-          ":\n"
-            <> Text.intercalate
-              "\n----------\n"
-              (toList (fmap (ppLocated ppTruePositive) bugs))
-      SafeWithPreconditions b u preconditions ->
+              (let ppU = PP.renderStrict . (PP.layoutPretty PP.defaultLayoutOptions) . ppUnclassified
+               in toList (fmap (ppLocated ppU) unclass))
+      LikelyBugs imprecision bugs ->
         PP.pretty
           (":\n" :: Text)
-          <> if didHit b
-            then PP.pretty ("The loop/recursion bound is not exceeded, and:\n" :: Text)
-            else
-              ppConstraints preconditions
-                <> ppUnsoundness' u
-      AlwaysSafe u -> "." <> ppUnsoundness' u
-      SafeUpToBounds u -> "." <> ppUnsoundness' u
+          <> PP.pretty
+               (Text.intercalate
+                 "\n----------\n"
+                 (toList (fmap (ppLocated ppTruePositive) bugs)))
+          <> ppImprecision' imprecision
+      SafeWithPreconditions u preconditions ->
+        PP.pretty
+          (":\n" :: Text)
+          <> ppConstraints preconditions
+               <> ppUnsoundness' u
+      LikelySafe u -> "." <> ppUnsoundness' u
   where
     ppUnsoundness' u =
       if mempty == u
@@ -151,37 +146,35 @@ ppFunctionSummary fs =
             )
             <> ppUnsoundness u
 
+    ppImprecision' i =
+      if mempty == i
+        then mempty
+        else
+          PP.pretty
+            ( Text.unwords
+                [ "\nIn addition to any assumptions listed above, the",
+                  "following sources of imprecision may invalidate this",
+                  "claim:\n"
+                ]
+            )
+            <> ppImprecision i
+
 printFunctionSummary :: FunctionSummary m argTypes -> Text
 printFunctionSummary fs =
   PP.renderStrict (PP.layoutPretty PP.defaultLayoutOptions (ppFunctionSummary fs))
 
--- | Did symbolic execution run into loop/recursion bounds?
-data DidHitBounds
-  = -- | Yes, it did.
-    DidHitBounds
-  | -- | No, it didn\'t.
-    DidntHitBounds
-  deriving (Bounded, Enum, Eq, Ord, Show)
-
-didHit :: DidHitBounds -> Bool
-didHit =
-  \case
-    DidHitBounds -> True
-    DidntHitBounds -> False
-
--- NOTE(lb): Unsoundness is not reported to the user when the result is
--- uncertain, because no claim is being made that unsoundness could make false.
+-- NOTE(lb): Unsoundness is only reported if a safety claim is being made, and
+-- imprecision is only reported if an unsafety claim is being made.
 makeFunctionSummary ::
   Constraints m argTypes ->
-  [Located Uncertainty] ->
   [Located TruePositive] ->
-  DidHitBounds ->
+  [Located Unclassified] ->
   Unsoundness ->
+  Imprecision ->
   FunctionSummary m argTypes
-makeFunctionSummary preconditions uncertainties truePositives bounds unsoundness =
-  case (isEmpty preconditions, uncertainties, truePositives, bounds) of
-    (True, [], [], DidntHitBounds) -> AlwaysSafe unsoundness
-    (True, [], [], DidHitBounds) -> SafeUpToBounds unsoundness
-    (False, [], [], b) -> SafeWithPreconditions b unsoundness preconditions
-    (_, [], t : ts, _) -> FoundBugs (t :| ts)
-    (_, u : us, _, _) -> Unclear (u :| us)
+makeFunctionSummary preconditions truePositives unclass unsoundness imprecision =
+  case (isEmpty preconditions, truePositives, unclass) of
+    (True, [], []) -> LikelySafe unsoundness
+    (False, [], _) -> SafeWithPreconditions unsoundness preconditions
+    (_, t : ts, _) -> LikelyBugs imprecision (t :| ts)
+    (_, _, u : us) -> Unclear (u :| us)

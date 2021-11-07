@@ -104,7 +104,7 @@ import           Crux.LLVM.Simulate (setupSimCtxt)
 
  -- local
 import           UCCrux.LLVM.Classify (classifyAssertion, classifyBadBehavior)
-import           UCCrux.LLVM.Classify.Types (Located(Located), Explanation(..), Uncertainty(..), ppProgramLoc)
+import           UCCrux.LLVM.Classify.Types (Located(Located), Explanation(..))
 import           UCCrux.LLVM.Constraints (Constraints, returnConstraints, relationalConstraints)
 import           UCCrux.LLVM.Context.App (AppContext, log)
 import           UCCrux.LLVM.Context.Function (FunctionContext, functionName)
@@ -116,8 +116,10 @@ import           UCCrux.LLVM.Overrides.Skip (SkipOverrideName, unsoundSkipOverri
 import           UCCrux.LLVM.Overrides.Polymorphic (PolymorphicLLVMOverride, getPolymorphicLLVMOverride, getForAllSymArch)
 import           UCCrux.LLVM.Overrides.Unsound (UnsoundOverrideName, unsoundOverrides)
 import           UCCrux.LLVM.FullType.Type (FullType, MapToCrucibleType)
-import           UCCrux.LLVM.PP (ppRegMap)
-import           UCCrux.LLVM.Run.Unsoundness (Unsoundness(Unsoundness))
+import           UCCrux.LLVM.PP (ppRegMap, ppProgramLoc)
+import           UCCrux.LLVM.Run.Simulate.Imprecision (Imprecision(Imprecision))
+import           UCCrux.LLVM.Run.Simulate.Uncertainty (Uncertainty(..))
+import           UCCrux.LLVM.Run.Simulate.Unsoundness (Unsoundness(Unsoundness))
 import           UCCrux.LLVM.Setup (setupExecution, SetupResult(SetupResult), SymValue)
 import           UCCrux.LLVM.Setup.Assume (assume)
 import           UCCrux.LLVM.Setup.Monad (TypedSelector)
@@ -152,6 +154,8 @@ symCreateOverrideFn = SymCreateOverrideFn . runCreateOverrideFn
 -- compatibility.
 data UCCruxSimulationResult m arch (argTypes :: Ctx (FullType m)) = UCCruxSimulationResult
   { unsoundness :: Unsoundness,
+    imprecision :: Imprecision,
+    uncertainty :: [Located Uncertainty],
     explanations :: [Located (Explanation m arch argTypes)]
   }
 
@@ -305,6 +309,7 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
        -- References written to during simulation
        bbMapRef <- IORef.newIORef (Map.empty :: LLVMAnnMap sym)
        explRef <- IORef.newIORef []
+       uncertainRef <- IORef.newIORef []
        skipReturnValueAnns <- IORef.newIORef Map.empty
        skipOverrideRef <- IORef.newIORef Set.empty
        let ?lc = modCtx ^. moduleTranslation . transContext . llvmTypeCtx
@@ -325,10 +330,10 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
                setupHook sym uOverrides overrides skipOverrideRef memRef argRef argAnnRef argShapeRef skipReturnValueAnns
            , Crux.onErrorHook =
              \sym ->
-               return (onErrorHook sym skipOverrideRef memRef argRef argAnnRef argShapeRef bbMapRef explRef skipReturnValueAnns)
+               return (onErrorHook sym skipOverrideRef memRef argRef argAnnRef argShapeRef bbMapRef explRef uncertainRef skipReturnValueAnns)
            , Crux.resultHook =
              \sym result ->
-               mkResultHook sym skipOverrideRef unsoundOverrideRef explRef memRef argShapeRef result resHook
+               mkResultHook sym skipOverrideRef unsoundOverrideRef explRef uncertainRef memRef argShapeRef result resHook
            }
   where
     setupHook ::
@@ -461,9 +466,10 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
       IORef (Maybe (Assignment (Shape m (SymValue sym arch)) argTypes)) ->
       IORef (LLVMAnnMap sym) ->
       IORef [Located (Explanation m arch argTypes)] ->
+      IORef [Located Uncertainty] ->
       IORef (Map.Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes))) ->
       Crux.Explainer sym t Void
-    onErrorHook sym skipOverrideRef memRef argRef argAnnRef argShapeRef bbMapRef explRef skipReturnValueAnnotations _groundEvalFn gl =
+    onErrorHook sym skipOverrideRef memRef argRef argAnnRef argShapeRef bbMapRef explRef uncertainRef skipReturnValueAnnotations _groundEvalFn gl =
       do
         let rd = panic "onErrorHook" ["IORef not written during simulation"]
         -- Read info from initial state
@@ -481,25 +487,31 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
               Just _ ->
                 panic "simulateLLVM" ["Unexplained error: no error for annotation."]
               Nothing ->
-                IORef.modifyIORef explRef . (:) $
                   case gl ^. Crucible.labeledPredMsg . to Crucible.simErrorReason of
                     Crucible.ResourceExhausted msg ->
-                      Located loc (ExExhaustedBounds msg)
+                      IORef.modifyIORef
+                        uncertainRef
+                        (Located loc (UExhaustedBounds (Text.pack msg)):)
                     Crucible.AssertFailureSimError msg _ ->
                       if "Call to assert" `isInfixOf` msg -- HACK
                         then
-                          classifyAssertion
-                            sym
-                            (gl ^. Crucible.labeledPred)
-                            loc
+                          let expl =
+                                classifyAssertion
+                                  sym
+                                  (gl ^. Crucible.labeledPred)
+                         in IORef.modifyIORef explRef (Located loc expl:)
                         else
-                          Located
-                            loc
-                            (ExUncertain (UMissingAnnotation (gl ^. Crucible.labeledPredMsg)))
+                          IORef.modifyIORef
+                            uncertainRef
+                            (Located
+                              loc
+                              (UMissingAnnotation (gl ^. Crucible.labeledPredMsg)):)
                     _ ->
-                      Located
-                        loc
-                        (ExUncertain (UMissingAnnotation (gl ^. Crucible.labeledPredMsg)))
+                      IORef.modifyIORef
+                        uncertainRef
+                        (Located
+                          loc
+                          (UMissingAnnotation (gl ^. Crucible.labeledPredMsg)):)
           Just (callStack, badBehavior) ->
             do
               -- Helpful for debugging:
@@ -513,19 +525,21 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
               liftIO $ (appCtx ^. log) Hi (render (ppCallStack callStack))
               skipped <- IORef.readIORef skipOverrideRef
               retAnns <- IORef.readIORef skipReturnValueAnnotations
-              classifyBadBehavior
-                appCtx
-                modCtx
-                funCtx
-                sym
-                mem
-                skipped
-                (gl ^. Crucible.labeledPredMsg)
-                args
-                (Map.union argAnnotations retAnns)
-                argShapes
-                badBehavior
-                >>= IORef.modifyIORef explRef . (:)
+              classification <-
+                classifyBadBehavior
+                  appCtx
+                  modCtx
+                  funCtx
+                  sym
+                  mem
+                  skipped
+                  (gl ^. Crucible.labeledPredMsg)
+                  args
+                  (Map.union argAnnotations retAnns)
+                  argShapes
+                  badBehavior
+                  callStack
+              IORef.modifyIORef explRef (Located loc classification:)
         return mempty
 
     mkResultHook ::
@@ -535,6 +549,7 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
       IORef (Set SkipOverrideName) ->
       IORef (Set UnsoundOverrideName) ->
       IORef [Located (Explanation m arch argTypes)] ->
+      IORef [Located Uncertainty] ->
       IORef (Maybe (MemImpl sym)) ->
       IORef (Maybe (Assignment (Shape m (SymValue sym arch)) argTypes)) ->
       Crux.CruxSimulationResult ->
@@ -545,7 +560,7 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
         UCCruxSimulationResult m arch argTypes ->
         IO r) ->
       IO r
-    mkResultHook sym skipOverrideRef unsoundOverrideRef explRef memRef argShapeRef cruxResult resHook =
+    mkResultHook sym skipOverrideRef unsoundOverrideRef explRef uncertainRef memRef argShapeRef cruxResult resHook =
       do for_ (traces cruxResult) $
            \trace ->
              do liftIO $ (appCtx ^. log) Hi "Trace:"
@@ -553,21 +568,23 @@ mkCallbacks appCtx modCtx funCtx halloc callbacks constraints cfg llvmOpts =
                   \loc ->
                     unless (What4.InternalPos == What4.plSourceLoc loc) $
                       liftIO $ (appCtx ^. log) Hi ("  " <> ppProgramLoc loc)
-
-         unsoundness' <-
-           Unsoundness
-             <$> IORef.readIORef unsoundOverrideRef
-               <*> IORef.readIORef skipOverrideRef
-         ucCruxResult <-
-           UCCruxSimulationResult unsoundness'
-             <$> case cruxResult of
+         skipOverridesUsed <- IORef.readIORef skipOverrideRef
+         unsoundOverridesUsed <- IORef.readIORef unsoundOverrideRef
+         uncertainties <-
+              case cruxResult of
                Crux.CruxSimulationResult Crux.ProgramIncomplete _ ->
                  pure
                    [ Located
                        What4.initializationLoc
-                       (ExUncertain (UTimeout (funCtx ^. functionName)))
+                       (UTimeout (funCtx ^. functionName))
                    ]
-               _ -> IORef.readIORef explRef
+               _ -> IORef.readIORef uncertainRef
+         ucCruxResult <-
+           UCCruxSimulationResult
+             (Unsoundness unsoundOverridesUsed skipOverridesUsed)
+             (Imprecision skipOverridesUsed)
+             uncertainties
+             <$> IORef.readIORef explRef
          let rd = panic "mkResultHook" ["IORef not written during simulation"]
          mem <- fromMaybe rd <$> IORef.readIORef memRef
          argShapes <- fromMaybe rd <$> IORef.readIORef argShapeRef
