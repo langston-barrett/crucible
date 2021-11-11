@@ -53,6 +53,8 @@ import           Lang.Crucible.Simulator.SimError (SimErrorReason(AssertFailureS
 import           Lang.Crucible.LLVM.Bytes (Bytes(..))
 import           Lang.Crucible.LLVM.DataLayout (noAlignment)
 import           Lang.Crucible.LLVM.MemModel
+import           Lang.Crucible.LLVM.MemModel.CallStack (getCallStack)
+import           Lang.Crucible.LLVM.MemModel.MemLog (memState)
 import           Lang.Crucible.LLVM.QQ( llvmOvr )
 
 import           Lang.Crucible.LLVM.Intrinsics.Common
@@ -573,7 +575,10 @@ llvmAbsOverride ::
 llvmAbsOverride w =
   let nm = L.Symbol ("llvm.abs.i" ++ show (natValue w)) in
     [llvmOvr| #w $nm( #w, i1 ) |]
-    (\_memOpts sym args -> Ctx.uncurryAssignment (Libc.callLLVMAbs sym w) args)
+    (\mvar sym args ->
+     do callStack <-
+          getCallStack . view (to memImplHeap . memState) <$> readGlobal mvar
+        Ctx.uncurryAssignment (Libc.callLLVMAbs sym callStack w) args)
 
 llvmCopysignOverride_F32 ::
   IsSymInterface sym =>

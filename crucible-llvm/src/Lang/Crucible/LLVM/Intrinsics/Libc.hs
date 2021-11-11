@@ -27,7 +27,7 @@
 
 module Lang.Crucible.LLVM.Intrinsics.Libc where
 
-import           Control.Lens ((^.), _1, _2, _3)
+import           Control.Lens ((^.), _1, _2, _3, to, use)
 import qualified Codec.Binary.UTF8.Generic as UTF8
 import           Control.Monad.Reader
 import           Control.Monad.State
@@ -55,8 +55,10 @@ import           Lang.Crucible.LLVM.Bytes
 import           Lang.Crucible.LLVM.DataLayout
 import qualified Lang.Crucible.LLVM.Errors.Poison as Poison
 import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as UB
+import           Lang.Crucible.LLVM.Eval (callStackFromMemVar)
 import           Lang.Crucible.LLVM.MalformedLLVMModule
 import           Lang.Crucible.LLVM.MemModel
+import           Lang.Crucible.LLVM.MemModel.CallStack (CallStack)
 import qualified Lang.Crucible.LLVM.MemModel.Type as G
 import qualified Lang.Crucible.LLVM.MemModel.Generic as G
 import           Lang.Crucible.LLVM.MemModel.Partial
@@ -275,6 +277,11 @@ llvmStrlenOverride =
 ------------------------------------------------------------------------
 -- ** Implementations
 
+callStackFromMemVar' ::
+  GlobalVar Mem ->
+  OverrideSim p sym ext r args ret CallStack
+callStackFromMemVar' mvar = use (to (flip callStackFromMemVar mvar))
+  
 ------------------------------------------------------------------------
 -- *** Allocation
 
@@ -1367,7 +1374,9 @@ llvmAbsOverride ::
       (BVType 32)
 llvmAbsOverride =
   [llvmOvr| i32 @abs( i32 ) |]
-  (\_ sym args -> Ctx.uncurryAssignment (callLibcAbs sym (knownNat @32)) args)
+  (\mvar sym args ->
+     do callStack <- callStackFromMemVar' mvar
+        Ctx.uncurryAssignment (callLibcAbs sym callStack (knownNat @32)) args)
 
 -- @labs@ uses `long` as its argument and result type, so we need two overrides
 -- for @labs@. See Note [Overrides involving (unsigned) long] in
@@ -1379,7 +1388,9 @@ llvmLAbsOverride_32 ::
       (BVType 32)
 llvmLAbsOverride_32 =
   [llvmOvr| i32 @labs( i32 ) |]
-  (\_ sym args -> Ctx.uncurryAssignment (callLibcAbs sym (knownNat @32)) args)
+  (\mvar sym args ->
+     do callStack <- callStackFromMemVar' mvar
+        Ctx.uncurryAssignment (callLibcAbs sym callStack (knownNat @32)) args)
 
 llvmLAbsOverride_64 ::
   (IsSymInterface sym, HasLLVMAnn sym) =>
@@ -1388,7 +1399,9 @@ llvmLAbsOverride_64 ::
       (BVType 64)
 llvmLAbsOverride_64 =
   [llvmOvr| i64 @labs( i64 ) |]
-  (\_ sym args -> Ctx.uncurryAssignment (callLibcAbs sym (knownNat @64)) args)
+  (\mvar sym args ->
+     do callStack <- callStackFromMemVar' mvar
+        Ctx.uncurryAssignment (callLibcAbs sym callStack (knownNat @64)) args)
 
 llvmLLAbsOverride ::
   (IsSymInterface sym, HasLLVMAnn sym) =>
@@ -1397,7 +1410,9 @@ llvmLLAbsOverride ::
       (BVType 64)
 llvmLLAbsOverride =
   [llvmOvr| i64 @llabs( i64 ) |]
-  (\_ sym args -> Ctx.uncurryAssignment (callLibcAbs sym (knownNat @64)) args)
+  (\mvar sym args ->
+     do callStack <- callStackFromMemVar' mvar
+        Ctx.uncurryAssignment (callLibcAbs sym callStack (knownNat @64)) args)
 
 callBSwap ::
   (1 <= width, IsSymInterface sym) =>
@@ -1427,16 +1442,17 @@ callAbs ::
   forall w p sym ext r args ret.
   (1 <= w, IsSymInterface sym, HasLLVMAnn sym) =>
   sym ->
+  CallStack ->
   CheckAbsIntMin ->
   NatRepr w ->
   RegEntry sym (BVType w) ->
   OverrideSim p sym ext r args ret (RegValue sym (BVType w))
-callAbs sym checkIntMin widthRepr (regValue -> src) = liftIO $ do
+callAbs sym callStack checkIntMin widthRepr (regValue -> src) = liftIO $ do
   bvIntMin    <- bvLit sym widthRepr (BV.minSigned widthRepr)
   isNotIntMin <- notPred sym =<< bvEq sym src bvIntMin
 
   when shouldCheckIntMin $ do
-    isNotIntMinUB <- annotateUB sym ub isNotIntMin
+    isNotIntMinUB <- annotateUB sym callStack ub isNotIntMin
     let err = AssertFailureSimError "Undefined behavior encountered" $
               show $ UB.explain ub
     assert sym isNotIntMinUB err
@@ -1461,19 +1477,21 @@ callAbs sym checkIntMin widthRepr (regValue -> src) = liftIO $ do
 callLibcAbs ::
   (1 <= w, IsSymInterface sym, HasLLVMAnn sym) =>
   sym ->
+  CallStack ->
   NatRepr w ->
   RegEntry sym (BVType w) ->
   OverrideSim p sym ext r args ret (RegValue sym (BVType w))
-callLibcAbs sym = callAbs sym LibcAbsIntMinUB
+callLibcAbs sym callStack = callAbs sym callStack LibcAbsIntMinUB
 
 callLLVMAbs ::
   (1 <= w, IsSymInterface sym, HasLLVMAnn sym) =>
   sym ->
+  CallStack ->
   NatRepr w ->
   RegEntry sym (BVType w) ->
   RegEntry sym (BVType 1) ->
   OverrideSim p sym ext r args ret (RegValue sym (BVType w))
-callLLVMAbs sym widthRepr src (regValue -> isIntMinPoison) = do
+callLLVMAbs sym callStack widthRepr src (regValue -> isIntMinPoison) = do
   shouldCheckIntMin <- liftIO $
     -- Per https://releases.llvm.org/12.0.0/docs/LangRef.html#id451, the second
     -- argument must be a constant.
@@ -1482,7 +1500,7 @@ callLLVMAbs sym widthRepr src (regValue -> isIntMinPoison) = do
       Nothing -> malformedLLVMModule
                    "Call to llvm.abs.* with non-constant second argument"
                    [printSymExpr isIntMinPoison]
-  callAbs sym (LLVMAbsIntMinPoison shouldCheckIntMin) widthRepr src
+  callAbs sym callStack (LLVMAbsIntMinPoison shouldCheckIntMin) widthRepr src
 
 -- | If the data layout is little-endian, run 'callBSwap' on the input.
 -- Otherwise, return the input unchanged. This is the workhorse for the
