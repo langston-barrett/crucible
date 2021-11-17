@@ -33,6 +33,7 @@ library
 
   exposed-modules:
     UCCrux.LLVM.Bug
+    UCCrux.LLVM.Bug.UndefinedBehaviorTag
     UCCrux.LLVM.Classify
     UCCrux.LLVM.Classify.Poison
     UCCrux.LLVM.Classify.Types
@@ -41,6 +42,8 @@ library
     UCCrux.LLVM.Context.Function
     UCCrux.LLVM.Context.Module
     UCCrux.LLVM.Cursor
+    UCCrux.LLVM.Equivalence
+    UCCrux.LLVM.Equivalence.Config
     UCCrux.LLVM.Errors.Panic
     UCCrux.LLVM.Errors.Unimplemented
     UCCrux.LLVM.FullType

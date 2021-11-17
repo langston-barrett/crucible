@@ -9,6 +9,8 @@ Stability        : provisional
 
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE PatternSynonyms #-}
+{-# LANGUAGE PolyKinds #-}
 
 module UCCrux.LLVM.Bug
   ( Bug,
@@ -41,52 +43,16 @@ import qualified Lang.Crucible.LLVM.Errors.MemoryError as MemErrors
 import           Lang.Crucible.LLVM.Errors.UndefinedBehavior (UndefinedBehavior)
 import qualified Lang.Crucible.LLVM.Errors.UndefinedBehavior as UB
 
+import           UCCrux.LLVM.Bug.UndefinedBehaviorTag (UndefinedBehaviorTag)
 import           UCCrux.LLVM.PP (ppProgramLoc)
 {- ORMOLU_ENABLE -}
-
-newtype UndefinedBehaviorTag =
-  UndefinedBehaviorTag { getUndefinedBehaviorTag :: UndefinedBehavior (Const ()) }
-
-makeUndefinedBehaviorTag :: UndefinedBehavior e -> UndefinedBehaviorTag
-makeUndefinedBehaviorTag = UndefinedBehaviorTag . fmapF (const (Const ()))
-
-instance Eq UndefinedBehaviorTag where
-  UndefinedBehaviorTag t1 == UndefinedBehaviorTag t2 =
-    case (t1, t2) of
-      (UB.FreeBadOffset {}, UB.FreeBadOffset {}) -> True
-      (UB.FreeUnallocated {}, UB.FreeUnallocated {}) -> True
-      (UB.DoubleFree {}, UB.DoubleFree {}) -> True
-      (UB.MemsetInvalidRegion {}, UB.MemsetInvalidRegion {}) -> True
-      (UB.ReadBadAlignment {}, UB.ReadBadAlignment {}) -> True
-      (UB.WriteBadAlignment {}, UB.WriteBadAlignment {}) -> True
-      (UB.PtrAddOffsetOutOfBounds {}, UB.PtrAddOffsetOutOfBounds {}) -> True
-      (UB.CompareInvalidPointer {}, UB.CompareInvalidPointer {}) -> True
-      (UB.CompareDifferentAllocs {}, UB.CompareDifferentAllocs {}) -> True
-      (UB.PtrSubDifferentAllocs {}, UB.PtrSubDifferentAllocs {}) -> True
-      (UB.PointerIntCast {}, UB.PointerIntCast {}) -> True
-      (UB.PointerUnsupportedOp {}, UB.PointerUnsupportedOp {}) -> True
-      (UB.PointerFloatCast {}, UB.PointerFloatCast {}) -> True
-      (UB.ComparePointerToBV {}, UB.ComparePointerToBV {}) -> True
-      (UB.UDivByZero {}, UB.UDivByZero {}) -> True
-      (UB.SDivByZero {}, UB.SDivByZero {}) -> True
-      (UB.URemByZero {}, UB.URemByZero {}) -> True
-      (UB.SRemByZero {}, UB.SRemByZero {}) -> True
-      (UB.SDivOverflow {}, UB.SDivOverflow {}) -> True
-      (UB.SRemOverflow {}, UB.SRemOverflow {}) -> True
-      (UB.AbsIntMin  {}, UB.AbsIntMin  {}) -> True
-      (UB.PoisonValueCreated {}, UB.PoisonValueCreated {}) -> True
-      _ -> False
-
--- TODO
--- instance Ord UndefinedBehaviorTag where
---     compare (UndefinedBehaviorTag t1) (UndefinedBehaviorTag t2) = _
 
 -- | This is different from 'Lang.Crucible.LLVM.Errors.BadBehavior' in that
 -- it stores less data.
 data BugBehavior
   = BBUndefinedBehaviorTag !UndefinedBehaviorTag
   | BBMemoryErrorReason MemoryErrorReason
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 ppBugBehavior :: BugBehavior -> PP.Doc ann
 ppBugBehavior =
@@ -101,7 +67,7 @@ data Bug =
     , bugLoc :: !What4.ProgramLoc
     , bugCallStack :: !CallStack
     }
-  deriving (Eq)
+  deriving (Eq, Ord)
 
 makeBug :: BadBehavior sym -> What4.ProgramLoc -> CallStack -> Bug
 makeBug bb loc callStack =
