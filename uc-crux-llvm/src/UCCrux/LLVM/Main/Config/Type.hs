@@ -24,11 +24,13 @@ import           Data.List.NonEmpty (NonEmpty)
 import           Crux.LLVM.Config (LLVMOptions)
 
 import           UCCrux.LLVM.Newtypes.FunctionName (FunctionName)
+import qualified UCCrux.LLVM.Equivalence.Config as EqConfig
 import qualified UCCrux.LLVM.Run.Explore.Config as ExConfig
 
 data RunConfig
   = Explore ExConfig.ExploreConfig
   | RunOn (NonEmpty FunctionName) [FunctionName]
+  | CrashEquivalence EqConfig.EquivalenceConfig
   deriving (Eq, Ord, Show)
 
 data TopLevelConfig = TopLevelConfig

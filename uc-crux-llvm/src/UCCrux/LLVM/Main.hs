@@ -40,7 +40,7 @@ where
 import           Prelude hiding (log)
 
 import           Control.Lens ((^.))
-import           Control.Monad (forM_)
+import           Control.Monad (forM_, void)
 import           Data.Aeson (ToJSON)
 import           Data.Foldable (for_)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -83,6 +83,8 @@ import           Crux.LLVM.Simulate (parseLLVM)
 import           Paths_uc_crux_llvm (version)
 import           UCCrux.LLVM.Context.App (AppContext)
 import           UCCrux.LLVM.Context.Module (ModuleContext, SomeModuleContext(..), makeModuleContext, defnTypes, withModulePtrWidth)
+import           UCCrux.LLVM.Equivalence (checkEquiv)
+import qualified UCCrux.LLVM.Equivalence.Config as EqConfig
 import           UCCrux.LLVM.Errors.Panic (panic)
 import           UCCrux.LLVM.FullType.Translation (ppTypeTranslationError)
 import qualified UCCrux.LLVM.Logging as Log
@@ -198,6 +200,23 @@ mainWithConfigs appCtx cruxOpts topConf =
                               PP.layoutPretty PP.defaultLayoutOptions =<<
                                 ppSomeCheckResult appCtx checkedFunc checkedResult
                  )
+      Config.CrashEquivalence eqConfig ->
+        do path' <-
+             genBitCode
+               (cruxOpts {inputFiles = [EqConfig.equivModule eqConfig]})
+               llOpts
+           memVar' <- mkMemVar "uc-crux-llvm:llvm_memory'" halloc
+           SomeModuleContext' modCtx' <- translateFile llOpts halloc memVar' path'
+           void $
+             checkEquiv
+               appCtx
+               modCtx
+               modCtx'
+               halloc
+               cruxOpts
+               llOpts
+               (EqConfig.equivOrOrder eqConfig)
+               (EqConfig.equivEntryPoints eqConfig)
     return ExitSuccess
 
 translateLLVMModule ::
