@@ -57,9 +57,21 @@ import           Data.Parameterized.Classes (OrdF(compareF), ixF', fromOrdering)
 import           Data.Parameterized.NatRepr (NatRepr, type (<=), type (+))
 import qualified Data.Parameterized.TH.GADT as U
 
+import           UCCrux.LLVM.FullType.Compatibility (CompatTypes(..))
 import           UCCrux.LLVM.FullType.Type (FullType(..), FullTypeRepr(..), ModuleTypes, asFullType)
 import           UCCrux.LLVM.Module (GlobalSymbol, FuncSymbol, getGlobalSymbol, getFuncSymbol)
 {- ORMOLU_ENABLE -}
+
+-- | Indicates whether a cursor is 'Strict' or 'Lax'.
+--
+-- Type-level only.
+data CursorStrictness
+  = -- | A 'Strict' cursor contains a 'FullTypeRepr' of exactly the type in its
+    -- @atTy@ type parameter.
+    Strict
+    -- | A 'Lax' cursor contains a 'FullTypeRepr' of a type compatible (in the
+    -- sense of 'CompatTypes') with its @atTy@ type parameter.
+  | Lax
 
 -- | A 'Cursor' points to a specific part of a value (i.e. a function argument
 -- or global variable). It's used for describing function preconditions, such as
@@ -71,47 +83,84 @@ import           UCCrux.LLVM.Module (GlobalSymbol, FuncSymbol, getGlobalSymbol, 
 --   see also the comment on 'UCCrux.LLVM.FullType.CrucibleType.TranslatedTypes'.
 -- * @inTy@: This is the \"outermost\" type, the type being pointed into.
 -- * @atTy@: This is the \"innermost\" type, the type being pointed at.
-data Cursor m (inTy :: FullType m) (atTy :: FullType m) where
-  Here :: FullTypeRepr m atTy -> Cursor m atTy atTy
+data Cursor m (s :: CursorStrictness) (inTy :: FullType m) (atTy :: FullType m) where
+  HereStrict :: FullTypeRepr m atTy -> Cursor m Strict atTy atTy
+  HereLax ::
+    FullTypeRepr m atTy ->
+    CompatTypes m atTy atTy' ->
+    Cursor m Lax atTy atTy
   Dereference ::
     -- | Which array index?
     Int ->
-    Cursor m inTy atTy ->
-    Cursor m ('FTPtr inTy) atTy
+    Cursor m s inTy atTy ->
+    Cursor m s ('FTPtr inTy) atTy
   Index ::
     (i + 1 <= n) =>
     -- | Which array index?
     NatRepr i ->
     -- | Overall array length.
     NatRepr n ->
-    Cursor m inTy atTy ->
-    Cursor m ('FTArray ('Just n) inTy) atTy
+    Cursor m s inTy atTy ->
+    Cursor m s ('FTArray ('Just n) inTy) atTy
   Field ::
     Ctx.Assignment (FullTypeRepr m) fields ->
     -- | Which field?
     Ctx.Index fields inTy ->
-    Cursor m inTy atTy ->
-    Cursor m ('FTStruct fields) atTy
+    Cursor m s inTy atTy ->
+    Cursor m s ('FTStruct fields) atTy
 
-instance Eq (Cursor m inTy atTy) where
+instance Eq (Cursor m s inTy atTy) where
   c1 == c2 = isJust (testEquality c1 c2)
 
-instance Semigroupoid (Cursor m) where
+instance Semigroupoid (Cursor m s) where
   o cursor1 cursor2 =
     case (cursor1, cursor2) of
-      (Here _, _) -> cursor2
-      (_, Here _) -> cursor1
+      (HereStrict _, _) -> cursor2
+      (HereLax _ _, _) -> cursor2
+      (_, HereStrict _) -> cursor1
+      (_, HereLax _ _) -> cursor1
       (_, Field ftReprs idx cursor3) -> Field ftReprs idx (o cursor1 cursor3)
       (_, Index i n cursor3) -> Index i n (o cursor1 cursor3)
       (_, Dereference i cursor3) -> Dereference i (o cursor1 cursor3)
 
-findBottom :: Cursor m inTy atTy -> FullTypeRepr m atTy
+findBottom :: Cursor m Strict inTy atTy -> FullTypeRepr m atTy
 findBottom =
   \case
-    Here repr -> repr
+    HereStrict repr -> repr
     Dereference _ cursor' -> findBottom cursor'
     Index _ _ cursor' -> findBottom cursor'
     Field _ _ cursor' -> findBottom cursor'
+
+makeLax ::
+  Cursor m s inTy atTy ->
+  Cursor m Lax inTy atTy
+makeLax =
+  \case
+    h@(HereLax {}) -> h
+    HereStrict ftRepr -> HereLax ftRepr (CompatRefl ftRepr)
+    Dereference i cursor -> Dereference i (makeLax cursor)
+    Index i n cursor -> Index i n (makeLax cursor)
+    Field fields idx cursor -> Field fields idx (makeLax cursor)
+
+strictCase ::
+  Cursor m s inTy atTy ->
+  Either (Cursor m Lax inTy atTy) (Cursor m Strict inTy atTy)
+strictCase =
+  \case
+    h@(HereLax {}) -> Left h
+    h@(HereStrict {}) -> Right h
+    Dereference i cursor -> go (Dereference i) cursor
+    Index i n cursor -> go (Index i n) cursor
+    Field fields idx cursor -> go (Field fields idx) cursor
+  where
+    go ::
+      (forall s. Cursor m s inTy' atTy' -> Cursor m s inTy'' atTy') ->
+      Cursor m s inTy' atTy' ->
+      Either (Cursor m Lax inTy'' atTy') (Cursor m Strict inTy'' atTy')
+    go f cursor =
+      case strictCase cursor of
+        Left cursor -> Left (f cursor)
+        Right cursor -> Right (f cursor)
 
 -- | Check that this 'Cursor' can be applied to this type.
 --
@@ -124,15 +173,15 @@ findBottom =
 -- different type indices.
 checkCompatibility ::
   ModuleTypes m ->
-  Cursor m inTy atTy ->
+  Cursor m Strict inTy atTy ->
   FullTypeRepr m inTy' ->
-  Maybe (Cursor m inTy' atTy)
+  Maybe (Cursor m Strict inTy' atTy)
 checkCompatibility mts cursor ftRepr =
   case (cursor, ftRepr) of
-    (Here repr, _) ->
+    (HereStrict repr, _) ->
       case testEquality repr ftRepr of
         Nothing -> Nothing
-        Just Refl -> Just (Here repr)
+        Just Refl -> Just (HereStrict repr)
     (Dereference i cursor', FTPtrRepr partType) ->
       Dereference i <$> checkCompatibility mts cursor' (asFullType mts partType)
     (Index i n cursor', FTArrayRepr m ftRepr') ->
@@ -154,29 +203,34 @@ checkCompatibility mts cursor ftRepr =
 -- The resulting 'Cursor' points \"deeper\" into the top-level type.
 deepenPtr ::
   ModuleTypes m ->
-  Cursor m inTy ('FTPtr atTy) ->
-  Cursor m inTy atTy
+  Cursor m s inTy ('FTPtr atTy) ->
+  Cursor m s inTy atTy
 deepenPtr mts =
   \case
-    Here (FTPtrRepr ptRepr) -> Dereference 0 (Here (asFullType mts ptRepr))
     Dereference i cursor -> Dereference i (deepenPtr mts cursor)
     Index i n cursor -> Index i n (deepenPtr mts cursor)
     Field fields idx cursor -> Field fields idx (deepenPtr mts cursor)
+    HereStrict (FTPtrRepr ptRepr) ->
+      Dereference 0 (HereStrict (asFullType mts ptRepr))
+    HereLax (FTPtrRepr ptRepr) compat ->
+      Dereference 0 (HereLax (asFullType mts ptRepr) (CompatPtr compat))
 
 -- | Similarly to 'deepenPtr', if you know that a 'Cursor' points to a struct
 -- and you know one of the fields of the struct, you can get a 'Cursor' that
 -- points to that field.
 deepenStruct ::
   Ctx.Index fields atTy ->
-  Cursor m inTy ('FTStruct fields) ->
-  Cursor m inTy atTy
+  Cursor m s inTy ('FTStruct fields) ->
+  Cursor m s inTy atTy
 deepenStruct idx =
   \case
-    Here (FTStructRepr _structInfo fields) ->
-      Field fields idx (Here (fields Ctx.! idx))
     Dereference i cursor -> Dereference i (deepenStruct idx cursor)
     Index i n cursor -> Index i n (deepenStruct idx cursor)
     Field fields idx' cursor -> Field fields idx' (deepenStruct idx cursor)
+    HereStrict (FTStructRepr _structInfo fields) ->
+      Field fields idx (HereStrict (fields Ctx.! idx))
+    HereLax (FTStructRepr _structInfo fields) compat ->
+      Field fields idx (HereLax (fields Ctx.! idx) compat)
 
 -- | Similarly to 'deepenPtr', if you know that a 'Cursor' points to an array
 -- and you know the type contained in the array, you can get a 'Cursor' that
@@ -185,26 +239,28 @@ deepenArray ::
   (i + 1 <= n) =>
   NatRepr i ->
   NatRepr n ->
-  Cursor m inTy ('FTArray ('Just n) atTy) ->
-  Cursor m inTy atTy
+  Cursor m s inTy ('FTArray ('Just n) atTy) ->
+  Cursor m s inTy atTy
 deepenArray idx len =
   \case
-    Here (FTArrayRepr _n elems) ->
-      Index idx len (Here elems)
     Dereference i cursor -> Dereference i (deepenArray idx len cursor)
     Index i n cursor -> Index i n (deepenArray idx len cursor)
     Field fields idx' cursor -> Field fields idx' (deepenArray idx len cursor)
+    HereStrict (FTArrayRepr _n elems) ->
+      Index idx len (HereStrict elems)
+    HereLax (FTArrayRepr _n elems) compat ->
+      Index idx len (HereLax elems) compat
 
 -- | A 'Cursor' can be \"applied\" to a 'FullTypeRepr' to get a \"smaller\"
 -- 'FullTypeRepr' that appears inside the \"outer\" one.
 seekType ::
   ModuleTypes m ->
-  Cursor m inTy atTy ->
+  Cursor m Strict inTy atTy ->
   FullTypeRepr m inTy ->
   FullTypeRepr m atTy
 seekType mts cursor ftRepr =
   case (cursor, ftRepr) of
-    (Here _, _) -> ftRepr
+    (HereStrict _, _) -> ftRepr
     (Dereference _ rest, FTPtrRepr ptRepr) ->
       seekType mts rest (asFullType mts ptRepr)
     (Index _ _ rest, FTArrayRepr _ ftRepr') ->
@@ -215,11 +271,13 @@ seekType mts cursor ftRepr =
 ppCursor ::
   -- | Top level, e.g. the name of a variable
   String ->
-  Cursor m inTy atTy ->
+  Cursor m s inTy atTy ->
   Doc ann
 ppCursor top =
   \case
-    Here _ft -> PP.pretty top
+    HereStrict _ft -> PP.pretty top
+    -- TODO(lb): probably indicate laxness here?
+    HereLax _ft _compat -> PP.pretty top
     Dereference 0 (Field _fieldTypes idx cursor) ->
       ppCursor top cursor <> PP.pretty "->" <> PP.viaShow idx
     Dereference 0 what -> PP.pretty "*" <> ppCursor top what
@@ -235,10 +293,10 @@ ppCursor top =
 -- * the manufactured return value from a \"skipped\" function
 --
 -- For documentation of the type parameters, see the comment on 'Cursor'.
-data Selector m (argTypes :: Ctx (FullType m)) inTy atTy
-  = SelectArgument !(Ctx.Index argTypes inTy) (Cursor m inTy atTy)
-  | SelectGlobal !(GlobalSymbol m) (Cursor m inTy atTy)
-  | SelectReturn !(FuncSymbol m) (Cursor m inTy atTy)
+data Selector m s (argTypes :: Ctx (FullType m)) inTy atTy
+  = SelectArgument !(Ctx.Index argTypes inTy) (Cursor m s inTy atTy)
+  | SelectGlobal !(GlobalSymbol m) (Cursor m s inTy atTy)
+  | SelectReturn !(FuncSymbol m) (Cursor m s inTy atTy)
   deriving Eq
 
 -- | A non-parameterized summary of a 'Selector'
@@ -249,7 +307,7 @@ data Where
     ReturnValue !String
   deriving (Eq, Ord)
 
-selectWhere :: Selector m argTypes inTy atTy -> Where
+selectWhere :: Selector m s argTypes inTy atTy -> Where
 selectWhere =
   \case
     SelectArgument idx _ -> Arg (Ctx.indexVal idx)
@@ -268,7 +326,7 @@ ppWhere =
     ReturnValue f ->
       PP.pretty "in return value of skipped function" PP.<+> PP.pretty f
 
-ppSelector :: Selector m argTypes inTy atTy -> PP.Doc ann
+ppSelector :: Selector m s argTypes inTy atTy -> PP.Doc ann
 ppSelector selector =
   ppWhere (selectWhere selector) PP.<+>
     PP.pretty "at" PP.<+>
@@ -278,23 +336,23 @@ ppSelector selector =
 --
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
-data SomeSelector m (argTypes :: Ctx (FullType m))
-  = forall inTy atTy. SomeSelector (Selector m argTypes inTy atTy)
+data SomeSelector m s (argTypes :: Ctx (FullType m))
+  = forall inTy atTy. SomeSelector (Selector m s argTypes inTy atTy)
 
 -- | For documentation of the type parameters, see the comment on 'Cursor'.
 --
 -- NOTE(lb): The explicit kind signature here is necessary for GHC 8.8/8.6
 -- compatibility.
-data SomeInSelector m (argTypes :: Ctx (FullType m)) atTy
-  = forall inTy. SomeInSelector (Selector m argTypes inTy atTy)
+data SomeInSelector m s (argTypes :: Ctx (FullType m)) atTy
+  = forall inTy. SomeInSelector (Selector m s argTypes inTy atTy)
 
 -- | Both kinds of 'Selector' (argument and global) contain a 'Cursor'.
 selectorCursor ::
   Lens
-    (Selector m argTypes inTy atTy)
-    (Selector m argTypes inTy atTy')
-    (Cursor m inTy atTy)
-    (Cursor m inTy atTy')
+    (Selector m s argTypes inTy atTy)
+    (Selector m s argTypes inTy atTy')
+    (Cursor m s inTy atTy)
+    (Cursor m s inTy atTy')
 selectorCursor =
   lens
     ( \case
@@ -311,7 +369,7 @@ selectorCursor =
 
 $(return [])
 
-instance TestEquality (Cursor m inTy) where
+instance TestEquality (Cursor m s inTy) where
   testEquality =
     $( U.structuralTypeEquality
          [t|Cursor|]
@@ -322,7 +380,10 @@ instance TestEquality (Cursor m inTy) where
                  ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
                    [|testEquality|]
                  ),
-                 ( appAny (appAny (appAny (U.ConType [t|Cursor|]))),
+                 ( appAny (appAny (appAny (U.ConType [t|CompatTypes|]))),
+                   [|testEquality|]
+                 ),
+                 ( appAny (appAny (appAny (appAny (U.ConType [t|Cursor|])))),
                    [|testEquality|]
                  ),
                  ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
@@ -335,7 +396,7 @@ instance TestEquality (Cursor m inTy) where
          )
      )
 
-instance OrdF (Cursor m inTy) where
+instance OrdF (Cursor m s inTy) where
   compareF =
     $( U.structuralTypeOrd
          [t|Cursor|]
@@ -346,7 +407,10 @@ instance OrdF (Cursor m inTy) where
                  ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
                    [|compareF|]
                  ),
-                 ( appAny (appAny (appAny (U.ConType [t|Cursor|]))),
+                 ( appAny (appAny (appAny (U.ConType [t|CompatTypes|]))),
+                   [|compareF|]
+                 ),
+                 ( appAny (appAny (appAny (appAny (U.ConType [t|Cursor|])))),
                    [|compareF|]
                  ),
                  ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
@@ -359,7 +423,7 @@ instance OrdF (Cursor m inTy) where
          )
      )
 
-instance TestEquality (Selector m argTypes inTy) where
+instance TestEquality (Selector m s argTypes inTy) where
   testEquality =
     $( U.structuralTypeEquality
          [t|Selector|]
@@ -370,7 +434,10 @@ instance TestEquality (Selector m argTypes inTy) where
                  ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
                    [|testEquality|]
                  ),
-                 ( appAny (appAny (appAny (U.ConType [t|Cursor|]))),
+                 ( appAny (appAny (appAny (U.ConType [t|CompatTypes|]))),
+                   [|testEquality|]
+                 ),
+                 ( appAny (appAny (appAny (appAny (U.ConType [t|Cursor|])))),
                    [|testEquality|]
                  ),
                  ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
@@ -383,7 +450,7 @@ instance TestEquality (Selector m argTypes inTy) where
          )
      )
 
-instance OrdF (Selector m argTypes inTy) where
+instance OrdF (Selector m s argTypes inTy) where
   compareF =
     $( U.structuralTypeOrd
          [t|Selector|]
@@ -394,7 +461,7 @@ instance OrdF (Selector m argTypes inTy) where
                  ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
                    [|compareF|]
                  ),
-                 ( appAny (appAny (appAny (U.ConType [t|Cursor|]))),
+                 ( appAny (appAny (appAny (appAny (U.ConType [t|Cursor|])))),
                    [|compareF|]
                  ),
                  ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
