@@ -71,7 +71,7 @@ withOptions llvmModule file k =
   do
     withFile (testDir </> file <> ".output") WriteMode $ \h ->
       do
-        let appCtx = makeAppContext Log.Low
+        let appCtx = makeAppContext Log.Hi
         llOpts <- (\ll -> ll { CruxLLVM.noCompile = False }) <$> mkLLOpts ""
         let cruxOpts = mkCruxOpts [testDir </> file]
         let ?outputConfig =

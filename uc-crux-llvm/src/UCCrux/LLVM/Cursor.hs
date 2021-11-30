@@ -239,6 +239,9 @@ data Selector m (argTypes :: Ctx (FullType m)) inTy atTy
   = SelectArgument !(Ctx.Index argTypes inTy) (Cursor m inTy atTy)
   | SelectGlobal !(GlobalSymbol m) (Cursor m inTy atTy)
   | SelectReturn !(FuncSymbol m) (Cursor m inTy atTy)
+    -- TODO(lb): This doesn't really have enough information - it should
+    -- basically be isomorphic to a 'ClobberSelector'
+  | SelectClobbered !(FuncSymbol m) (Cursor m inTy atTy)
   deriving Eq
 
 -- | A non-parameterized summary of a 'Selector'
@@ -247,6 +250,8 @@ data Where
   | Global !String
   | -- | Name of the skipped function
     ReturnValue !String
+    -- | Name of the skipped function
+  | ClobberedValue !String
   deriving (Eq, Ord)
 
 selectWhere :: Selector m argTypes inTy atTy -> Where
@@ -259,6 +264,9 @@ selectWhere =
     SelectReturn fSymb _ ->
       let L.Symbol f = getFuncSymbol fSymb
        in ReturnValue f
+    SelectClobbered fSymb _ ->
+      let L.Symbol f = getFuncSymbol fSymb
+       in ClobberedValue f
 
 ppWhere :: Where -> PP.Doc ann
 ppWhere =
@@ -267,6 +275,8 @@ ppWhere =
     Global g -> PP.pretty "in global" PP.<+> PP.pretty g
     ReturnValue f ->
       PP.pretty "in return value of skipped function" PP.<+> PP.pretty f
+    ClobberedValue f ->
+      PP.pretty "in value clobbered by skipped function" PP.<+> PP.pretty f
 
 ppSelector :: Selector m argTypes inTy atTy -> PP.Doc ann
 ppSelector selector =
@@ -301,12 +311,14 @@ selectorCursor =
         SelectArgument _ cursor -> cursor
         SelectGlobal _ cursor -> cursor
         SelectReturn _ cursor -> cursor
+        SelectClobbered _ cursor -> cursor
     )
     ( \s v ->
         case s of
           SelectArgument arg _ -> SelectArgument arg v
           SelectGlobal glob _ -> SelectGlobal glob v
           SelectReturn func _ -> SelectReturn func v
+          SelectClobbered func _ -> SelectClobbered func v
     )
 
 $(return [])

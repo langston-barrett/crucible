@@ -39,6 +39,8 @@ data Unimplemented
   | CheckConstraintsPtrArray
   | CheckConstraintsStruct
   | CheckConstraintsGlobal
+  | SometimesClobber
+  | ClobberConstraints
   deriving (Eq, Ord)
 
 ppUnimplemented :: Unimplemented -> String
@@ -56,6 +58,8 @@ ppUnimplemented =
     CheckConstraintsPtrArray -> "Checking inferred precondition on an array"
     CheckConstraintsStruct -> "Checking inferred precondition on a struct"
     CheckConstraintsGlobal -> "Checking inferred precondition on a global"
+    SometimesClobber -> "Selective clobbering"
+    ClobberConstraints -> "Constraints on clobbered values"
 
 instance PanicComponent Unimplemented where
   panicComponentName _ = "uc-crux-llvm"
