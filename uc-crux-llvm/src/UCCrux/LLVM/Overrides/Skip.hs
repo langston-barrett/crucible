@@ -129,13 +129,13 @@ unsoundSkipOverrides ::
   IORef (Set SkipOverrideName) ->
   -- | Annotations of created values
   IORef (Map (Some (What4.SymAnnotation sym)) (Some (TypedSelector m arch argTypes))) ->
-  -- | What data should get clobbered by this override?
-  Map (FuncSymbol m) (ClobberSpecs m) ->
-  -- | Postconditions of each override (constraints on return values)
+  -- | Postconditions of each override (constraints on return values,
+  -- information about clobbered pointer values such as arguments or global
+  -- variables)
   Map (FuncSymbol m) (ConstrainedTypedValue m) ->
   [L.Declare] ->
   OverM personality sym LLVM [Either (ClobberSpecError m) (PolymorphicLLVMOverride arch (personality sym) sym)]
-unsoundSkipOverrides modCtx bak mtrans usedRef annotationRef clobbers postconditions decls =
+unsoundSkipOverrides modCtx bak mtrans usedRef annotationRef postconditions decls =
   do
     let llvmCtx = mtrans ^. transContext
     let ?lc = llvmCtx ^. llvmTypeCtx
