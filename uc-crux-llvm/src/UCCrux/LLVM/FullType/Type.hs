@@ -52,6 +52,8 @@ module UCCrux.LLVM.FullType.Type
     IsPtrRepr (..),
     aliasOrFullType,
     toPartType,
+    FuncSig,
+    FuncSigRepr,
 
     -- * Translation
     toFullType,
@@ -211,6 +213,26 @@ data FullTypeRepr (m :: Type) (ft :: FullType m) where
   -- TODO(lb): This could have a symbol repr for the name
   FTOpaquePtrRepr :: L.Ident -> FullTypeRepr m 'FTOpaquePtr
 
+-- | Type-level only
+data FuncSig m where
+  FuncSig ::
+    IsVarArgs ->
+    Maybe (FullType m) ->
+    Ctx.Ctx (FullType m) ->
+    FuncSig m
+
+-- TODO(lb): intertwine with fulltyperepr?
+data FuncSigRepr m (fs :: FuncSig m) where
+  FuncSigRepr ::
+    VarArgsRepr varArgs ->
+    Ctx.Assignment (FullTypeRepr m) args ->
+    FullTypeRepr m ret ->
+    FuncSigRepr m ('FuncSig varArgs ('Just ret) args)
+  VoidFuncSigRepr ::
+    VarArgsRepr varArgs ->
+    Ctx.Assignment (FullTypeRepr m) args ->
+    FuncSigRepr m ('FuncSig varArgs Nothing args)
+
 -- | This functions similarly to 'MemType.SymType'
 data PartTypeRepr (m :: Type) (ft :: FullType m) where
   PTFullRepr :: FullTypeRepr m ft -> PartTypeRepr m ft
@@ -273,6 +295,24 @@ instance TestEquality (FullTypeRepr m) where
          )
      )
 
+instance TestEquality (FuncSigRepr m) where
+  testEquality =
+    $( U.structuralTypeEquality
+         [t|FuncSigRepr|]
+         ( let appAny con = U.TypeApp con U.AnyType
+            in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
+                   [|testEquality|]
+                 ),
+                 ( appAny (U.ConType [t|VarArgsRepr|]),
+                   [|testEquality|]
+                 ),
+                 ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
+                   [|testEquality|]
+                 )
+               ]
+         )
+     )
+
 -- | See note on 'TestEquality' instance.
 instance OrdF (PartTypeRepr m) where
   compareF =
@@ -319,6 +359,24 @@ instance OrdF (FullTypeRepr m) where
                    [|compareF|]
                  ),
                  ( appAny (appAny (U.ConType [t|PartTypeRepr|])),
+                   [|compareF|]
+                 )
+               ]
+         )
+     )
+
+instance OrdF (FuncSigRepr m) where
+  compareF =
+    $( U.structuralTypeOrd
+         [t|FuncSigRepr|]
+         ( let appAny con = U.TypeApp con U.AnyType
+            in [ ( appAny (appAny (U.ConType [t|FullTypeRepr|])),
+                   [|compareF|]
+                 ),
+                 ( appAny (U.ConType [t|VarArgsRepr|]),
+                   [|compareF|]
+                 ),
+                 ( appAny (appAny (U.ConType [t|Ctx.Assignment|])),
                    [|compareF|]
                  )
                ]
