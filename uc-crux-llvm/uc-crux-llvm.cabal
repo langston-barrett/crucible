@@ -91,6 +91,7 @@ library
     UCCrux.LLVM.Stats
     UCCrux.LLVM.View
     UCCrux.LLVM.View.FullType
+    UCCrux.LLVM.View.Shape
     UCCrux.LLVM.View.Util
 
   other-modules:
