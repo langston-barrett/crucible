@@ -29,6 +29,8 @@ module Lang.Crucible.LLVM.Intrinsics
 
 , module Lang.Crucible.LLVM.Intrinsics.Common
 , module Lang.Crucible.LLVM.Intrinsics.Options
+, module Libc
+, Libc.printfOps
 ) where
 
 import           Control.Lens hiding (op, (:>), Empty)

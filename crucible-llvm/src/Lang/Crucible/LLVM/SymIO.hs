@@ -197,7 +197,7 @@ initialLLVMFileSystem
   -> IO (LLVMFileSystem ptrW, LCSG.SymGlobalState sym, SomeOverrideSim sym ())
 initialLLVMFileSystem halloc sym ptrW initContents handles globals0 = do
   fs0 <- SymIO.initFS sym ptrW initContents
-  let fdm0 = FDescMap { fDescNext = 0
+  let fdm0 = FDescMap { fDescNext = 1
                       , fDescMap = Map.empty
                       }
   fsVar <- freshGlobalVar halloc (Text.pack "llvmFileSystem_Global") (SymIO.FileSystemRepr ptrW)
