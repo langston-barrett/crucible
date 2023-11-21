@@ -164,7 +164,7 @@ createCheckOverride appCtx modCtx usedRef argFTys constraints cfg funcSym =
   in makePolymorphicLLVMOverride $
        basic_llvm_override $
          LLVMOverride
-           { llvmOverride_declare = decl,
+           { llvmOverride_name = L.decName decl,
              llvmOverride_args = Crucible.cfgArgTypes cfg,
              llvmOverride_ret = Crucible.cfgReturnType cfg,
              llvmOverride_def =

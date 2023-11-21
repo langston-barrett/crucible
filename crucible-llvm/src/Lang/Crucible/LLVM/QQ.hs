@@ -303,7 +303,7 @@ liftArgs = go [| Ctx.Empty |]
 
 liftQQDeclToOverride :: QQDeclare -> Q Exp
 liftQQDeclToOverride qqd@(QQDeclare ret _nm args varargs) =
-  [| IC.LLVMOverride $(liftQQDecl qqd) $(liftArgs args varargs) $(liftTypeRepr ret) |]
+  [| IC.LLVMOverride (L.decName $(liftQQDecl qqd)) $(liftArgs args varargs) $(liftTypeRepr ret) |]
 
 -- | This quasiquoter parses values in LLVM type syntax, extended
 --   with metavariables, and builds values of @Text.LLVM.AST.Type@.

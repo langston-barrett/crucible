@@ -138,7 +138,7 @@ mkOverride modCtx _proxy funcSymb (FuncSigRepr _ argFTys retTy) impl =
       makePolymorphicLLVMOverride $
         basic_llvm_override $
           LLVMOverride
-            { llvmOverride_declare = decl,
+            { llvmOverride_name = L.decName decl,
               llvmOverride_args = argTys,
               llvmOverride_ret = toCrucibleReturnType modCtx retTy,
               llvmOverride_def =

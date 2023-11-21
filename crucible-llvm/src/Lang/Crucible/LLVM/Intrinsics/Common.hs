@@ -8,9 +8,11 @@
 ------------------------------------------------------------------------
 
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
@@ -47,12 +49,13 @@ import           Control.Monad.Reader (ReaderT, ask, lift)
 import           Control.Monad.Trans.Maybe (MaybeT)
 import qualified Data.List as List
 import qualified Data.Text as Text
+import           Data.Word (Word32)
 import           Numeric (readDec)
 
 import qualified ABI.Itanium as ABI
 import qualified Data.Parameterized.Context as Ctx
 import           Data.Parameterized.Some (Some(..))
-import           Data.Parameterized.TraversableFC (fmapFC)
+import           Data.Parameterized.TraversableFC (fmapFC, toListFC)
 
 import           Lang.Crucible.Backend
 import           Lang.Crucible.CFG.Common (GlobalVar)
@@ -79,7 +82,7 @@ import           Lang.Crucible.LLVM.Translation.Types
 -- Crucible.
 data LLVMOverride p sym args ret =
   LLVMOverride
-  { llvmOverride_declare :: L.Declare    -- ^ An LLVM name and signature for this intrinsic
+  { llvmOverride_name    :: L.Symbol
   , llvmOverride_args    :: CtxRepr args -- ^ A representation of the argument types
   , llvmOverride_ret     :: TypeRepr ret -- ^ A representation of the return type
   , llvmOverride_def ::
@@ -96,6 +99,90 @@ data LLVMOverride p sym args ret =
 
 data SomeLLVMOverride p sym =
   forall args ret. SomeLLVMOverride (LLVMOverride p sym args ret)
+
+llvmType :: HasPtrWidth wptr => TypeRepr t -> Maybe L.Type
+llvmType =
+  \case
+    AnyRepr {} -> Nothing
+    BoolRepr -> Just (L.PrimType (L.Integer 1))
+    CharRepr {} -> Nothing
+    BVRepr w -> intType w
+    ComplexRealRepr {} -> Nothing
+    FloatRepr {} -> Nothing  -- TODO?
+    FunctionHandleRepr {} -> Nothing
+    IEEEFloatRepr {} -> Nothing  -- TODO?
+    IntegerRepr {} -> Nothing
+    MaybeRepr {} -> Nothing
+    NatRepr {} -> Nothing
+    RealValRepr {} -> Nothing
+    RecursiveRepr {} -> Nothing
+    ReferenceRepr {} -> Nothing
+    SequenceRepr {} -> Nothing
+    StringRepr {} -> Nothing
+    StringMapRepr {} -> Nothing
+    StructRepr {} -> Nothing
+    SymbolicArrayRepr {} -> Nothing
+    SymbolicStructRepr {} -> Nothing
+    UnitRepr -> Just (L.PrimType L.Void)
+    VariantRepr {} -> Nothing
+    VectorRepr {} -> Nothing
+    WordMapRepr {} -> Nothing
+
+    LLVMPointerRepr w ->
+      case testEquality w ?ptrWidth of
+        Just Refl -> Just L.PtrOpaque
+        Nothing -> intType w
+    IntrinsicRepr {} -> Nothing
+  where
+    intType :: NatRepr n -> Maybe L.Type
+    intType w = 
+      let natVal = natValue w
+      in if natVal > fromIntegral (maxBound :: Word32)
+         then Nothing
+         else Just (L.PrimType (L.Integer (fromIntegral natVal)))
+
+llvmOverrideDeclare ::
+  HasPtrWidth w => 
+  LLVMOverride p sym args ret ->
+  Either (Some TypeRepr) L.Declare
+llvmOverrideDeclare ov = do
+  let getType :: forall t. TypeRepr t -> Either (Some TypeRepr) L.Type
+      getType t =
+        case llvmType t of
+          Nothing -> Left (Some t)
+          Just llTy -> Right llTy
+  (Some args, isVarArgs) <-
+    case Ctx.viewAssign (llvmOverride_args ov) of
+      Ctx.AssignEmpty ->
+        pure (Some (llvmOverride_args ov), False)
+      Ctx.AssignExtend rest lastTy | Just Refl <- testEquality varArgsRepr lastTy ->
+        pure (Some rest, True)
+      _ ->
+        pure (Some (llvmOverride_args ov), False)
+  llvmArgs <- sequence (toListFC getType args)
+  llvmRet <- getType (llvmOverride_ret ov)
+  pure $
+    L.Declare
+    { L.decArgs = llvmArgs
+    , L.decAttrs = []
+    , L.decComdat = Nothing
+    , L.decLinkage = Nothing
+    , L.decName = llvmOverride_name ov
+    , L.decRetType = llvmRet
+    , L.decVarArgs = isVarArgs
+    , L.decVisibility = Nothing
+    }
+
+llvmOverride_declare :: HasPtrWidth wptr => LLVMOverride p sym args ret -> L.Declare
+llvmOverride_declare ov =
+  case llvmOverrideDeclare ov of
+    Right decl -> decl
+    Left (Some tpr) -> 
+      panic "Intrinsics.llvmOverride_declare"
+        [ "Couldn't convert Crucible-LLVM type to LLVM type"
+        , show tpr
+        ]
+{-# DEPRECATED llvmOverride_declare "Use llvmOverrideDeclare instead" #-}
 
 -- | Convenient LLVM representation of the @size_t@ type.
 llvmSizeT :: HasPtrWidth wptr => L.Type
@@ -249,7 +336,7 @@ basic_llvm_override :: forall p args ret sym arch wptr l a rtp.
   LLVMOverride p sym args ret ->
   OverrideTemplate p sym arch rtp l a
 basic_llvm_override ovr = OverrideTemplate (ExactMatch nm) (register_llvm_override ovr)
- where L.Symbol nm = L.decName (llvmOverride_declare ovr)
+ where L.Symbol nm = llvmOverride_name ovr
 
 
 -- | Check that the requested declaration matches the provided declaration. In
@@ -348,7 +435,7 @@ alloc_and_register_override ::
   [L.Symbol] ->
   OverrideSim p sym LLVM rtp l a ()
 alloc_and_register_override bak llvmctx llvmOverride aliases = do
-  let L.Declare { L.decName = symb@(L.Symbol nm) } = llvmOverride_declare llvmOverride
+  let symb@(L.Symbol nm) = llvmOverride_name llvmOverride
   let mvar = llvmMemVar llvmctx
   mem <- readGlobal mvar
   (_ptr, mem') <- liftIO (registerFunPtr bak mem nm symb aliases)
