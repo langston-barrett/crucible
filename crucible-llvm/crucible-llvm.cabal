@@ -81,6 +81,7 @@ library
     Lang.Crucible.LLVM.MemModel
     Lang.Crucible.LLVM.MemModel.CallStack
     Lang.Crucible.LLVM.MemModel.CallStack.Internal
+    Lang.Crucible.LLVM.MemModel.Concretize
     Lang.Crucible.LLVM.MemModel.Generic
     Lang.Crucible.LLVM.MemModel.MemLog
     Lang.Crucible.LLVM.MemModel.Partial
