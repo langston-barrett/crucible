@@ -348,8 +348,22 @@ stringSort =
 isType :: ( ?parserHooks :: ParserHooks ext, MonadSyntax Atomic m )
        => m (Some TypeRepr)
 isType =
-  describe "type" $ call
-    (atomicType <|> stringT <|> vector <|> seqt <|> ref <|> bv <|> fp <|> fun <|> maybeT <|> var <|> struct <|> (extensionTypeParser ?parserHooks))
+  describe "type" $
+    call $
+      asum
+      [ atomicType
+      , stringT
+      , vector
+      , seqt
+      , ref
+      , bv
+      , fp
+      , fun
+      , maybeT
+      , var
+      , struct
+      , extensionTypeParser ?parserHooks
+      ]
 
   where
     atomicType =
