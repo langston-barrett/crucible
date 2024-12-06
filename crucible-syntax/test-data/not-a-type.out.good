@@ -1,0 +1,3 @@
+(defun @main () not-a-type (start start: (return ())))
+
+At test-data/not-a-type.cbl:1:17, expected Any or Bool or Char or ComplexReal or Integer or Nat or Real or Unit or a bitvector type or a floating point type or a function type or a maybe type or a reference type or a squence type or a string type or a struct type or a variant type or a vector type or type but got not-a-type

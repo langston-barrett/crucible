@@ -351,32 +351,28 @@ isType =
   describe "type" $
     call $
       asum
-      [ atomicType
-      , stringT
-      , vector
-      , seqt
-      , ref
-      , bv
-      , fp
-      , fun
-      , maybeT
-      , var
-      , struct
+      [ kw AnyT         $> Some AnyRepr
+      , kw UnitT        $> Some UnitRepr
+      , kw BoolT        $> Some BoolRepr
+      , kw NatT         $> Some NatRepr
+      , kw IntegerT     $> Some IntegerRepr
+      , kw RealT        $> Some RealValRepr
+      , kw ComplexRealT $> Some ComplexRealRepr
+      , kw CharT        $> Some CharRepr
+      , describe "a string type" stringT
+      , describe "a vector type" vector
+      , describe "a squence type" seqt
+      , describe "a reference type" ref
+      , describe "a bitvector type" bv
+      , describe "a floating point type" fp
+      , describe "a function type" fun
+      , describe "a maybe type" maybeT
+      , describe "a variant type" var
+      , describe "a struct type" struct
       , extensionTypeParser ?parserHooks
       ]
 
   where
-    atomicType =
-      later $ describe "atomic type" $
-        asum [ kw AnyT         $> Some AnyRepr
-             , kw UnitT        $> Some UnitRepr
-             , kw BoolT        $> Some BoolRepr
-             , kw NatT         $> Some NatRepr
-             , kw IntegerT     $> Some IntegerRepr
-             , kw RealT        $> Some RealValRepr
-             , kw ComplexRealT $> Some ComplexRealRepr
-             , kw CharT        $> Some CharRepr
-             ]
     vector = unary VectorT isType <&> \(Some t) -> Some (VectorRepr t)
     seqt   = unary SequenceT isType <&> \(Some t) -> Some (SequenceRepr t)
     ref    = unary RefT isType <&> \(Some t) -> Some (ReferenceRepr t)
