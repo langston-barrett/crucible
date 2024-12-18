@@ -9,7 +9,6 @@
 
 module Lang.Crucible.Syntax.TypeScheme
   ( Kind(..)
-  , KindRepr(..)
   , TypeScheme(..)
   , Instantiation
   , emptyInst
@@ -23,15 +22,10 @@ import Data.Kind (Type)
 import Data.Parameterized (Some(Some))
 import Control.Lens qualified as Lens
 import Data.Parameterized.Classes (ixF')
-import Data.Parameterized.TraversableFC (fmapFC)
 
 data Kind
   = KType
   | KArrow Kind Kind
-
-data KindRepr :: Kind -> Type where
-  KTypeRepr :: KindRepr KType
-  KArrowRepr :: KindRepr ki -> KindRepr kr -> KindRepr (KArrow ki kr)
 
 data TypeScheme :: Ctx.Ctx Kind -> Kind -> Type where
   SUnit :: TypeScheme ks KType
@@ -54,12 +48,8 @@ type family Inst (k :: Kind) :: Type where
 data Instantiation k where
   Inst :: Maybe (Inst k) -> Instantiation k
 
-emptyInst :: Ctx.Assignment KindRepr ks -> Ctx.Assignment Instantiation ks
-emptyInst =
-  fmapFC $
-    \case
-      KTypeRepr -> Inst Nothing
-      KArrowRepr _ _ -> Inst Nothing
+emptyInst :: Ctx.Size ks -> Ctx.Assignment Instantiation ks
+emptyInst sz = Ctx.generate sz (\_ -> Inst Nothing)
 
 _matchApp ::
   TypeScheme ks (KArrow KType KType) ->
