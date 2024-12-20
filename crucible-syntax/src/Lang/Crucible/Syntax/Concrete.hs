@@ -517,7 +517,6 @@ synthExprWithScheme :: forall m s ext ks args
              , MonadSyntax Atomic m
              , ?parserHooks :: ParserHooks ext )
   => Maybe (Some TypeRepr)
-  -> Keyword
   -> Ctx.Size ks
   -> (PList.List (Const (TypeScheme ks KType)) args)
   -> TypeScheme ks KType
@@ -525,21 +524,19 @@ synthExprWithScheme :: forall m s ext ks args
       PList.List (Const (SomeExpr ext s)) args ->
         m (SomeExpr ext s))
   -> m (SomeExpr ext s)
-synthExprWithScheme typeHint k kinds argSchemes retScheme mkExpr =
-  followedBy (kw k) $ do
-    commit
-    let eInst = emptyInst kinds
-    retInst <-
-      case typeHint of
-        Just hint ->
-          case match retScheme hint eInst of
-            Left err -> describe (fmtErr err) cut
-            Right inst -> pure inst
-        Nothing -> pure eInst
-    (retArgsInst, exprs) <- go retInst argSchemes
-    case fullInst retArgsInst of
-      Nothing -> later $ describe "Could not infer type variables" cut
-      Just i -> mkExpr i exprs
+synthExprWithScheme typeHint kinds argSchemes retScheme mkExpr = do
+  let eInst = emptyInst kinds
+  retInst <-
+    case typeHint of
+      Just hint ->
+        case match retScheme hint eInst of
+          Left err -> describe (fmtErr err) cut
+          Right inst -> pure inst
+      Nothing -> pure eInst
+  (retArgsInst, exprs) <- go retInst argSchemes
+  case fullInst retArgsInst of
+    Nothing -> later $ describe "Could not infer type variables" cut
+    Just i -> mkExpr i exprs
   where
     fmtErr err =
       PP.renderStrict $
@@ -631,6 +628,30 @@ builtins =
       \Ctx.Empty (Const b PList.:< PList.Nil) ->
         SomeE BoolRepr . EApp . Not <$> evalSomeExpr BoolRepr b
     }
+  , SomeBuiltin $
+    Builtin
+    { builtinKw = VectorSize_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
+    , builtinRet = SNat
+    , builtinSemantics =
+      \(Ctx.Empty Ctx.:> Inst' (Some t))
+       (Const v PList.:< PList.Nil) ->
+        SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v
+    }
+  , SomeBuiltin $
+    Builtin
+    { builtinKw = VectorIsEmpty_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
+    , builtinRet = SBool
+    , builtinSemantics =
+      \(Ctx.Empty Ctx.:> Inst' (Some t))
+       (Const v PList.:< PList.Nil) ->
+        SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v
+    }
   ]
 
 instance PP.Pretty (Builtin ks args) where
@@ -650,14 +671,15 @@ synthBuiltin ::
   Maybe (Some TypeRepr) ->
   Builtin ks args ->
   m (SomeExpr ext s)
-synthBuiltin typeHint builtin = do
-  synthExprWithScheme
-    typeHint
-    (builtinKw builtin)
-    (builtinTVars builtin)
-    (builtinArgs builtin)
-    (builtinRet builtin)
-    (builtinSemantics builtin)
+synthBuiltin typeHint builtin =
+  followedBy (kw (builtinKw builtin)) $ do
+    commit
+    synthExprWithScheme
+      typeHint
+      (builtinTVars builtin)
+      (builtinArgs builtin)
+      (builtinRet builtin)
+      (builtinSemantics builtin)
 
 synthExpr :: forall m s ext
            . ( MonadReader (SyntaxState s) m
@@ -676,7 +698,7 @@ synthExpr typeHint =
      equalp <|> lessThan <|> lessThanEq <|>
      toAny <|> fromAny <|> stringAppend <|> stringEmpty <|> stringLength <|> showExpr <|>
      just <|> nothing <|> fromJust_ <|> injection <|> projection <|>
-     vecLit <|> vecRep <|> vecLen <|> vecEmptyP <|> vecSet <|>
+     vecLit <|> vecRep <|> vecSet <|>
      struct <|> getField <|> setField <|>
      seqNil <|> seqCons <|> seqAppend <|> seqNilP <|> seqLen <|>
      seqHead <|> seqTail <|> seqUncons <|>
@@ -1095,30 +1117,6 @@ synthExpr typeHint =
          (n, Pair t e) <-
            binary VectorReplicate_ (check NatRepr) (forceSynth =<< synthExpr newhint)
          return $ SomeE (VectorRepr t) $ EApp $ VectorReplicate t n e
-
-    vecLen :: m (SomeExpr ext s)
-    vecLen =
-      synthExprWithScheme
-        typeHint
-        VectorSize_
-        Ctx.size1
-        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
-        SNat
-        (\(Ctx.Empty Ctx.:> Inst' (Some t))
-          (Const v PList.:< PList.Nil) ->
-          SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v)
-
-    vecEmptyP :: m (SomeExpr ext s)
-    vecEmptyP =
-      synthExprWithScheme
-        typeHint
-        VectorIsEmpty_
-        Ctx.size1
-        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
-        SNat
-        (\(Ctx.Empty Ctx.:> Inst' (Some t))
-          (Const v PList.:< PList.Nil) ->
-          SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v)
 
     vecLit :: m (SomeExpr ext s)
     vecLit =
