@@ -21,27 +21,25 @@ module Lang.Crucible.Syntax.Builtins
   ) where
 
 import Control.Applicative (empty)
+import Data.BitVector.Sized qualified as BV
 import Data.Functor.Const (Const (..))
 import Data.Parameterized.Context qualified as Ctx
 import Data.Parameterized.List qualified as PList
 import Data.Parameterized.Some (Some(Some))
+import Data.Parameterized.TraversableFC (toListFC)
+import Data.Text qualified as T
+import Data.Type.Equality ((:~:)(..), testEquality)
 import Lang.Crucible.CFG.Core (ReferenceType)
-import Lang.Crucible.CFG.Expr (App)
+import Lang.Crucible.CFG.Expr (App(..))
 import Lang.Crucible.CFG.Generator (Atom)
 import Lang.Crucible.CFG.Reg (Reg, GlobalVar)
 import Lang.Crucible.Syntax.Atoms (Keyword (..), Atomic (..))
 import Lang.Crucible.Syntax.Monad (MonadSyntax, later, describe, withFocus)
 import Lang.Crucible.Syntax.SExpr (Syntax)
 import Lang.Crucible.Syntax.TypeScheme
-import Lang.Crucible.Types (TypeRepr)
+import Lang.Crucible.Types (TypeRepr(..))
 import Prettyprinter qualified as PP
 import What4.ProgramLoc (Position)
-import Data.Parameterized.TraversableFC (toListFC)
-import Lang.Crucible.Types (TypeRepr(..))
-import Lang.Crucible.CFG.Expr (App(..))
-import Data.Type.Equality ((:~:)(..), testEquality)
-import qualified Data.Text as T
-import qualified Data.BitVector.Sized as BV
 
 type AST s = Syntax Atomic
 
