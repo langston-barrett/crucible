@@ -70,9 +70,11 @@ import Lang.Crucible.Types
 import qualified Data.BitVector.Sized as BV
 import Data.Foldable
 import Data.Functor
+import Data.Functor.Compose (Compose)
 import qualified Data.Functor.Product as Functor
 import Data.Kind (Type)
 import Data.Maybe
+import qualified Data.Parameterized.List as PList
 import Data.Parameterized.Some(Some(..))
 import Data.Parameterized.Pair (Pair(..))
 import Data.Parameterized.TraversableFC
@@ -87,6 +89,8 @@ import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import Numeric.Natural
+import qualified Prettyprinter as PP
+import qualified Prettyprinter.Render.Text as PP
 
 import Lang.Crucible.Syntax.ExprParse hiding (SyntaxError)
 import qualified Lang.Crucible.Syntax.ExprParse as SP
@@ -99,6 +103,7 @@ import What4.Utils.StringLiteral
 
 import Lang.Crucible.Syntax.SExpr (Syntax, pattern L, pattern A, toText, PrintRules(..), PrintStyle(..), syntaxPos, withPosFrom, showAtom)
 import Lang.Crucible.Syntax.Atoms hiding (atom)
+import Lang.Crucible.Syntax.TypeScheme
 
 import Lang.Crucible.CFG.Reg hiding (globalName)
 import Lang.Crucible.CFG.Expr
@@ -484,6 +489,7 @@ evalIntLiteral _ RealValRepr i = return $ EApp $ RationalLit (fromInteger i)
 evalIntLiteral ast tpr _i =
   withFocus ast $ later $ describe ("literal " <> T.pack (show tpr) <> " value") empty
 
+
 forceSynth :: MonadSyntax Atomic m => SomeExpr ext s -> m (Pair TypeRepr (E ext s))
 forceSynth (SomeE tp e) = return $ Pair tp e
 forceSynth (SomeOverloaded ast _ _) =
@@ -505,6 +511,64 @@ synth' :: forall m s ext
            , ?parserHooks :: ParserHooks ext )
        => m (SomeExpr ext s)
 synth' = synthExpr Nothing
+
+synthExprWithScheme :: forall m s ext ks args
+           . ( MonadReader (SyntaxState s) m
+             , MonadSyntax Atomic m
+             , ?parserHooks :: ParserHooks ext )
+  => Keyword
+  -> Maybe (Some TypeRepr)
+  -> Ctx.Size ks
+  -> (PList.List (Const (TypeScheme ks KType)) args)
+  -> TypeScheme ks KType
+  -> (Ctx.Assignment Inst' ks ->
+      PList.List (Const (SomeExpr ext s)) args ->
+        m (SomeExpr ext s))
+  -> m (SomeExpr ext s)
+synthExprWithScheme k typeHint kinds argSchemes retScheme mkExpr =
+  followedBy (kw k) $ do
+    commit
+    let eInst = emptyInst kinds
+    retInst <-
+      case typeHint of
+        Just hint ->
+          case match retScheme hint eInst of
+            Left err -> describe (fmtErr err) cut
+            Right inst -> pure inst
+        Nothing -> pure eInst
+    (retArgsInst, exprs) <- go retInst argSchemes
+    case fullInst retArgsInst of
+      Nothing -> later $ describe "Could not infer type variables" cut
+      Just i -> mkExpr i exprs
+  where
+    fmtErr err =
+      PP.renderStrict $
+        PP.layoutPretty PP.defaultLayoutOptions $
+          PP.pretty (typeErrorExpected err)
+
+    go ::
+      forall ks' args'.
+      Ctx.Assignment (Compose Maybe Inst') ks' ->
+      PList.List (Const (TypeScheme ks' KType)) args' ->
+      m ( Ctx.Assignment (Compose Maybe Inst') ks'
+        , PList.List (Const (SomeExpr ext s)) args'
+        )
+    go inst (Const a PList.:< as) = do
+      let hint = instantiate inst a
+      depCons (synthExpr @m @s hint) $ \e -> do
+        inst' <-
+          case e of
+            SomeE t _ -> do
+              case match a (Some t) inst of
+                Left err -> describe (fmtErr err) cut
+                Right inst' -> pure inst'
+            SomeOverloaded {} -> pure inst
+            SomeIntLiteral {} -> pure inst
+        (inst'', exprs) <- go inst' as
+        pure (inst'', Const e PList.:< exprs)
+    go inst PList.Nil = do
+      emptyList
+      pure (inst, PList.Nil)
 
 synthExpr :: forall m s ext
            . ( MonadReader (SyntaxState s) m
@@ -949,17 +1013,27 @@ synthExpr typeHint =
 
     vecLen :: m (SomeExpr ext s)
     vecLen =
-      do Pair t e <- unary VectorSize_ synth
-         case t of
-           VectorRepr _ -> return $ SomeE NatRepr $ EApp $ VectorSize e
-           other -> later $ describe ("vector (found " <> T.pack (show other) <> ")") empty
+      synthExprWithScheme
+        VectorSize_
+        typeHint
+        Ctx.size1
+        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
+        SNat
+        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+          (Const v PList.:< PList.Nil) ->
+          SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v)
 
     vecEmptyP :: m (SomeExpr ext s)
     vecEmptyP =
-      do Pair t e <- unary VectorIsEmpty_ synth
-         case t of
-           VectorRepr _ -> return $ SomeE BoolRepr $ EApp $ VectorIsEmpty e
-           other -> later $ describe ("vector (found " <> T.pack (show other) <> ")") empty
+      synthExprWithScheme
+        VectorIsEmpty_
+        typeHint
+        Ctx.size1
+        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
+        SNat
+        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+          (Const v PList.:< PList.Nil) ->
+          SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v)
 
     vecLit :: m (SomeExpr ext s)
     vecLit =
@@ -976,27 +1050,29 @@ synthExpr typeHint =
 
     vecCons :: m (SomeExpr ext s)
     vecCons =
-      do let newhint = case typeHint of
-                         Just (Some (VectorRepr t)) -> Just (Some t)
-                         _ -> Nothing
-         (a, d) <- binary VectorCons_ (later (synthExpr newhint)) (later (synthExpr typeHint))
-         let g Nothing = Nothing
-             g (Just (Some t)) = Just (Some (VectorRepr t))
-         case join (find isJust [ typeHint, g (someExprType a), someExprType d ]) of
-           Just (Some (VectorRepr t)) ->
-             SomeE (VectorRepr t) . EApp <$> (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) d)
-           _ -> later $ describe "unambiguous vector cons (add a type ascription to disambiguate)" empty
+      synthExprWithScheme
+        VectorCons_
+        typeHint
+        Ctx.size1
+        (Const (SVar Ctx.baseIndex) PList.:< Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
+        (SApp SVec (SVar Ctx.baseIndex))
+        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+          (Const a PList.:< Const v PList.:< PList.Nil) ->
+          SomeE (VectorRepr t) . EApp <$>
+            (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v))
 
     vecGet :: m (SomeExpr ext s)
     vecGet =
-      do let newhint = case typeHint of
-                         Just (Some t) -> Just (Some (VectorRepr t))
-                         _ -> Nothing
-         (Pair t e, n) <-
-            binary VectorGetEntry_ (forceSynth =<< synthExpr newhint) (check NatRepr)
-         case t of
-           VectorRepr elemT -> return $ SomeE elemT $ EApp $ VectorGetEntry elemT e n
-           other -> later $ describe ("vector (found " <> T.pack (show other) <> ")") empty
+      synthExprWithScheme
+        VectorGetEntry_
+        typeHint
+        Ctx.size1
+        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< Const SNat  PList.:< PList.Nil)
+        (SVar Ctx.baseIndex)
+        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+          (Const v PList.:< Const n PList.:< PList.Nil) ->
+          SomeE t . EApp <$>
+            (VectorGetEntry t <$> evalSomeExpr (VectorRepr t) v <*> evalSomeExpr NatRepr n))
 
     vecSet :: m (SomeExpr ext s)
     vecSet =
