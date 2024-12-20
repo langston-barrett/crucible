@@ -516,8 +516,8 @@ synthExprWithScheme :: forall m s ext ks args
            . ( MonadReader (SyntaxState s) m
              , MonadSyntax Atomic m
              , ?parserHooks :: ParserHooks ext )
-  => Keyword
-  -> Maybe (Some TypeRepr)
+  => Maybe (Some TypeRepr)
+  -> Keyword
   -> Ctx.Size ks
   -> (PList.List (Const (TypeScheme ks KType)) args)
   -> TypeScheme ks KType
@@ -525,7 +525,7 @@ synthExprWithScheme :: forall m s ext ks args
       PList.List (Const (SomeExpr ext s)) args ->
         m (SomeExpr ext s))
   -> m (SomeExpr ext s)
-synthExprWithScheme k typeHint kinds argSchemes retScheme mkExpr =
+synthExprWithScheme typeHint k kinds argSchemes retScheme mkExpr =
   followedBy (kw k) $ do
     commit
     let eInst = emptyInst kinds
@@ -569,6 +569,61 @@ synthExprWithScheme k typeHint kinds argSchemes retScheme mkExpr =
     go inst PList.Nil = do
       emptyList
       pure (inst, PList.Nil)
+
+data Builtin ks args
+  = Builtin
+    { builtinKw :: Keyword
+    , builtinTVars :: Ctx.Size ks
+    , builtinArgs :: PList.List (Const (TypeScheme ks KType)) args
+    , builtinRet :: TypeScheme ks KType
+    , builtinSemantics ::
+        forall m s ext.
+        ( MonadReader (SyntaxState s) m
+        , MonadSyntax Atomic m
+        , ?parserHooks :: ParserHooks ext
+        ) =>
+        Ctx.Assignment Inst' ks ->
+        PList.List (Const (SomeExpr ext s)) args ->
+        m (SomeExpr ext s)
+    }
+
+data SomeBuiltin = forall ks args. SomeBuiltin (Builtin ks args)
+
+builtins :: [SomeBuiltin]
+builtins =
+  [ SomeBuiltin $
+    Builtin
+    { builtinKw = VectorCons_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SVar Ctx.baseIndex) PList.:<
+      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:<
+      PList.Nil
+    , builtinRet = SApp SVec (SVar Ctx.baseIndex)
+    , builtinSemantics =
+      \(Ctx.Empty Ctx.:> Inst' (Some t)) 
+       (Const a PList.:< Const v PList.:< PList.Nil) ->
+        SomeE (VectorRepr t) . EApp <$>
+        (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v)
+    }
+  ]
+
+synthBuiltin ::
+  ( MonadReader (SyntaxState s) m
+  , MonadSyntax Atomic m
+  , ?parserHooks :: ParserHooks ext
+  ) =>
+  Maybe (Some TypeRepr) ->
+  Builtin ks args ->
+  m (SomeExpr ext s)
+synthBuiltin typeHint builtin = do
+  synthExprWithScheme
+    typeHint
+    (builtinKw builtin)
+    (builtinTVars builtin)
+    (builtinArgs builtin)
+    (builtinRet builtin)
+    (builtinSemantics builtin)
 
 synthExpr :: forall m s ext
            . ( MonadReader (SyntaxState s) m
@@ -1014,8 +1069,8 @@ synthExpr typeHint =
     vecLen :: m (SomeExpr ext s)
     vecLen =
       synthExprWithScheme
-        VectorSize_
         typeHint
+        VectorSize_
         Ctx.size1
         (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
         SNat
@@ -1026,8 +1081,8 @@ synthExpr typeHint =
     vecEmptyP :: m (SomeExpr ext s)
     vecEmptyP =
       synthExprWithScheme
-        VectorIsEmpty_
         typeHint
+        VectorIsEmpty_
         Ctx.size1
         (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
         SNat
@@ -1051,8 +1106,8 @@ synthExpr typeHint =
     vecCons :: m (SomeExpr ext s)
     vecCons =
       synthExprWithScheme
-        VectorCons_
         typeHint
+        VectorCons_
         Ctx.size1
         (Const (SVar Ctx.baseIndex) PList.:< Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
         (SApp SVec (SVar Ctx.baseIndex))
@@ -1064,8 +1119,8 @@ synthExpr typeHint =
     vecGet :: m (SomeExpr ext s)
     vecGet =
       synthExprWithScheme
-        VectorGetEntry_
         typeHint
+        VectorGetEntry_
         Ctx.size1
         (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< Const SNat  PList.:< PList.Nil)
         (SVar Ctx.baseIndex)

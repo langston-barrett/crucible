@@ -53,7 +53,8 @@ instance PP.Pretty (TypeScheme ks k) where
       SApp i r -> PP.pretty i PP.<+> PP.pretty r
       SVec -> PP.pretty "Vec"
       SVar idx -> PP.pretty "x" PP.<> PP.viaShow (Ctx.indexVal idx)
-      SArrow _args _ret -> PP.pretty "TODO: (->)"
+      SArrow args ret ->
+        PP.fillSep (PP.punctuate (PP.pretty "->") (map PP.pretty (args ++ [ret])))
 
 instance Show (TypeScheme ks k) where
   show = show . PP.pretty
