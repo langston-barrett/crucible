@@ -601,12 +601,46 @@ builtins =
       PList.Nil
     , builtinRet = SApp SVec (SVar Ctx.baseIndex)
     , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t)) 
+      \(Ctx.Empty Ctx.:> Inst' (Some t))
        (Const a PList.:< Const v PList.:< PList.Nil) ->
         SomeE (VectorRepr t) . EApp <$>
         (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v)
     }
+  , SomeBuiltin $
+    Builtin
+    { builtinKw = VectorGetEntry_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:<
+      Const SNat  PList.:<
+      PList.Nil
+    , builtinRet = SVar Ctx.baseIndex
+    , builtinSemantics =
+      \(Ctx.Empty Ctx.:> Inst' (Some t))
+       (Const v PList.:< Const n PList.:< PList.Nil) ->
+       SomeE t . EApp <$>
+         (VectorGetEntry t <$> evalSomeExpr (VectorRepr t) v <*> evalSomeExpr NatRepr n)
+    }
+  , SomeBuiltin $
+    Builtin
+    { builtinKw = Not_
+    , builtinTVars = Ctx.zeroSize
+    , builtinArgs = Const SBool PList.:< PList.Nil
+    , builtinRet = SBool
+    , builtinSemantics =
+      \Ctx.Empty (Const b PList.:< PList.Nil) ->
+        SomeE BoolRepr . EApp . Not <$> evalSomeExpr BoolRepr b
+    }
   ]
+
+instance PP.Pretty (Builtin ks args) where
+  pretty builtin =
+    PP.fillSep
+    [ PP.viaShow (builtinKw builtin)
+    , ":"
+    , PP.pretty
+      (SArrow (toListFC getConst (builtinArgs builtin)) (builtinRet builtin))
+    ]
 
 synthBuiltin ::
   ( MonadReader (SyntaxState s) m
@@ -639,10 +673,10 @@ synthExpr typeHint =
      unaryArith Negate <|> unaryArith Abs <|>
      naryArith Plus <|> binaryArith Minus <|> naryArith Times <|> binaryArith Div <|> binaryArith Mod <|>
      unitCon <|> boolLit <|> stringLit <|> funNameLit <|>
-     notExpr <|> equalp <|> lessThan <|> lessThanEq <|>
+     equalp <|> lessThan <|> lessThanEq <|>
      toAny <|> fromAny <|> stringAppend <|> stringEmpty <|> stringLength <|> showExpr <|>
      just <|> nothing <|> fromJust_ <|> injection <|> projection <|>
-     vecLit <|> vecCons <|> vecRep <|> vecLen <|> vecEmptyP <|> vecGet <|> vecSet <|>
+     vecLit <|> vecRep <|> vecLen <|> vecEmptyP <|> vecSet <|>
      struct <|> getField <|> setField <|>
      seqNil <|> seqCons <|> seqAppend <|> seqNilP <|> seqLen <|>
      seqHead <|> seqTail <|> seqUncons <|>
@@ -651,7 +685,7 @@ synthExpr typeHint =
      ubvToFloat <|> floatToUBV <|> sbvToFloat <|> floatToSBV <|>
      unaryBV BVNonzero_ BVNonzero <|> compareBV BVCarry_ BVCarry <|>
      compareBV BVSCarry_ BVSCarry <|> compareBV BVSBorrow_ BVSBorrow <|>
-     compareBV Slt BVSlt <|> compareBV Sle BVSle)
+     compareBV Slt BVSlt <|> compareBV Sle BVSle <|> asum (map (\(SomeBuiltin b) -> synthBuiltin typeHint b) builtins))
 
 -- Syntactic constructs still to add (see issue #74)
 
@@ -758,10 +792,6 @@ synthExpr typeHint =
              Nothing -> empty
              Just (FunctionHeader _ funArgs ret handle _) ->
                return $ SomeE (FunctionHandleRepr (argTypes funArgs) ret) (EApp $ HandleLit handle)
-
-    notExpr =
-      do e <- describe "negation expression" $ unary Not_ (check BoolRepr)
-         return $ SomeE BoolRepr $ EApp $ Not e
 
     matchingExprs ::
       Maybe (Some TypeRepr) -> SomeExpr ext s -> SomeExpr ext s ->
@@ -1074,7 +1104,7 @@ synthExpr typeHint =
         Ctx.size1
         (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
         SNat
-        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+        (\(Ctx.Empty Ctx.:> Inst' (Some t))
           (Const v PList.:< PList.Nil) ->
           SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v)
 
@@ -1086,7 +1116,7 @@ synthExpr typeHint =
         Ctx.size1
         (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
         SNat
-        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
+        (\(Ctx.Empty Ctx.:> Inst' (Some t))
           (Const v PList.:< PList.Nil) ->
           SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v)
 
@@ -1102,32 +1132,6 @@ synthExpr typeHint =
                Just (Some t) ->
                  SomeE (VectorRepr t) . EApp . VectorLit t . V.fromList
                    <$> mapM (evalSomeExpr t) ls
-
-    vecCons :: m (SomeExpr ext s)
-    vecCons =
-      synthExprWithScheme
-        typeHint
-        VectorCons_
-        Ctx.size1
-        (Const (SVar Ctx.baseIndex) PList.:< Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil)
-        (SApp SVec (SVar Ctx.baseIndex))
-        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
-          (Const a PList.:< Const v PList.:< PList.Nil) ->
-          SomeE (VectorRepr t) . EApp <$>
-            (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v))
-
-    vecGet :: m (SomeExpr ext s)
-    vecGet =
-      synthExprWithScheme
-        typeHint
-        VectorGetEntry_
-        Ctx.size1
-        (Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< Const SNat  PList.:< PList.Nil)
-        (SVar Ctx.baseIndex)
-        (\(Ctx.Empty Ctx.:> Inst' (Some t)) 
-          (Const v PList.:< Const n PList.:< PList.Nil) ->
-          SomeE t . EApp <$>
-            (VectorGetEntry t <$> evalSomeExpr (VectorRepr t) v <*> evalSomeExpr NatRepr n))
 
     vecSet :: m (SomeExpr ext s)
     vecSet =

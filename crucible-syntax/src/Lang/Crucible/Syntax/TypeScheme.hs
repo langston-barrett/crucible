@@ -19,14 +19,16 @@ module Lang.Crucible.Syntax.TypeScheme
   , instantiate
   ) where
 
-import Data.Parameterized.Context qualified as Ctx
-import Lang.Crucible.Types
-import Data.Kind (Type)
-import Data.Parameterized (Some(Some), TraversableFC (traverseFC))
 import Control.Lens qualified as Lens
-import Data.Parameterized.Classes (ixF')
+import Control.Monad qualified as Monad
 import Data.Functor.Compose (Compose (Compose, getCompose))
+import Data.Kind (Type)
+import Data.Parameterized.Classes (ixF')
+import Data.Parameterized.Context qualified as Ctx
+import Data.Parameterized.Some (Some(Some))
 import Data.Parameterized.Some (viewSome)
+import Data.Parameterized.TraversableFC (traverseFC, toListFC)
+import Lang.Crucible.Types
 import Prettyprinter qualified as PP
 
 -- | Data-kind for kinds of 'TypeScheme's
@@ -36,6 +38,7 @@ data Kind
 
 data TypeScheme :: Ctx.Ctx Kind -> Kind -> Type where
   SUnit :: TypeScheme ks KType
+  SBool :: TypeScheme ks KType
   SNat :: TypeScheme ks KType
   SApp ::
     TypeScheme ks (KArrow ki kr) ->
@@ -49,6 +52,7 @@ instance PP.Pretty (TypeScheme ks k) where
   pretty =
     \case
       SUnit -> PP.pretty "Unit"
+      SBool -> PP.pretty "Bool"
       SNat -> PP.pretty "Nat"
       SApp i r -> PP.pretty i PP.<+> PP.pretty r
       SVec -> PP.pretty "Vec"
@@ -112,11 +116,22 @@ match scheme repr insts = do
     (SApp SVec s, Some (VectorRepr r)) ->
       match s (Some r) insts
     (SApp SVec _, _) -> Left (TypeError scheme repr)
+    (SApp (SVar {}) _, _) -> Left (TypeError scheme repr)
+    (SApp (SApp {}) _, _) -> Left (TypeError scheme repr)
     (SUnit, Some UnitRepr) -> Right insts
     (SUnit, _) -> Left (TypeError scheme repr)
     (SNat, Some NatRepr) -> Right insts
     (SNat, _) -> Left (TypeError scheme repr)
-    _ -> Left (TypeError scheme repr)
+    (SBool, Some BoolRepr) -> Right insts
+    (SBool, _) -> Left (TypeError scheme repr)
+    (SArrow sargs sret, Some (FunctionHandleRepr targs tret)) ->
+      let targs' = toListFC Some targs in
+      if length sargs /= length targs'
+      then Left (TypeError scheme repr)
+      else do
+        insts' <- Monad.foldM (\is (s, t) -> match s t is) insts (zip sargs targs')
+        match sret (Some tret) insts'
+    (SArrow {}, _) -> Left (TypeError scheme repr)
 
 instantiate ::
   forall ks k.
@@ -130,6 +145,7 @@ instantiate insts =
       Just f
     SVec -> Just (\(Some t) -> Some (VectorRepr t))
     SUnit -> Just (Some UnitRepr)
+    SBool -> Just (Some BoolRepr)
     SNat -> Just (Some NatRepr)
     SApp con arg -> do
       con' <- instantiate insts con
