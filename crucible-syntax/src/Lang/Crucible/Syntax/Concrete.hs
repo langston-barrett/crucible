@@ -101,6 +101,7 @@ import What4.FunctionName
 import What4.Symbol
 import What4.Utils.StringLiteral
 
+import Lang.Crucible.Syntax.Builtins
 import Lang.Crucible.Syntax.SExpr (Syntax, pattern L, pattern A, toText, PrintRules(..), PrintStyle(..), syntaxPos, withPosFrom, showAtom)
 import Lang.Crucible.Syntax.Atoms hiding (atom)
 import Lang.Crucible.Syntax.TypeScheme
@@ -120,10 +121,6 @@ liftSyntaxParse p ast =
     Left e -> throwError (SyntaxParseError e)
     Right v -> return v
 
-type AST s = Syntax Atomic
-
-
-
 printExpr :: AST s -> Text
 printExpr = toText (PrintRules rules)
   where rules (Kw Defun) = Just (Special 3)
@@ -131,18 +128,6 @@ printExpr = toText (PrintRules rules)
         rules (Kw Start) = Just (Special 1)
         rules (Kw Registers) = Just (Special 0)
         rules _ = Nothing
-
-data E ext s t where
-  EAtom  :: !(Atom s t) -> E ext s t
-  EReg   :: !Position -> !(Reg s t) -> E ext s t
-  EGlob  :: !Position -> !(GlobalVar t) -> E ext s t
-  EDeref :: !Position -> !(E ext s (ReferenceType t)) -> E ext s t
-  EApp   :: !(App ext (E ext s) t) -> E ext s t
-
-data SomeExpr ext s where
-  SomeE :: TypeRepr t -> E ext s t -> SomeExpr ext s
-  SomeOverloaded :: AST s -> Keyword -> [SomeExpr ext s] -> SomeExpr ext s
-  SomeIntLiteral :: AST s -> Integer -> SomeExpr ext s
 
 data SomeBVExpr ext s where
   SomeBVExpr :: (1 <= w) => NatRepr w -> E ext s (BVType w) -> SomeBVExpr ext s
@@ -414,67 +399,6 @@ findJointType = foldr (\y x -> f x (someExprType y))
  f Nothing y    = y
  f x@(Just _) _ = x
 
-evalOverloaded :: forall m s t ext. MonadSyntax Atomic m => AST s -> TypeRepr t -> Keyword -> [SomeExpr ext s] -> m (E ext s t)
-evalOverloaded ast tpr k = withFocus ast .
-  case (k, tpr) of
-    (Plus, NatRepr)     -> nary NatAdd    (NatLit 0)
-    (Plus, IntegerRepr) -> nary IntAdd    (IntLit 0)
-    (Plus, RealValRepr) -> nary RealAdd   (RationalLit 0)
-    (Plus, BVRepr w)    -> nary (BVAdd w) (BVLit w (BV.zero w))
-
-    (Times, NatRepr)     -> nary NatMul    (NatLit 1)
-    (Times, IntegerRepr) -> nary IntMul    (IntLit 1)
-    (Times, RealValRepr) -> nary RealMul   (RationalLit 1)
-    (Times, BVRepr w)    -> nary (BVMul w) (BVLit w (BV.one w))
-
-    (Minus, NatRepr)     -> bin NatSub
-    (Minus, IntegerRepr) -> bin IntSub
-    (Minus, RealValRepr) -> bin RealSub
-    (Minus, BVRepr w)    -> bin (BVSub w)
-
-    (Div, NatRepr)       -> bin NatDiv
-    (Div, IntegerRepr)   -> bin IntDiv
-    (Div, RealValRepr)   -> bin RealDiv
-    (Div, BVRepr w)      -> bin (BVUdiv w)
-
-    (Mod, NatRepr)       -> bin NatMod
-    (Mod, IntegerRepr)   -> bin IntMod
-    (Mod, RealValRepr)   -> bin RealMod
-    (Mod, BVRepr w)      -> bin (BVUrem w)
-
-    (Negate, IntegerRepr) -> u IntNeg
-    (Negate, RealValRepr) -> u RealNeg
-    (Negate, BVRepr w)    -> u (BVNeg w)
-
-    (Abs, IntegerRepr)   -> u IntAbs
-
-    _ -> \_ -> later $ describe ("operation at type " <> T.pack (show tpr)) $ empty
- where
- u :: (E ext s t -> App ext (E ext s) t) -> [SomeExpr ext s] -> m (E ext s t)
- u f [x] = EApp . f <$> evalSomeExpr tpr x
- u _ _ = later $ describe "one argument" $ empty
-
- bin :: (E ext s t -> E ext s t -> App ext (E ext s) t) -> [SomeExpr ext s] -> m (E ext s t)
- bin f [x,y] = EApp <$> (f <$> evalSomeExpr tpr x <*> evalSomeExpr tpr y)
- bin _ _ = later $ describe "two arguments" $ empty
-
- nary :: (E ext s t -> E ext s t -> App ext (E ext s) t) -> App ext (E ext s) t -> [SomeExpr ext s] -> m (E ext s t)
- nary _ z []     = return $ EApp z
- nary _ _ [x]    = evalSomeExpr tpr x
- nary f _ (x:xs) = go f <$> evalSomeExpr tpr x <*> mapM (evalSomeExpr tpr) xs
-
- go f x (y:ys) = go f (EApp $ f x y) ys
- go _ x []     = x
-
-
-evalSomeExpr :: MonadSyntax Atomic m => TypeRepr t -> SomeExpr ext s -> m (E ext s t)
-evalSomeExpr tpr (SomeE tpr' e)
-  | Just Refl <- testEquality tpr tpr' = return e
-  | otherwise = later $ describe ("matching types (" <> T.pack (show tpr)
-                                  <> " /= " <> T.pack (show tpr') <> ")") empty
-evalSomeExpr tpr (SomeOverloaded ast k args) = evalOverloaded ast tpr k args
-evalSomeExpr tpr (SomeIntLiteral ast i) = evalIntLiteral ast tpr i
-
 applyOverloaded ::
   MonadSyntax Atomic m => AST s -> Keyword -> Maybe (Some TypeRepr) -> [SomeExpr ext s] -> m (SomeExpr ext s)
 applyOverloaded ast k mtp args =
@@ -566,102 +490,6 @@ synthExprWithScheme typeHint kinds argSchemes retScheme mkExpr = do
     go inst PList.Nil = do
       emptyList
       pure (inst, PList.Nil)
-
-data Builtin ks args
-  = Builtin
-    { builtinKw :: Keyword
-    , builtinTVars :: Ctx.Size ks
-    , builtinArgs :: PList.List (Const (TypeScheme ks KType)) args
-    , builtinRet :: TypeScheme ks KType
-    , builtinSemantics ::
-        forall m s ext.
-        ( MonadReader (SyntaxState s) m
-        , MonadSyntax Atomic m
-        , ?parserHooks :: ParserHooks ext
-        ) =>
-        Ctx.Assignment Inst' ks ->
-        PList.List (Const (SomeExpr ext s)) args ->
-        m (SomeExpr ext s)
-    }
-
-data SomeBuiltin = forall ks args. SomeBuiltin (Builtin ks args)
-
-builtins :: [SomeBuiltin]
-builtins =
-  [ SomeBuiltin $
-    Builtin
-    { builtinKw = VectorCons_
-    , builtinTVars = Ctx.size1
-    , builtinArgs =
-      Const (SVar Ctx.baseIndex) PList.:<
-      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:<
-      PList.Nil
-    , builtinRet = SApp SVec (SVar Ctx.baseIndex)
-    , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t))
-       (Const a PList.:< Const v PList.:< PList.Nil) ->
-        SomeE (VectorRepr t) . EApp <$>
-        (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v)
-    }
-  , SomeBuiltin $
-    Builtin
-    { builtinKw = VectorGetEntry_
-    , builtinTVars = Ctx.size1
-    , builtinArgs =
-      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:<
-      Const SNat  PList.:<
-      PList.Nil
-    , builtinRet = SVar Ctx.baseIndex
-    , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t))
-       (Const v PList.:< Const n PList.:< PList.Nil) ->
-       SomeE t . EApp <$>
-         (VectorGetEntry t <$> evalSomeExpr (VectorRepr t) v <*> evalSomeExpr NatRepr n)
-    }
-  , SomeBuiltin $
-    Builtin
-    { builtinKw = Not_
-    , builtinTVars = Ctx.zeroSize
-    , builtinArgs = Const SBool PList.:< PList.Nil
-    , builtinRet = SBool
-    , builtinSemantics =
-      \Ctx.Empty (Const b PList.:< PList.Nil) ->
-        SomeE BoolRepr . EApp . Not <$> evalSomeExpr BoolRepr b
-    }
-  , SomeBuiltin $
-    Builtin
-    { builtinKw = VectorSize_
-    , builtinTVars = Ctx.size1
-    , builtinArgs =
-      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
-    , builtinRet = SNat
-    , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t))
-       (Const v PList.:< PList.Nil) ->
-        SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v
-    }
-  , SomeBuiltin $
-    Builtin
-    { builtinKw = VectorIsEmpty_
-    , builtinTVars = Ctx.size1
-    , builtinArgs =
-      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
-    , builtinRet = SBool
-    , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t))
-       (Const v PList.:< PList.Nil) ->
-        SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v
-    }
-  ]
-
-instance PP.Pretty (Builtin ks args) where
-  pretty builtin =
-    PP.fillSep
-    [ PP.viaShow (builtinKw builtin)
-    , ":"
-    , PP.pretty
-      (SArrow (toListFC getConst (builtinArgs builtin)) (builtinRet builtin))
-    ]
 
 synthBuiltin ::
   ( MonadReader (SyntaxState s) m

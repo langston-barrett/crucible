@@ -108,6 +108,7 @@ library
 
   exposed-modules:
     Lang.Crucible.Syntax.Atoms
+    Lang.Crucible.Syntax.Builtins
     Lang.Crucible.Syntax.Concrete
     Lang.Crucible.Syntax.SExpr
     Lang.Crucible.Syntax.Overrides
