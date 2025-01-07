@@ -536,7 +536,8 @@ synthExpr typeHint =
      ubvToFloat <|> floatToUBV <|> sbvToFloat <|> floatToSBV <|>
      unaryBV BVNonzero_ BVNonzero <|> compareBV BVCarry_ BVCarry <|>
      compareBV BVSCarry_ BVSCarry <|> compareBV BVSBorrow_ BVSBorrow <|>
-     compareBV Slt BVSlt <|> compareBV Sle BVSle <|> asum (map (\(SomeBuiltin b) -> synthBuiltin typeHint b) builtins))
+     compareBV Slt BVSlt <|> compareBV Sle BVSle <|>
+    asum (map (\(SomeBuiltin b) -> synthBuiltin typeHint b) builtins))
 
 -- Syntactic constructs still to add (see issue #74)
 

@@ -57,6 +57,16 @@ builtins :: [SomeBuiltin]
 builtins =
   [ SomeBuiltin $
     Builtin
+    { builtinKw = Not_
+    , builtinTVars = Ctx.zeroSize
+    , builtinArgs = Const SBool PList.:< PList.Nil
+    , builtinRet = SBool
+    , builtinSemantics =
+      \Ctx.Empty (Const b PList.:< PList.Nil) ->
+        SomeE BoolRepr . EApp . Not <$> evalSomeExpr BoolRepr b
+    }
+  , SomeBuiltin $
+    Builtin
     { builtinKw = VectorCons_
     , builtinTVars = Ctx.size1
     , builtinArgs =
@@ -87,13 +97,15 @@ builtins =
     }
   , SomeBuiltin $
     Builtin
-    { builtinKw = Not_
-    , builtinTVars = Ctx.zeroSize
-    , builtinArgs = Const SBool PList.:< PList.Nil
+    { builtinKw = VectorIsEmpty_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
     , builtinRet = SBool
     , builtinSemantics =
-      \Ctx.Empty (Const b PList.:< PList.Nil) ->
-        SomeE BoolRepr . EApp . Not <$> evalSomeExpr BoolRepr b
+      \(Ctx.Empty Ctx.:> Inst' (Some t))
+       (Const v PList.:< PList.Nil) ->
+        SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v
     }
   , SomeBuiltin $
     Builtin
@@ -106,17 +118,5 @@ builtins =
       \(Ctx.Empty Ctx.:> Inst' (Some t))
        (Const v PList.:< PList.Nil) ->
         SomeE NatRepr . EApp . VectorSize <$> evalSomeExpr (VectorRepr t) v
-    }
-  , SomeBuiltin $
-    Builtin
-    { builtinKw = VectorIsEmpty_
-    , builtinTVars = Ctx.size1
-    , builtinArgs =
-      Const (SApp SVec (SVar Ctx.baseIndex)) PList.:< PList.Nil
-    , builtinRet = SBool
-    , builtinSemantics =
-      \(Ctx.Empty Ctx.:> Inst' (Some t))
-       (Const v PList.:< PList.Nil) ->
-        SomeE BoolRepr . EApp . VectorIsEmpty <$> evalSomeExpr (VectorRepr t) v
     }
   ]
