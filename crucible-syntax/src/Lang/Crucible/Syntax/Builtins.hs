@@ -67,6 +67,23 @@ builtins =
     }
   , SomeBuiltin $
     Builtin
+    { builtinKw = StringConcat_
+    , builtinTVars = Ctx.size1
+    , builtinArgs =
+      Const (SApp SString (SVar Ctx.baseIndex)) PList.:<
+      Const (SApp SString (SVar Ctx.baseIndex)) PList.:<
+      PList.Nil
+    , builtinRet = SApp SString (SVar Ctx.baseIndex)
+    , builtinSemantics =
+      \(Ctx.Empty Ctx.:> Inst' (Some si))
+       (Const e1 PList.:< Const e2 PList.:< PList.Nil) ->
+       SomeE (StringRepr si) . EApp <$>
+         (StringConcat si <$>
+          evalSomeExpr (StringRepr si) e1 <*>
+          evalSomeExpr (StringRepr si) e2)
+    }
+  , SomeBuiltin $
+    Builtin
     { builtinKw = VectorCons_
     , builtinTVars = Ctx.size1
     , builtinArgs =
@@ -77,7 +94,7 @@ builtins =
     , builtinSemantics =
       \(Ctx.Empty Ctx.:> Inst' (Some t))
        (Const a PList.:< Const v PList.:< PList.Nil) ->
-        SomeE (VectorRepr t) . EApp <$>
+       SomeE (VectorRepr t) . EApp <$>
         (VectorCons t <$> evalSomeExpr t a <*> evalSomeExpr (VectorRepr t) v)
     }
   , SomeBuiltin $

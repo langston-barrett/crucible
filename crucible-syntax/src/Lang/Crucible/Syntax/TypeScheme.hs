@@ -33,7 +33,8 @@ import Prettyprinter qualified as PP
 
 -- | Data-kind for kinds of 'TypeScheme's
 data Kind
-  = KType
+  = KString
+  | KType
   | KArrow Kind Kind
 
 data TypeScheme :: Ctx.Ctx Kind -> Kind -> Type where
@@ -45,6 +46,8 @@ data TypeScheme :: Ctx.Ctx Kind -> Kind -> Type where
     TypeScheme ks ki ->
     TypeScheme ks kr
   SVar :: Ctx.Index ks k -> TypeScheme ks k
+  SString :: TypeScheme ks (KArrow KString KType)
+  SStringInfo :: StringInfoRepr si -> TypeScheme ks KString
   SVec :: TypeScheme ks (KArrow KType KType)
   SArrow :: [TypeScheme ks KType] -> TypeScheme ks KType -> TypeScheme ks KType
 
@@ -55,6 +58,8 @@ instance PP.Pretty (TypeScheme ks k) where
       SBool -> PP.pretty "Bool"
       SNat -> PP.pretty "Nat"
       SApp i r -> PP.pretty i PP.<+> PP.pretty r
+      SString -> PP.pretty "String"
+      SStringInfo si -> PP.viaShow si
       SVec -> PP.pretty "Vec"
       SVar idx -> PP.pretty "x" PP.<> PP.viaShow (Ctx.indexVal idx)
       SArrow args ret ->
@@ -64,6 +69,7 @@ instance Show (TypeScheme ks k) where
   show = show . PP.pretty
 
 type family Inst (k :: Kind) :: Type where
+  Inst KString = Some StringInfoRepr
   Inst KType = Some TypeRepr
   Inst (KArrow ki kr) = Inst ki -> Inst kr
 
@@ -116,6 +122,11 @@ match scheme repr insts = do
     (SApp SVec s, Some (VectorRepr r)) ->
       match s (Some r) insts
     (SApp SVec _, _) -> Left (TypeError scheme repr)
+    (SApp SString (SStringInfo si), Some (StringRepr si')) ->
+      case testEquality si si' of
+        Just Refl -> Right insts
+        Nothing -> Left (TypeError scheme repr)
+    (SApp SString _, _) -> Left (TypeError scheme repr)
     (SApp (SVar {}) _, _) -> Left (TypeError scheme repr)
     (SApp (SApp {}) _, _) -> Left (TypeError scheme repr)
     (SUnit, Some UnitRepr) -> Right insts
@@ -143,7 +154,9 @@ instantiate insts =
     SVar idx -> do
       Inst' f <- getCompose (Lens.view (ixF' idx) insts)
       Just f
+    SString -> Just (\(Some si) -> Some (StringRepr si))
     SVec -> Just (\(Some t) -> Some (VectorRepr t))
+    SStringInfo si -> Just (Some si)
     SUnit -> Just (Some UnitRepr)
     SBool -> Just (Some BoolRepr)
     SNat -> Just (Some NatRepr)

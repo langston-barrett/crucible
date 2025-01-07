@@ -525,7 +525,7 @@ synthExpr typeHint =
      naryArith Plus <|> binaryArith Minus <|> naryArith Times <|> binaryArith Div <|> binaryArith Mod <|>
      unitCon <|> boolLit <|> stringLit <|> funNameLit <|>
      equalp <|> lessThan <|> lessThanEq <|>
-     toAny <|> fromAny <|> stringAppend <|> stringEmpty <|> stringLength <|> showExpr <|>
+     toAny <|> fromAny <|> stringEmpty <|> stringLength <|> showExpr <|>
      just <|> nothing <|> fromJust_ <|> injection <|> projection <|>
      vecLit <|> vecRep <|> vecSet <|>
      struct <|> getField <|> setField <|>
@@ -926,18 +926,6 @@ synthExpr typeHint =
 
     stringEmpty =
       unary StringEmpty_ stringSort <&> \(Some si) -> SomeE (StringRepr si) $ EApp $ StringEmpty si
-
-    stringAppend :: m (SomeExpr ext s)
-    stringAppend =
-      do (e1,(e2,())) <-
-           followedBy (kw StringConcat_) $
-           cons (synthExpr typeHint) $
-           cons (synthExpr typeHint) $
-           emptyList
-         matchingExprs typeHint e1 e2 $ \tp s1 s2 ->
-           case tp of
-             StringRepr si -> return $ SomeE (StringRepr si) $ EApp $ StringConcat si s1 s2
-             _ -> later $ describe "string expressions" empty
 
     vecRep :: m (SomeExpr ext s)
     vecRep =
