@@ -110,13 +110,14 @@ library
     Lang.Crucible.Syntax.Atoms
     Lang.Crucible.Syntax.Builtins
     Lang.Crucible.Syntax.Concrete
-    Lang.Crucible.Syntax.SExpr
-    Lang.Crucible.Syntax.Overrides
     Lang.Crucible.Syntax.ExprParse
     Lang.Crucible.Syntax.Monad
+    Lang.Crucible.Syntax.Overrides
     Lang.Crucible.Syntax.Prog
+    Lang.Crucible.Syntax.SExpr
 
   other-modules:
+    Lang.Crucible.Syntax.Expr
     Lang.Crucible.Syntax.TypeScheme
 
   ghc-options: -Wall -Werror=incomplete-patterns -Werror=missing-methods -Werror=overlapping-patterns

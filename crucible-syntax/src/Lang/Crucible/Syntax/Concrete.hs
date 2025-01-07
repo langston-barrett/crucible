@@ -102,6 +102,7 @@ import What4.Symbol
 import What4.Utils.StringLiteral
 
 import Lang.Crucible.Syntax.Builtins
+import Lang.Crucible.Syntax.Expr
 import Lang.Crucible.Syntax.SExpr (Syntax, pattern L, pattern A, toText, PrintRules(..), PrintStyle(..), syntaxPos, withPosFrom, showAtom)
 import Lang.Crucible.Syntax.Atoms hiding (atom)
 import Lang.Crucible.Syntax.TypeScheme
